@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.pytest_cache/
+.ruff_cache/
+node_modules/
+web/dist/
+*.egg-info/
+data/
+.harness/
+.screenshots/
+*.tsbuildinfo
+AGENTS.md

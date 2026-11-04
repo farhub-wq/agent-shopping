@@ -1,0 +1,150 @@
+name: shop-agent
+
+x-service-env: &service-env
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
+  INVENTORY_URL: http://inventory:8000
+  CATALOG_URL: http://catalog:8000
+  ORDER_URL: http://order:8000
+  FULFILLMENT_URL: http://fulfillment:8000
+  AFTERSALES_URL: http://aftersales:8000
+  GATEWAY_URL: http://gateway:8000
+  HARNESS_URL: http://harness:8000
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-256}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shop}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shop}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  catalog:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: catalog } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/catalog_db
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8001:8000"]
+    healthcheck: &healthcheck
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+
+  inventory:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: inventory } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/inventory_db
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8002:8000"]
+    healthcheck: *healthcheck
+
+  order:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: order } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/order_db
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8003:8000"]
+    healthcheck: *healthcheck
+
+  fulfillment:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: fulfillment } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/fulfillment_db
+      ORDER_URL: http://order:8000
+      FULFILLMENT_SLA_HOURS: ${FULFILLMENT_SLA_HOURS:-48}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8004:8000"]
+    healthcheck: *healthcheck
+
+  aftersales:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: aftersales } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/aftersales_db
+      REFUND_WINDOW_DAYS: ${REFUND_WINDOW_DAYS:-7}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8005:8000"]
+    healthcheck: *healthcheck
+
+  harness:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: harness } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/harness_db
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-shop-agent-sandbox:latest}
+      SANDBOX_TIMEOUT_SECONDS: ${SANDBOX_TIMEOUT_SECONDS:-20}
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      order: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+    ports: ["8006:8000"]
+    healthcheck: *healthcheck
+
+  gateway:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: gateway } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/order_db
+      SERVICE_NAME: gateway
+    depends_on:
+      catalog: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      order: { condition: service_healthy }
+      fulfillment: { condition: service_healthy }
+      aftersales: { condition: service_healthy }
+      harness: { condition: service_healthy }
+    ports: ["8080:8000"]
+    healthcheck: *healthcheck
+
+  web:
+    build: { context: ./web }
+    depends_on:
+      gateway: { condition: service_healthy }
+    ports: ["5173:80"]
+
+volumes:
+  pgdata:
