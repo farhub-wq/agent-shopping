@@ -10,6 +10,7 @@ export default function Ops() {
   const [rows, setRows] = useState<any[]>([]);
   const [error, setError] = useState("");
 
+  // 不同 tab 对应不同服务接口，切换后按当前 tab 重新取数，避免残留旧列表。
   const load = async () => {
     try {
       setError("");
@@ -22,10 +23,12 @@ export default function Ops() {
     }
   };
 
+  // 只有运营/管理员才请求数据；顾客身份直接走下面的拦截页。
   useEffect(() => {
     if (session && session.role !== "customer") load();
   }, [tab]);
 
+  // 前端仅做入口收敛，真正的权限校验由网关与服务端再验一次。
   if (!session || session.role === "customer") {
     return (
       <div className="empty">
@@ -36,6 +39,7 @@ export default function Ops() {
     );
   }
 
+  // 所有运营动作成功后再拉一次列表，以服务端状态为准，避免本地乐观更新失真。
   const act = async (fn: () => Promise<any>) => {
     try {
       await fn();
@@ -80,6 +84,7 @@ export default function Ops() {
                     <button
                       className="ghost small"
                       onClick={() => {
+                        // 调整的是总库存，可售量由服务端按“总量-预占”重新计算。
                         const value = window.prompt(`设置 ${row.sku} 的总库存`, String(row.total));
                         if (value !== null) act(() => api.setStock(row.sku, Number(value)));
                       }}
@@ -120,6 +125,7 @@ export default function Ops() {
               </header>
               <p className="muted">截止 {new Date(shipment.deadline_at).toLocaleString()} · 运单 {shipment.tracking_no || "-"}</p>
               <div className="row-actions">
+                {/* 履约动作按状态单向推进：pending 发货，shipped 后确认签收。 */}
                 {shipment.status === "pending" && (
                   <button className="primary small" onClick={() => act(() => api.ship(shipment.id))}>发货</button>
                 )}
@@ -144,6 +150,7 @@ export default function Ops() {
               </header>
               <p>{ticket.description || ticket.decision_note}</p>
               <p className="hint">风险评分 {ticket.risk_score} · {ticket.risk_reasons?.join("；") || "无"}</p>
+              {/* Agent 只给建议，通过/驳回仍是人工动作，前端不自动执行。 */}
               {ticket.agent_recommendation?.recommendation && (
                 <p className="advice">
                   Agent 建议：{ticket.agent_recommendation.recommendation}（置信度 {ticket.agent_recommendation.confidence}）
@@ -152,8 +159,10 @@ export default function Ops() {
                 </p>
               )}
               <div className="row-actions">
+                {/* 审批动作都由人工点击触发，Agent 结果不在这里自动执行。 */}
                 <button className="primary small" onClick={() => act(() => api.approveTicket(ticket.id))}>通过</button>
                 <button className="ghost" onClick={() => act(() => api.rejectTicket(ticket.id))}>驳回</button>
+                {/* 退款完成不可逆，只在 approved 后开放。 */}
                 {ticket.status === "approved" && (
                   <button className="ghost" onClick={() => act(() => api.refundTicket(ticket.id))}>完成退款</button>
                 )}

@@ -78,6 +78,8 @@ def _split_front_matter(raw: str) -> tuple[dict[str, Any], str, int]:
         raise ValueError("SKILL.md front matter 未闭合")
     meta = yaml.safe_load(parts[1]) or {}
     body = parts[2]
+    # split 只切两刀，正文里出现的 --- 不会被误当成 front matter 分隔符；
+    # offset 记录正文在原文中的起始行号，便于把正文位置映射回原文行号。
     offset = raw[: len(parts[0]) + len(parts[1]) + 6].count("\n")
     return meta, body, offset
 
@@ -97,12 +99,16 @@ def load_skill(path: Path) -> SkillManifest:
         path=str(path),
     )
     manifest.content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # 准入审计在加载时同步完成：风险技能根本进不了运行时，
+    # 而不是等到第一次调用才暴露。
     manifest.findings = audit(raw, offset, manifest)
     return manifest
 
 
 def audit(raw: str, offset: int, manifest: SkillManifest) -> list[Finding]:
     findings: list[Finding] = []
+    # 六类检查固定编码；high 会让整个技能 deny，medium 仅提示不阻断。
+    # preprocessing-command：!`cmd` 意味着内容在进入模型上下文前就被宿主执行。
     for match in PREPROCESS_PATTERN.finditer(raw):
         findings.append(
             Finding(
@@ -114,6 +120,7 @@ def audit(raw: str, offset: int, manifest: SkillManifest) -> list[Finding]:
         )
     for match in TOOL_REF_PATTERN.finditer(raw):
         name = match.group(1)
+        # 正文显式引用的工具必须在 allowed_tools 中声明，否则是隐式扩权。
         if name not in manifest.allowed_tools:
             findings.append(
                 Finding(
@@ -125,6 +132,8 @@ def audit(raw: str, offset: int, manifest: SkillManifest) -> list[Finding]:
             )
     for match in SCRIPT_PATTERN.finditer(raw):
         script = match.group(1)
+        # 引用脚本却没有 sandbox 能力，说明脚本可能被宿主直接执行；
+        # 风险定为 medium：不一定利用成功，但需要人工复核。
         if not any(script in tool for tool in manifest.allowed_tools) and "sandbox" not in manifest.allowed_tools:
             findings.append(
                 Finding(
@@ -135,6 +144,7 @@ def audit(raw: str, offset: int, manifest: SkillManifest) -> list[Finding]:
                 )
             )
     for match in PATH_ESCAPE_PATTERN.finditer(raw):
+        # 路径逃逸可直接读写技能目录之外的文件，属于高危，直接 deny。
         findings.append(
             Finding(
                 "path-escape",
@@ -143,10 +153,12 @@ def audit(raw: str, offset: int, manifest: SkillManifest) -> list[Finding]:
                 raw[: match.start()].count("\n") + 1,
             )
         )
+    # 声明网络能力却没有 allowlist，等于允许任意出站，无法审计目的地。
     if manifest.permissions.get("network") and not manifest.permissions.get("network_allowlist"):
         findings.append(
             Finding("network-egress", "high", "声明了网络访问但未提供 allowlist")
         )
+    # 工具数量过多违反最小权限；不阻断，但提示人工收敛。
     if len(manifest.allowed_tools) > 12:
         findings.append(Finding("dependency-risk", "medium", "允许工具数量过多，最小权限原则未满足"))
     return findings

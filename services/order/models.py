@@ -19,12 +19,14 @@ class Order(Base):
     order_no: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     tenant: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    # 订单状态只能由状态机变更，这里默认 CREATED，路由不得直接赋值 status。
     status: Mapped[str] = mapped_column(String(16), default="CREATED", index=True)
     amount_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8), default="CNY")
     items: Mapped[list] = mapped_column(JSON, default=list)
     address: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 退款进入 REFUNDING 前的状态快照：退款驳回时据此回退到原状态。
     refund_previous: Mapped[str | None] = mapped_column(String(16), nullable=True)
     refund_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -34,6 +36,7 @@ class Order(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
+        # 显式挑选对外字段，不直接序列化 ORM 实例；时间统一转 ISO 字符串。
         return {
             "id": self.id,
             "order_no": self.order_no,
@@ -56,6 +59,7 @@ class Order(Base):
 class OrderEvent(Base):
     __tablename__ = "order_events"
 
+    # 只追加的事件轨迹：每次状态流转写一条 from→to 记录，用于审计与时间线展示。
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[str] = mapped_column(String(36), index=True)
     from_status: Mapped[str] = mapped_column(String(16))

@@ -48,12 +48,14 @@ class MCPServer:
             result = await self._dispatch(method, params, ctx, trust)
             return {"jsonrpc": "2.0", "id": request_id, "result": result}
         except MCPError as exc:
+            # 协议层错误原样回传 code，客户端可按 JSON-RPC 规范区分业务错误与方法错误。
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": exc.code, "message": exc.message, "data": exc.data},
             }
         except Exception as exc:
+            # 未预期异常统一折成 -32603，只回类型名，避免把内部堆栈/路径泄露给调用方。
             logger.exception("MCP 请求处理失败 method=%s", method)
             return {
                 "jsonrpc": "2.0",
@@ -86,9 +88,12 @@ class MCPServer:
         if method == "tools/call":
             name = params.get("name", "")
             arguments = params.get("arguments") or {}
+            # 关键：MCP 调用不绕过本地护栏，仍走 registry.execute 的
+            # 权限 → 审批 → 执行 → 脱敏 → 证据流程。
             result = await self.registry.execute(name, arguments, ctx, trust=trust)
             return {
                 "content": [{"type": "text", "text": json.dumps(result.to_dict(), ensure_ascii=False)}],
+                # isError 反映工具级失败（denied / needs_approval / error），而非传输失败。
                 "isError": not result.ok,
             }
         raise MCPError(-32601, f"不支持的方法 {method}")
@@ -106,6 +111,7 @@ class HTTPMCPClient:
             response = await client.post(self.endpoint, json=payload)
         body = response.json()
         if "error" in body:
+            # HTTP 200 也可能携带 JSON-RPC error，必须先看 body 而不是只看状态码。
             error = body["error"]
             raise MCPError(int(error.get("code", -32000)), str(error.get("message", "MCP 调用失败"),), error.get("data"))
         return body.get("result")
@@ -146,6 +152,7 @@ class StdioMCPClient:
         payload = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params or {}}
         self.process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
         await self.process.stdin.drain()
+        # 逐行协议：读一行必须设超时，否则子进程挂死会拖住整个 Agent 运行。
         line = await asyncio.wait_for(self.process.stdout.readline(), timeout=15)
         body = json.loads(line.decode("utf-8"))
         if "error" in body:
@@ -186,9 +193,12 @@ class MCPHub:
                 await client.initialize()
                 discovered = await client.list_tools()
             except Exception:
+                # 单个 MCP Server 故障只降级该来源，不阻断其余工具发现。
                 logger.exception("MCP Server %s 不可用，跳过", name)
                 continue
             for tool in discovered:
+                # 加 mcp__server__ 前缀避免不同 Server 的同名工具互相覆盖，
+                # 路由表据此反查应该转发给哪个客户端。
                 qualified = f"mcp__{name}__{tool['name']}"
                 self._routes[qualified] = name
                 tools.append({**tool, "name": qualified, "server": name})
@@ -198,6 +208,7 @@ class MCPHub:
         server = self._routes.get(name)
         if server is None:
             raise MCPError(-32601, f"未知 MCP 工具 {name}")
+        # 转发时去掉 mcp__server__ 前缀，远端只认自己的原始工具名。
         return await self.clients[server].call_tool(name.split("__", 2)[2], arguments)
 
 
@@ -220,6 +231,8 @@ def register_mcp_tools(registry: ToolRegistry, hub: MCPHub, discovered: list[dic
                 description=f"[MCP:{spec.get('server')}] {spec.get('description', '')}",
                 input_schema=spec.get("inputSchema") or {"type": "object", "properties": {}},
                 handler=_make_handler(name),
+                # 远端工具一律按最小权限登记；真实能力由远端 Server 自身负责，
+                # 本地这层只额外施加 read/low 的下限约束，避免 MCP 成为绕过审批的通道。
                 policy=ToolPolicy(name=name, permission="read", risk="low", data_class="public"),
             )
         )

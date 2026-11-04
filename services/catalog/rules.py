@@ -29,9 +29,12 @@ DEFAULT_RULE = {"required": [], "forbidden_keywords": ["全网最低", "国家�
 
 
 def validate_product(payload: dict[str, Any]) -> dict[str, Any]:
+    # 未配置规则的类目走默认兜底，防止新增类目绕过违规词检查。
     rule = CATEGORY_RULES.get(str(payload.get("category", "")), DEFAULT_RULE)
     attributes = payload.get("attributes") or {}
+    # 空字符串与 None 都按「未填写」处理，必填属性不能靠空值蒙混通过。
     missing = [key for key in rule["required"] if not attributes.get(key)]
+    # 违规词只扫描文案字段，命中即判不合规，不做模糊匹配。
     text = " ".join(
         str(payload.get(key, "")) for key in ("title", "subtitle", "description")
     )

@@ -42,6 +42,7 @@ class SandboxResult:
 
 
 def _truncate(raw: bytes) -> tuple[str, bool]:
+    # 输出上限 8KB：既限制回传给模型的上下文成本，也防止脚本用日志刷爆内存。
     if len(raw) > MAX_OUTPUT_BYTES:
         return raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace"), True
     return raw.decode("utf-8", errors="replace"), False
@@ -61,10 +62,13 @@ class SandboxManager:
 
     async def run(self, code: str, *, language: str = "python", timeout: int | None = None) -> SandboxResult:
         if language != "python":
+            # 只支持 python：其他语言需要额外镜像与运行时，当前不静默降级。
             return SandboxResult("error", stderr="当前沙箱仅支持 python", backend="none")
         limit = timeout or self.settings.sandbox_timeout_seconds
         if self.settings.sandbox_enabled:
             result = await asyncio.to_thread(self._run_docker, code, limit)
+            # 只有「Docker 根本不可用」才降级到本地子进程；
+            # 容器已启动但执行出错时不降级，避免用更弱的安全边界重跑同一段代码。
             if result.status != "unavailable":
                 return result
             logger.warning("Docker 沙箱不可用，降级到本地子进程（非安全边界）")
@@ -82,6 +86,8 @@ class SandboxManager:
 
         container = None
         try:
+            # 安全基线：网络模式走配置（默认 none）、只读根文件系统、/tmp 限额可写、
+            # 限制 CPU/内存/PID、禁止提权、以 65534 低权用户运行、python -I 隔离用户 site-packages。
             container = client.containers.create(
                 self.settings.sandbox_image,
                 command=["python", "-I", "-c", code],
@@ -130,6 +136,7 @@ class SandboxManager:
             )
         finally:
             if container is not None:
+                # 无论成功与否都强制删除容器，避免残留进程与磁盘占用。
                 try:
                     container.remove(force=True)
                 except Exception:
@@ -137,6 +144,7 @@ class SandboxManager:
 
     async def _run_local(self, code: str, timeout: int) -> SandboxResult:
         started = time.perf_counter()
+        # 本地兜底只防误操作：进程仍与宿主同权限、可访问真实文件系统，不构成安全边界。
         python = sys.executable or shutil.which("python") or "python"
         process = await asyncio.create_subprocess_exec(
             python,
@@ -149,6 +157,7 @@ class SandboxManager:
         try:
             stdout_raw, stderr_raw = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
+            # 超时必须杀掉子进程并回收，否则脚本会在后台继续占用资源。
             process.kill()
             await process.wait()
             return SandboxResult(

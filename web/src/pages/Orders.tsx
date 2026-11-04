@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, getSession, money } from "../lib/api";
 
+// 后端状态码到中文的展示映射；未命中的状态回退显示原始码，避免悄悄丢信息。
 const STATUS_LABELS: Record<string, string> = {
   CREATED: "已创建",
   RESERVED: "库存已锁定",
@@ -33,6 +34,7 @@ export default function Orders() {
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
 
+  // 订单与售后单是两个独立列表，一次并发拉取减少往返。
   const load = async () => {
     try {
       const [orderData, ticketData] = await Promise.all([api.orders(), api.tickets()]);
@@ -44,6 +46,7 @@ export default function Orders() {
     }
   };
 
+  // 未登录不请求数据，直接展示引导；登录态在进入页面时读取一次即可。
   useEffect(() => {
     if (session) load();
   }, []);
@@ -61,6 +64,7 @@ export default function Orders() {
   const pay = async (orderId: string) => {
     try {
       await api.pay(orderId);
+      // 支付会推进订单状态，必须重新拉列表而不是本地改字段。
       await load();
     } catch (exc) {
       setError((exc as Error).message);
@@ -69,6 +73,7 @@ export default function Orders() {
 
   const showTimeline = async (orderId: string) => {
     try {
+      // 轨迹由订单服务按 OrderEvent 汇总返回，前端只负责展示。
       setTimeline(await api.timeline(orderId));
     } catch (exc) {
       setError((exc as Error).message);
@@ -77,6 +82,7 @@ export default function Orders() {
 
   const submitTicket = async (orderId: string) => {
     try {
+      // 顾客侧只发起「仅退款」申请，审批与退款由运营在后台完成。
       await api.createTicket({ order_id: orderId, reason, description, type: "refund_only" });
       setFormOrder(null);
       setDescription("");
@@ -115,6 +121,7 @@ export default function Orders() {
                 ))}
               </ul>
               <div className="row-actions">
+                {/* 操作入口由订单状态驱动：仅 RESERVED 可支付，已支付之后才允许售后。 */}
                 {order.status === "RESERVED" && <button className="primary small" onClick={() => pay(order.id)}>去支付</button>}
                 {(order.status === "PAID" || order.status === "SHIPPED" || order.status === "COMPLETED") && (
                   <button className="ghost" onClick={() => setFormOrder(order.id)}>申请售后</button>
@@ -156,6 +163,7 @@ export default function Orders() {
               </header>
               <p className="muted">订单 {ticket.order_id} · 原因 {ticket.reason}</p>
               <p>{ticket.decision_note}</p>
+              {/* 风险评分与命中原因由售后规则计算，存在才展示，供用户理解审核依据。 */}
               {ticket.risk_reasons?.length > 0 && (
                 <p className="hint">风险：{ticket.risk_reasons.join("；")}（评分 {ticket.risk_score}）</p>
               )}

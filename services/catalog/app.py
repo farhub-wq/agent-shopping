@@ -32,11 +32,13 @@ SEED_PRODUCTS = [
 ]
 
 
+# 种子商品 ID 由 SKU 派生的 uuid5，保证多次启动或重建库时主键稳定，不会重复插入。
 def _seed_id(sku: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"shop-agent/{sku}"))
 
 
 async def seed_products() -> None:
+    # 只在空表时写入种子数据，避免每次启动重复插入或覆盖人工维护的商品。
     async with get_session_factory()() as session:
         existing = await session.scalar(select(func.count()).select_from(Product))
         if existing:
@@ -64,6 +66,7 @@ async def seed_products() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging("catalog")
+    # 启动顺序固定：先建表再投种子数据，否则空库上写入种子会失败。
     await init_models()
     await seed_products()
     yield
@@ -108,6 +111,7 @@ async def list_products(
     size: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     async with get_session_factory()() as session:
+        # 前台列表只暴露已上架商品，草稿/下线商品不参与搜索与分页。
         stmt = select(Product).where(Product.status == "published")
         if q:
             keyword = f"%{q}%"
@@ -128,9 +132,11 @@ async def list_products(
 @app.get("/products/{product_id}")
 async def get_product(product_id: str) -> dict[str, Any]:
     async with get_session_factory()() as session:
+        # 路径参数既接受主键也接受 SKU，方便前端用 SKU 直达详情页。
         product = await session.get(Product, product_id)
         if product is None:
             product = await session.scalar(select(Product).where(Product.sku == product_id))
+        # 未上架商品对外统一按不存在处理，避免通过接口探测草稿内容。
         if product is None or product.status != "published":
             raise ApiError("NOT_FOUND", "商品不存在或未上架")
         return product.to_dict()
@@ -138,6 +144,7 @@ async def get_product(product_id: str) -> dict[str, Any]:
 
 @app.get("/admin/products")
 async def admin_list_products(principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
+    # 后台列表可见全部状态，必须要求 staff 权限，普通用户拿不到草稿数据。
     principal.require_staff()
     async with get_session_factory()() as session:
         stmt = select(Product).order_by(Product.updated_at.desc())
@@ -154,6 +161,7 @@ async def create_product(payload: ProductCreate, principal: PrincipalDep) -> dic
         exists = await session.scalar(select(Product).where(Product.sku == payload.sku))
         if exists:
             raise ApiError("CONFLICT", "SKU 已存在")
+        # 新商品一律落 draft，必须显式 PATCH 成 published 且通过合规校验才能上架。
         product = Product(
             id=str(uuid.uuid4()),
             sku=payload.sku,
@@ -176,6 +184,7 @@ async def create_product(payload: ProductCreate, principal: PrincipalDep) -> dic
 async def update_product(product_id: str, payload: ProductUpdate, principal: PrincipalDep) -> dict[str, Any]:
     principal.require_staff()
     changes = payload.model_dump(exclude_unset=True)
+    # 状态只允许白名单取值，防止调用方写入任意字符串绕过上下架语义。
     if changes.get("status") not in (None, "draft", "published", "offline"):
         raise ApiError("BAD_REQUEST", "非法的商品状态")
     async with get_session_factory()() as session:
@@ -183,6 +192,7 @@ async def update_product(product_id: str, payload: ProductUpdate, principal: Pri
         if product is None:
             raise ApiError("NOT_FOUND", "商品不存在")
         if changes.get("status") == "published":
+            # 上架前用本次改动合并后的字段做合规校验，避免「先改文案再上架」绕过规则。
             check = validate_product(
                 {
                     "category": product.category,
@@ -208,4 +218,5 @@ async def compliance_check(product_id: str, principal: PrincipalDep) -> dict[str
         product = await session.get(Product, product_id)
         if product is None:
             raise ApiError("NOT_FOUND", "商品不存在")
+        # 只读校验接口，不落库；结果供运营在编辑页预览合规风险。
         return validate_product(product.to_dict())

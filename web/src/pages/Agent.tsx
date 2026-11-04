@@ -23,6 +23,7 @@ export default function Agent() {
   const [evidence, setEvidence] = useState<any>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 会话 id 在页面生命周期内固定，让多轮对话共享 Agent 的上下文与记忆。
   const sessionId = useRef(`web-${crypto.randomUUID().slice(0, 8)}`);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -31,6 +32,7 @@ export default function Agent() {
   }, []);
 
   useEffect(() => {
+    // 新消息或等待中自动滚到底部，保证流式输出始终可见。
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
 
@@ -44,6 +46,7 @@ export default function Agent() {
     setEvidence(null);
     try {
       await chatStream(skill, text, sessionId.current, (event) => {
+        // trace 事件逐条累积，形成工具调用证据；final 才落最终答案并记录 run_id。
         if (event.type === "trace") setTrace((prev) => [...prev, event.event]);
         if (event.type === "final") {
           const result = event.result;
@@ -62,6 +65,7 @@ export default function Agent() {
   const showEvidence = async () => {
     if (!runId) return;
     try {
+      // 证据卡来自本次 run 的 trace 记录，用于复核 Agent 是否越权或失败。
       setEvidence(await api.evidence(runId));
     } catch (exc) {
       setError((exc as Error).message);
@@ -136,6 +140,7 @@ export default function Agent() {
             <ul className="trace-list">
               {trace.map((event, index) => (
                 <li key={index}>
+                  {/* trace 条目字段按工具调用类型可选，有值才渲染对应片段。 */}
                   <span className="tag">{event.type}</span>
                   {event.tool && <strong>{event.tool}</strong>}
                   {event.status && <span className={`status ${event.status}`}>{event.status}</span>}

@@ -15,6 +15,7 @@ class AfterSaleTicket(Base):
     __tablename__ = "after_sale_tickets"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # 工单号对用户可见，唯一索引避免重复生成造成客服对不上号
     ticket_no: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     order_id: Mapped[str] = mapped_column(String(36), index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -23,14 +24,19 @@ class AfterSaleTicket(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # 风险分与命中原因由政策引擎写入，保留评分依据便于人工复核时解释结论
     risk_score: Mapped[int] = mapped_column(Integer, default=0)
     risk_reasons: Mapped[list] = mapped_column(JSON, default=list)
+    # 决策说明：自动档写政策理由，人工档写客服备注
     decision_note: Mapped[str] = mapped_column(Text, default="")
+    # Agent 只能写建议，不参与状态流转；单独存字段以便审计模型输出与最终决策的差异
     agent_recommendation: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 记录决策人：policy-engine 表示自动档，其余为人工操作者的用户 ID
     decided_by: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # 只挑对外字段返回，不把 ORM 对象整体序列化
     def to_dict(self) -> dict:
         return {
             "id": self.id,

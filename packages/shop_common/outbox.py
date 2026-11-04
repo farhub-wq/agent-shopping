@@ -30,8 +30,9 @@ class OutboxEvent(Base):
     tenant: Mapped[str] = mapped_column(String(64), default="default")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True  # noqa: UP017
     )
+    # published_at 为空即待投递；attempts 与 last_error 用于重试与故障观测。
     published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -70,6 +71,7 @@ class OutboxRelay:
             pending = (
                 (
                     await session.execute(
+                        # 只取未投递事件并按创建时间升序，尽量保持同一聚合根事件的先后顺序。
                         select(OutboxEvent)
                         .where(OutboxEvent.published_at.is_(None))
                         .order_by(OutboxEvent.created_at)
@@ -89,13 +91,14 @@ class OutboxRelay:
                         event_id=event.id,
                         tenant=event.tenant,
                     )
-                    event.published_at = datetime.now(timezone.utc)
+                    event.published_at = datetime.now(timezone.utc)  # noqa: UP017
                     event.attempts += 1
                     sent += 1
                 except Exception as exc:  # 投递失败不阻塞后续事件，交给下一轮重试
                     event.attempts += 1
                     event.last_error = f"{type(exc).__name__}: {exc}"
                     logger.warning("outbox 投递失败 id=%s attempts=%s", event.id, event.attempts)
+            # 成功标记与失败记录共用一次提交，保证投递状态和错误信息不丢。
             await session.commit()
             return sent
 
@@ -107,5 +110,6 @@ class OutboxRelay:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # 中继异常不退出循环，记录后继续下一轮扫描。
                 logger.exception("outbox 中继异常，2 秒后重试")
             await asyncio.sleep(interval_seconds)

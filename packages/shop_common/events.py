@@ -27,9 +27,11 @@ class EventBus:
         self.namespace = namespace
 
     def _stream(self, topic: str) -> str:
+        # key 统一带命名空间，方便同一 Redis 实例上多个环境/应用互不干扰。
         return f"{self.namespace}:events:{topic}"
 
     def _dedupe_key(self, topic: str, group: str, event_id: str) -> str:
+        # 去重键按 topic + 消费组 + 事件 ID 隔离，不同消费组各自消费同一事件不会被互相吞掉。
         return f"{self.namespace}:dedupe:{topic}:{group}:{event_id}"
 
     async def publish(
@@ -51,12 +53,14 @@ class EventBus:
                 "tenant": tenant,
                 "payload": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             },
+            # 近似裁剪限制流长度，防止长期运行后事件无上限堆积撑爆 Redis。
             maxlen=maxlen,
             approximate=True,
         )
         return event_id
 
     async def ensure_group(self, topic: str, group: str) -> None:
+        # 组已存在时 Redis 返回 BUSYGROUP，按幂等成功处理，保证消费者重启不报错。
         try:
             await self.redis.xgroup_create(self._stream(topic), group, id="0", mkstream=True)
         except ResponseError as exc:
@@ -81,6 +85,7 @@ class EventBus:
         for _, messages in entries:
             for message_id, fields in messages:
                 event_id = fields.get("id", message_id)
+                # SET NX 占位做消费去重：已处理的事件直接 ack 跳过，占位 24 小时后自动过期。
                 dedupe = self._dedupe_key(topic, group, event_id)
                 if not await self.redis.set(dedupe, "1", nx=True, ex=86400):
                     await self.redis.xack(self._stream(topic), group, message_id)
@@ -94,6 +99,7 @@ class EventBus:
                 try:
                     await handler(event)
                 except Exception:
+                    # 处理失败时删除占位且不 ack，事件留在 pending，可继续重试。
                     await self.redis.delete(dedupe)
                     logger.exception("事件处理失败 topic=%s id=%s", topic, event_id)
                     continue
@@ -116,6 +122,7 @@ class EventBus:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # 循环异常（如 Redis 短暂不可用）不退出消费者，退避后继续。
                 logger.exception("事件循环异常 topic=%s，2 秒后重试", topic)
                 await asyncio.sleep(2)
 

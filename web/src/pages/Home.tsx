@@ -16,6 +16,7 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
 
+  // 搜索与分类都走同一接口，空字符串转 undefined 以免带上无效查询参数。
   const load = async () => {
     try {
       const data = await api.feed({ q: query || undefined, category: category || undefined });
@@ -26,6 +27,7 @@ export default function Home() {
     }
   };
 
+  // 切分类立即重查；关键词搜索由回车/按钮触发，避免每次输入都打后端。
   useEffect(() => {
     load();
   }, [category]);
@@ -88,6 +90,7 @@ export default function Home() {
               <p className="muted">{item.subtitle}</p>
               <div className="price-row">
                 <span className="price">{money(item.price_cents)}</span>
+                {/* 可售数量是列表接口聚合出的派生值，>0 才展示可售，否则统一显示缺货。 */}
                 <span className={item.available > 0 ? "stock" : "stock out"}>
                   {item.available > 0 ? `可售 ${item.available}` : "缺货"}
                 </span>

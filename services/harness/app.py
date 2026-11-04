@@ -46,6 +46,8 @@ async def lifespan(_: FastAPI):
     await init_models()
     redis = create_redis(settings.redis_url)
     memory = MemoryManager(redis)
+    # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
+    # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
     skills = {item.name: item for item in load_all(SKILL_ROOT)}
     runtime = AgentRuntime(registry, build_provider(), skills, memory)
     mcp_server = MCPServer("shop-agent-harness", registry)
@@ -111,6 +113,8 @@ async def list_agents() -> dict[str, Any]:
                 "description": manifest.description,
                 "trust": manifest.trust,
                 "allowed_tools": manifest.allowed_tools,
+                # 只要存在一条 high 级 finding 就整体判 deny：准入是「一票否决」，
+                # 避免部分风险被 medium 项稀释后放行。
                 "verdict": "deny"
                 if any(item.severity == "high" for item in manifest.findings)
                 else "allow",
@@ -131,6 +135,8 @@ async def verify_skill(name: str) -> dict[str, Any]:
     path = SKILL_ROOT / name / "SKILL.md"
     if not path.exists():
         raise ApiError("NOT_FOUND", f"技能 {name} 不存在")
+    # 重新扫描磁盘上的最新内容，供发布前/排障时核对准入结论；
+    # 这里的结果不会替换 lifespan 中缓存的运行时 manifest。
     manifest = load_skill(path)
     return manifest.to_dict()
 
@@ -174,6 +180,8 @@ async def chat(
 async def approve_run(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
     assert runtime is not None
     principal.require_staff()
+    # 审批重放必须绑定原 run_id：待审批负载按 run_id 存在 Redis 里，
+    # 审批人点击后取回原工具与参数执行，避免重新让模型生成参数。
     ctx = ToolContext(
         user_id=principal.user_id,
         role=principal.role,
@@ -189,6 +197,8 @@ async def get_evidence(run_id: str) -> dict[str, Any]:
     trace = load_trace(run_id)
     if not trace:
         raise ApiError("NOT_FOUND", "运行记录不存在")
+    # 证据接口只做投影，不重算：直接读 jsonl 里已落盘的事件，
+    # 保证返回内容与当时 trace_digest 覆盖的内容一致。
     start = next((item for item in trace if item["type"] == "run.start"), {})
     end = next((item for item in trace if item["type"] == "run.end"), {})
     tool_calls = [item for item in trace if item["type"] == "tool.result"]
@@ -206,6 +216,7 @@ async def get_evidence(run_id: str) -> dict[str, Any]:
 @app.get("/memory/{user_id}")
 async def memory_records(user_id: str, principal: PrincipalDep) -> dict[str, Any]:
     assert memory is not None
+    # 记忆是用户私有数据：普通用户只能读写自己的记录，运营/管理员才可跨用户查看。
     if not principal.is_staff() and principal.user_id != user_id:
         raise ApiError("FORBIDDEN", "无权查看他人记忆")
     return {"items": await memory.list_records(user_id)}
@@ -247,6 +258,7 @@ async def sandbox_health() -> dict[str, Any]:
 
 @app.post("/sandbox/run")
 async def sandbox_run(payload: SandboxRequest, principal: PrincipalDep) -> dict[str, Any]:
+    # 沙箱执行属于高危能力，只能由运营/管理员触发，不开放给普通终端用户。
     principal.require_staff()
     result = await sandbox.run(payload.code, language=payload.language, timeout=payload.timeout)
     return result.to_dict()
@@ -258,5 +270,7 @@ async def mcp_endpoint(request: Request, principal: PrincipalDep) -> dict[str, A
     assert mcp_server is not None
     body = await request.json()
     ctx = _ctx(principal, f"mcp-{principal.user_id}")
+    # 信任等级由平台角色推导，不接受客户端在 JSON-RPC 包里自报；
+    # 这是「manifest 不能提权」在 MCP 入口上的同一原则。
     trust = "certified" if principal.role == "admin" else ("vendor" if principal.role == "operator" else "reviewed")
     return await mcp_server.handle(body, ctx, trust=trust)

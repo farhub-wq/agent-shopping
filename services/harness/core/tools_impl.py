@@ -23,6 +23,8 @@ sandbox = SandboxManager()
 
 
 def _headers(ctx: ToolContext) -> dict[str, str]:
+    # 把调用者身份透传给下游服务，让每个服务按自己的规则再做一次授权，
+    # Agent 侧放行不等于数据侧放行。
     return {"X-User-Id": ctx.user_id, "X-User-Role": ctx.role, "X-Tenant": ctx.tenant}
 
 
@@ -36,6 +38,7 @@ async def _catalog_search(args: dict[str, Any], ctx: ToolContext) -> Any:
 
 
 async def _get(client: ServiceClient, path: str, params: dict[str, Any]) -> Any:
+    # 只拼 query 串，路径仍是固定常量（来自各工具函数），避免模型输入改变请求路径。
     query = "&".join(f"{key}={value}" for key, value in params.items())
     return await client.request("GET", f"{path}?{query}" if query else path)
 
@@ -144,6 +147,8 @@ async def _content_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
     }
 
 
+# 工具在模块导入时集中登记（注册副作用），app.py 只要 import 本模块，
+# 启动时 registry 就已包含全部业务工具；权限策略与 handler 在这里成对定义。
 registry.register(
     Tool(
         "catalog_search",
@@ -267,6 +272,8 @@ registry.register(
         "人工审批通过售后单（不可逆，默认不授予任何 Agent）",
         {"type": "object", "properties": {"ticket_id": {"type": "string"}, "note": {"type": "string"}}},
         _after_sales_approve,
+        # requires_approval=True 是唯一的执行入口条件：注册表会先返回 needs_approval，
+        # 只有人工审批后经 approve_and_replay 才会真正跑到 handler。
         ToolPolicy(
             "after_sales_approve",
             permission="write",
@@ -290,6 +297,8 @@ registry.register(
             "required": ["code"],
         },
         _sandbox_run,
+        # execute 权限意味着只有 vendor 及以上信任等级（且 exec=True）能用；
+        # reviewed/community 技能即使声明了 sandbox_run 也会被 policy 拦下。
         ToolPolicy("sandbox_run", permission="execute", risk="medium"),
     )
 )

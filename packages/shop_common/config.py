@@ -55,6 +55,7 @@ class ServiceSettings(BaseSettings):
         return f"sqlite+aiosqlite:///./data/{self.service_name}.db"
 
 
+# 配置是进程级单例：lru_cache 保证环境变量只解析一次，避免各模块持有不同配置快照。
 @lru_cache
 def get_settings() -> ServiceSettings:
     return ServiceSettings()

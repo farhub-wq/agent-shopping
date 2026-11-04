@@ -9,6 +9,7 @@ export default function Product() {
   const [qty, setQty] = useState(1);
   const [error, setError] = useState("");
 
+  // 详情接口同时返回商品信息与库存快照，换商品时按路由 id 重新拉取。
   useEffect(() => {
     api.product(id).then(setData).catch((exc) => setError(exc.message));
   }, [id]);
@@ -16,8 +17,10 @@ export default function Product() {
   if (error) return <p className="error">{error}</p>;
   if (!data) return <p className="muted">加载中…</p>;
   const { product, stock } = data;
+  // 库存字段可能缺失，用 nullish 兜底判断是否售罄，按钮状态统一由此派生。
   const soldOut = (stock.available ?? 0) <= 0;
 
+  // 只保留下单需要的字段，避免把整份详情响应塞进购物车/本地存储。
   const cartPayload = () => ({
     sku: product.sku,
     product_id: product.id,
@@ -50,6 +53,7 @@ export default function Product() {
         </div>
         <div className="qty-row">
           <span>数量</span>
+          {/* 数量在前端夹到 1..99，真正可用量仍由后端预占时校验。 */}
           <input
             type="number"
             min={1}

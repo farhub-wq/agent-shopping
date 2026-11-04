@@ -6,6 +6,7 @@ export interface Session {
   role: Role;
 }
 
+// 登录态与购物车都只落在 localStorage，前端不保存任何服务端会话副本。
 const SESSION_KEY = "shop_session";
 const CART_KEY = "shop_cart";
 
@@ -30,6 +31,7 @@ export function logout() {
   localStorage.removeItem(SESSION_KEY);
 }
 
+// 登录直接调用网关换取 token；拿到后立刻写回本地，后续请求统一读这份 session。
 export async function login(userId: string, role: Role): Promise<Session> {
   const response = await fetch("/api/auth/token", {
     method: "POST",
@@ -43,14 +45,20 @@ export async function login(userId: string, role: Role): Promise<Session> {
   return session;
 }
 
+/**
+ * 全站唯一的 HTTP 出口：统一拼 /api 前缀、注入登录态、解析错误响应。
+ * 页面组件不得自行 fetch，避免路径与鉴权头散落各处。
+ */
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const session = getSession();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string> | undefined),
   };
+  // 已登录时把 token 放进 Authorization；未登录请求走访客权限上限。
   if (session) headers.Authorization = `Bearer ${session.token}`;
   const response = await fetch(`/api${path}`, { ...options, headers });
+  // 后端错误体约定为 { code, message }，这里优先透出 message 供页面展示。
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
   if (!response.ok) {
@@ -67,6 +75,7 @@ export const api = {
     return request(`/storefront/feed${query ? `?${query}` : ""}`);
   },
   product: (productId: string) => request(`/storefront/products/${productId}`),
+  // 下单必须带 Idempotency-Key，由调用方生成，保证重复提交不会产生重复订单。
   checkout: (payload: any, idempotencyKey: string) =>
     request("/storefront/checkout", {
       method: "POST",
@@ -111,6 +120,7 @@ export function cartItems(): CartItem[] {
 
 export function saveCart(items: CartItem[]) {
   localStorage.setItem(CART_KEY, JSON.stringify(items));
+  // 购物车变更通过事件广播，Header 的角标据此刷新，避免组件间直接耦合。
   window.dispatchEvent(new Event("cart-updated"));
 }
 
@@ -131,6 +141,10 @@ export interface StreamEvent {
   [key: string]: any;
 }
 
+/**
+ * Agent 对话走 SSE 流式返回：逐帧解析 data: 行并回调页面。
+ * 不能用 response.json()，否则会等到整段结束时才更新 UI。
+ */
 export async function chatStream(
   skill: string,
   message: string,
@@ -153,6 +167,7 @@ export async function chatStream(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    // 按空行切分 SSE 事件；最后一段可能不完整，留在 buffer 等下一帧再拼。
     buffer += decoder.decode(value, { stream: true });
     const chunks = buffer.split("\n\n");
     buffer = chunks.pop() || "";
@@ -170,6 +185,7 @@ export async function chatStream(
   }
 }
 
+// 接口金额一律以“分”传输，展示时统一在此换算，避免各页面重复处理精度。
 export function money(cents: number): string {
   return `¥${(cents / 100).toFixed(2)}`;
 }

@@ -11,6 +11,7 @@ export default function Cart() {
 
   useEffect(() => setItems(cartItems()), []);
 
+  // 本地购物车的增删改都立即回写 localStorage，刷新或跳页后状态不丢。
   const update = (sku: string, qty: number) => {
     const next = items.map((item) => (item.sku === sku ? { ...item, qty: Math.max(1, qty) } : item));
     setItems(next);
@@ -23,16 +24,19 @@ export default function Cart() {
     saveCart(next);
   };
 
+  // 合计由本地单价×数量派生，仅用于展示；最终金额以服务端下单结果为准。
   const total = items.reduce((sum, item) => sum + item.price_cents * item.qty, 0);
 
   const submit = async () => {
     setBusy(true);
     setError("");
     try {
+      // 下单必须携带幂等键；同时用 busy 禁用按钮，避免提交期间重复点击产生多单。
       await api.checkout(
         { items: items.map((item) => ({ sku: item.sku, qty: item.qty })), address },
         crypto.randomUUID(),
       );
+      // 支付前先清空本地购物车；下单失败则保留，便于用户重试。
       clearCart();
       setItems([]);
       navigate("/orders");
@@ -74,6 +78,7 @@ export default function Cart() {
 
       <section className="panel">
         <h2>收货信息</h2>
+        {/* 地址字段按固定顺序渲染，标签映射集中在这一处，新增字段需同步补充。 */}
         {Object.entries(address).map(([key, value]) => (
           <label key={key}>
             {({ receiver: "收货人", phone: "手机号", province: "省份", city: "城市", detail: "详细地址" } as Record<string, string>)[key]}

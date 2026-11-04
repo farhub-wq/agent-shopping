@@ -16,6 +16,7 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
   const navigate = useNavigate();
 
   useEffect(() => {
+    // 监听购物车广播事件，角标数量由此处统一派生，不在各页面各自维护。
     const update = () => setCartCount(cartItems().reduce((sum, item) => sum + item.qty, 0));
     update();
     window.addEventListener("cart-updated", update);
@@ -26,6 +27,7 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
     const next = await login(userId, role);
     onSession(next);
     setShowLogin(false);
+    // 运营/管理员登录后直接进入后台，顾客仍留在商城流程。
     if (role !== "customer") navigate("/ops");
   };
 
@@ -42,6 +44,7 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
         <NavLink to="/" end>商城</NavLink>
         <NavLink to="/orders">订单</NavLink>
         <NavLink to="/agent">智能助手</NavLink>
+        {/* 运营后台入口只对运营/管理员开放；顾客侧不显示，服务端仍会再校验。 */}
         {(session?.role === "operator" || session?.role === "admin") && <NavLink to="/ops">运营后台</NavLink>}
       </nav>
       <div className="actions">
@@ -84,6 +87,7 @@ export default function App() {
     <BrowserRouter>
       <Header session={session} onSession={setSession} />
       <main className="page">
+        {/* 页面组件只负责渲染与交互，所有接口调用都封在 lib/api.ts 里。 */}
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/product/:id" element={<Product />} />

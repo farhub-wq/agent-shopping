@@ -23,12 +23,14 @@ class Product(Base):
     price_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(8), default="CNY")
     image_url: Mapped[str] = mapped_column(String(500), default="")
+    # 默认 draft：新建商品不能直接对外可见，必须经过上架流程。
     status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
+    # 显式挑选对外字段，不直接序列化 ORM 实例，避免后续新增内部字段时意外泄露。
     def to_dict(self) -> dict:
         return {
             "id": self.id,

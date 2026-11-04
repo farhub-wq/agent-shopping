@@ -11,6 +11,7 @@ local order_key = KEYS[1]
 local ttl = tonumber(ARGV[1])
 local n = tonumber(ARGV[2])
 
+-- 先全量校验，任一 SKU 不足立即返回失败下标，避免出现部分扣减的中间态。
 for i = 1, n do
   local available = tonumber(redis.call('GET', KEYS[i + 1]) or '-1')
   local need = tonumber(ARGV[i + 2])
@@ -19,6 +20,7 @@ for i = 1, n do
   end
 end
 
+-- 校验全部通过后再统一扣减，并把每项扣减量写入订单预占哈希，供回补/提交追溯。
 for i = 1, n do
   local need = tonumber(ARGV[i + 2])
   redis.call('DECRBY', KEYS[i + 1], need)
@@ -56,6 +58,7 @@ local users_key = KEYS[2]
 local user = ARGV[1]
 local limit = tonumber(ARGV[2])
 
+-- 重复购买校验与库存扣减在同一个原子脚本内，并发请求不会同时通过检查。
 if redis.call('SISMEMBER', users_key, user) == 1 then
   return {0, 'DUPLICATE', -1}
 end

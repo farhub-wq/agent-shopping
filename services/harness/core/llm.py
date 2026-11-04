@@ -53,12 +53,15 @@ class DeterministicPlanner(LLMProvider):
                 break
         tool_messages = [item for item in messages if item["role"] == "tool"]
         if tool_messages:
+            # 只要已经拿到过工具结果就直接收束成最终回答，避免离线规划器反复调用同一工具。
             return Decision(kind="final", content=self._compose(tool_messages))
 
         sku = SKU_PATTERN.search(last_user)
         text = last_user
 
         def choose(candidates: list[tuple[str, dict[str, Any]]]) -> Decision:
+            # 只从技能实际暴露的工具里挑，候选顺序表达「首选 / 退路」；
+            # 全都不可用时明确说明能力缺失，而不是编造一个不存在的工具名。
             for name, args in candidates:
                 if name in available:
                     return Decision(kind="tool", tool=name, args=args)
@@ -112,6 +115,7 @@ class DeterministicPlanner(LLMProvider):
                 payloads.append(content)
         if len(payloads) == 1:
             data = payloads[0]
+            # 工具返回非 ok 状态时必须如实转述失败，不能把错误包装成正常结论。
             if isinstance(data, dict) and data.get("status") not in {None, "ok"}:
                 return f"操作未完成：{data.get('message', '未知原因')}"
             return self._render(data)
@@ -153,6 +157,7 @@ class OpenAICompatibleProvider(LLMProvider):
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
+            # 工具 schema 直接来自白名单，模型只能在这些名字里选，减少幻觉式调用。
             "tools": [
                 {
                     "type": "function",
@@ -179,6 +184,7 @@ class OpenAICompatibleProvider(LLMProvider):
         usage = body.get("usage", {})
         calls = message.get("tool_calls") or []
         if calls:
+            # 一次决策只执行第一个工具调用：运行时按步审计，避免并发副作用难以归因。
             call = calls[0]
             return Decision(
                 kind="tool",
@@ -191,6 +197,8 @@ class OpenAICompatibleProvider(LLMProvider):
 
 def build_provider() -> LLMProvider:
     settings = get_settings()
+    # 两者齐备才切到真实模型；缺任一配置都退回离线规划器，
+    # 保证本地演示、CI 与回归测试不依赖外部网络和 API Key。
     if settings.llm_base_url and settings.llm_api_key:
         logger.info("使用 OpenAI 兼容模型 %s", settings.llm_model)
         return OpenAICompatibleProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)

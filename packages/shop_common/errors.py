@@ -24,6 +24,7 @@ class ApiError(Exception):
         self.code = code
         self.message = message
         self.details = details or {}
+        # 未登记的 code 退回 500，避免映射遗漏把失败当成成功状态返回。
         self.status_code = self.status_by_code.get(code, 500)
 
     def to_dict(self) -> dict[str, Any]:
@@ -35,6 +36,7 @@ def install_error_handlers(app: FastAPI, service_name: str) -> None:
     async def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
 
+    # 兜底异常只暴露错误类型，不返回堆栈与内部细节，避免信息泄漏。
     @app.exception_handler(Exception)
     async def _handle_unexpected(_: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(

@@ -21,6 +21,8 @@ EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.\w+")
 
 
 def redact(text: str) -> str:
+    # 工具输出可能带手机号/身份证/邮箱，统一在返回给模型前抹掉；
+    # 手机号与身份证用等长占位符，邮箱直接换成通用占位，兼顾可读性与脱敏。
     text = PHONE_PATTERN.sub("1**********", text)
     text = ID_CARD_PATTERN.sub("******************", text)
     return EMAIL_PATTERN.sub("***@***", text)
@@ -85,6 +87,8 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
+        # 同名工具直接报错而不是覆盖：注册冲突通常意味着两处实现互相遮蔽，
+        # 静默覆盖会让权限策略与实际 handler 对不上。
         if tool.name in self._tools:
             raise ValueError(f"工具重复注册: {tool.name}")
         self._tools[tool.name] = tool
@@ -105,12 +109,17 @@ class ToolRegistry:
         started = time.perf_counter()
         tool = self._tools.get(name)
         if tool is None:
+            # 未知工具不抛异常而是返回 error：让模型看到失败原因并自行换路，
+            # 同时这条结果仍会进入 trace。
             return ToolResult("error", message=f"未知工具 {name}")
         try:
+            # 第 1 步：权限上限。denied 也是正常返回值，不是异常。
             enforce(trust, tool.policy)
         except ApiError as exc:
             return ToolResult("denied", message=exc.message)
 
+        # 第 2 步：审批门槛。未在 ctx.approved 中的高风险工具一律转待审批，
+        # 语义上「已受理但未执行」，而不是失败。
         if tool.policy.requires_approval and name not in ctx.approved:
             return ToolResult(
                 "needs_approval",
@@ -119,6 +128,8 @@ class ToolRegistry:
             )
 
         try:
+            # 第 3 步：执行。业务异常转成 error 结果而不是向上抛，
+            # 让运行时能把失败原因回填给模型继续推理。
             data = await tool.handler(args, ctx)
         except ApiError as exc:
             return ToolResult(
@@ -135,6 +146,8 @@ class ToolRegistry:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
+        # 第 4 步：输出脱敏。只对字符串结果做正则替换；
+        # 结构化结果由各工具实现自行保证不含敏感字段。
         if isinstance(data, str):
             data = redact(data)
         return ToolResult("ok", data=data, duration_ms=int((time.perf_counter() - started) * 1000))

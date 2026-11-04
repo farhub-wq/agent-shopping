@@ -11,7 +11,8 @@ settings = get_settings()
 
 
 def create_token(*, user_id: str, role: str = "customer", tenant: str = "default") -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    # 令牌无状态：tenant 供多租户隔离，exp 由配置统一控制有效期，签发时不查库。
     payload = {
         "sub": user_id,
         "role": role,
@@ -36,6 +37,7 @@ class Principal:
         self.tenant = tenant
 
     def is_staff(self) -> bool:
+        # 只有运营与管理员可执行后台写操作，其余角色一律按顾客权限处理。
         return self.role in {"operator", "admin"}
 
     def require_staff(self) -> None:

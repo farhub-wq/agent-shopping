@@ -56,6 +56,8 @@ class AgentRuntime:
         self.memory = memory
 
     def _build_system(self, manifest: SkillManifest, memories: list[dict[str, Any]]) -> str:
+        # 把召回记忆与运行约束拼进 system prompt：
+        # 记忆提供个性化上下文，约束则把「不许编造、不可逆只能提议」写死在每次运行里。
         context = "\n".join(f"- [{item['kind']}] {item['text']}" for item in memories) or "- 无"
         return (
             f"{manifest.system_prompt}\n\n"
@@ -74,6 +76,8 @@ class AgentRuntime:
         manifest = self.skills.get(skill_name)
         if manifest is None:
             raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
+        # 准入兜底：带 high finding 的技能在运行入口再次被拒，
+        # 即使有人绕过 /agents 的展示判断直接调用 chat 也执行不了。
         if any(finding.severity == "high" for finding in manifest.findings):
             raise ApiError("FORBIDDEN", f"技能 {skill_name} 未通过准入检查")
 
@@ -94,6 +98,8 @@ class AgentRuntime:
     ) -> AgentRunResult:
         ledger = TraceLedger(ctx.run_id)
         manifest, system, messages = await self._prepare(skill_name, user_message, ctx)
+        # 工具白名单取 manifest 声明与注册表的交集：
+        # 声明了但没注册的忽略，注册了但没声明的不会暴露给模型。
         allowed = [name for name in manifest.allowed_tools if self.registry.get(name)]
         specs = self.registry.specs(allowed)
         steps_limit = max_steps or manifest.max_steps
@@ -107,6 +113,8 @@ class AgentRuntime:
 
         for step in range(steps_limit):
             usage["steps"] = step + 1
+            # 每步都先落 agent.step 再执行动作：trace 顺序即真实决策顺序，
+            # 出问题时能还原模型在拿到什么信息后做了什么。
             decision = await self.provider.decide(system, messages, specs)
             usage["prompt_chars"] += len(json.dumps(messages, ensure_ascii=False))
             ledger.append(
@@ -131,11 +139,14 @@ class AgentRuntime:
                 preview=str(result.data)[:200],
             )
             if result.status == "needs_approval":
+                # 不可逆动作到此为止：不执行、不继续推理，转存待审批负载等人工处理。
                 status = "pending_approval"
                 pending = {"tool": decision.tool, "args": decision.args, "reason": result.message}
                 ledger.append("approval.requested", tool=decision.tool, args=decision.args)
                 break
             if result.status in {"error", "denied"}:
+                # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
+                # 保证最终答案不会被当成完整成功。
                 tool_errors += 1
                 status = "degraded" if status == "completed" else status
 
@@ -164,13 +175,16 @@ class AgentRuntime:
                 }
             )
         else:
+            # for-else：循环跑满步数仍未得到 final 决策，说明任务无法在预算内收敛。
             status = "max_steps_exceeded"
             answer = "达到最大推理步数，未能完成任务。请缩小问题范围或转人工处理。"
 
         if pending is not None:
             answer = "该操作需要人工审批，已生成待审批请求。"
+            # 待审批负载只保留 1 小时：超时即失效，避免过期请求被无意批准。
             await self.memory.redis.set(
                 f"shop:harness:pending:{ledger.run_id}",
+                # approved 是 set，序列化成 list 才能放进 JSON；重放时再还原。
                 json.dumps({"skill": skill_name, "ctx": ctx.__dict__ | {"approved": list(ctx.approved)}, **pending}, ensure_ascii=False),
                 ex=3600,
             )
@@ -180,6 +194,8 @@ class AgentRuntime:
 
         usage["estimated_tokens"] = usage["prompt_chars"] // 3
 
+        # 会话结束统一落三处记忆：工作记忆保留原文、情节记忆保留结论、
+        # 语义事实在 _prepare 阶段已抽取。失败状态给更高重要性，便于后续复盘。
         await self.memory.append_turn(ctx.session_id, "user", user_message)
         await self.memory.append_turn(ctx.session_id, "assistant", answer)
         await self.memory.remember(
@@ -222,6 +238,7 @@ class AgentRuntime:
             return
         yield {"type": "start", "skill": skill_name, "trust": manifest.trust}
         result = await self.run(skill_name, user_message, ctx)
+        # 只推关键事件给前端：run.start/run.end 已在 final 结果里，避免流式输出冗余。
         for event in result.trace:
             if event["type"] in {"agent.step", "tool.call", "tool.result", "approval.requested"}:
                 yield {"type": "trace", "event": event}
@@ -233,8 +250,11 @@ class AgentRuntime:
         if not raw:
             raise ApiError("NOT_FOUND", "待审批请求不存在或已过期")
         payload = json.loads(raw)
+        # 人工审批即临时授权：把该工具加入 approved 让护栏放行，
+        # 并以 certified 等级重放，因为审批人本身已是 staff。
         ctx.approved.add(payload["tool"])
         result = await self.registry.execute(payload["tool"], payload["args"], ctx, trust="certified")
+        # 执行后立刻删除待审批 key，保证同一审批请求只能重放一次。
         await self.memory.redis.delete(f"shop:harness:pending:{run_id}")
         ledger = TraceLedger(run_id)
         ledger.append("approval.granted", tool=payload["tool"], approver=ctx.user_id)

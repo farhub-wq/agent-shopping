@@ -91,6 +91,8 @@ class MemoryManager:
         return f"{self.namespace}:mem:work:{session_id}"
 
     async def append_turn(self, session_id: str, role: str, content: str, max_turns: int = 12) -> None:
+        # 工作记忆只保留最近 max_turns 轮并设 24h 过期：
+        # 上下文成本有上界，也避免 Redis key 无限增长。
         await self.redis.lpush(
             self._work_key(session_id), json.dumps({"role": role, "content": content}, ensure_ascii=False)
         )
@@ -108,6 +110,7 @@ class MemoryManager:
             if match:
                 fact = f"{label}：{match.group(1).strip()}"
                 facts.append(fact)
+                # 语义事实高权重入库（0.85），保证称呼/地址/偏好这类信息优先被召回。
                 await self.remember(user_id, fact, kind="semantic", importance=0.85, tenant=tenant)
         return facts
 
@@ -135,6 +138,8 @@ class MemoryManager:
                 .all()
             )
             for record in recent:
+                # 相似度 ≥ 0.92 视为同一条记忆：用新文本覆盖并提升重要性，
+                # 既去重又保留最新表述，避免同一事实反复膨胀检索结果。
                 if cosine(embedding, record.embedding or []) >= 0.92:
                     record.text = text
                     record.importance = max(record.importance, importance)
@@ -173,7 +178,10 @@ class MemoryManager:
             for record in rows:
                 similarity = cosine(query_vector, record.embedding or [])
                 age_days = max((now - record.created_at.timestamp()) / 86400, 0)
+                # 时间衰减尺度为 7 天：exp(-age/7)，越久权重越低。
                 recency = math.exp(-age_days / 7)
+                # 混合打分固定权重：相关性 0.6 / 重要性 0.25 / 新鲜度 0.15；
+                # 相关性仍是主导项，重要事实可跨越时间被召回，但不会压过查询意图。
                 score = 0.6 * similarity + 0.25 * record.importance + 0.15 * recency
                 scored.append((score, record))
             scored.sort(key=lambda item: item[0], reverse=True)
@@ -181,6 +189,8 @@ class MemoryManager:
             selected: list[dict[str, Any]] = []
             used = 0
             for score, record in scored:
+                # 按字符数粗估 token（中文约 2 字符/token）；装不下的条目跳过而非中断，
+                # 让后面的短记忆仍有机会占满预算。
                 cost = max(len(record.text) // 2, 1)
                 if used + cost > token_budget:
                     continue
@@ -206,6 +216,8 @@ class MemoryManager:
         messages = await self.working_messages(session_id, limit=24)
         if len(messages) < keep_turns + 2:
             return None
+        # 早于 keep_turns 的轮次压成一条摘要落情节记忆，Redis 里只留最近的原文，
+        # 兼顾长期可追溯与短期上下文成本。
         older = messages[:-keep_turns]
         summary = "；".join(f"{item['role']}:{item['content'][:60]}" for item in older)[:500]
         await self.remember(
