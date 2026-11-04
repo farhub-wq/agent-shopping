@@ -1,17 +1,16 @@
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
-
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
+from sqlalchemy import func, or_, select
 
 from .models import Product
 from .rules import validate_product
@@ -206,7 +205,7 @@ async def update_product(product_id: str, payload: ProductUpdate, principal: Pri
                 raise ApiError("BAD_REQUEST", "商品不满足上架合规要求", details=check)
         for key, value in changes.items():
             setattr(product, key, value)
-        product.updated_at = datetime.now(timezone.utc)
+        product.updated_at = datetime.now(UTC)
         await session.commit()
         return product.to_dict()
 

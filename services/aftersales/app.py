@@ -2,14 +2,12 @@ import asyncio
 import contextlib
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import func, select
-
 from shop_common.auth import Principal, PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
@@ -18,6 +16,7 @@ from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay
+from sqlalchemy import func, select
 
 from .models import AfterSaleTicket
 from .policy import evaluate
@@ -83,7 +82,7 @@ async def _notify_order(ticket: AfterSaleTicket, event: str, extra: dict | None 
 async def _approve(ticket: AfterSaleTicket) -> None:
     # 通过动作同时落状态、决策时间与事件；调用方负责 commit，保证三者在一个事务里
     ticket.status = "approved"
-    ticket.decided_at = datetime.now(timezone.utc)
+    ticket.decided_at = datetime.now(UTC)
     await _notify_order(ticket, "after-sales.approved", {"amount_cents": ticket.amount_cents})
 
 
@@ -104,7 +103,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
 
     async with get_session_factory()() as session:
         # 只统计近 30 天本人工单数作为频次风控信号，时间窗口固定避免历史数据拖累判定
-        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff = datetime.now(UTC) - timedelta(days=30)
         recent = await session.scalar(
             select(func.count())
             .select_from(AfterSaleTicket)
@@ -122,7 +121,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
         )
         ticket = AfterSaleTicket(
             id=str(uuid.uuid4()),
-            ticket_no=f"AS{datetime.now(timezone.utc):%Y%m%d}{uuid.uuid4().hex[:6].upper()}",
+            ticket_no=f"AS{datetime.now(UTC):%Y%m%d}{uuid.uuid4().hex[:6].upper()}",
             order_id=payload.order_id,
             user_id=principal.user_id,
             type=payload.type,
@@ -138,7 +137,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
         if result["decision"] == "auto_reject":
             ticket.status = "rejected"
             ticket.decided_by = "policy-engine"
-            ticket.decided_at = datetime.now(timezone.utc)
+            ticket.decided_at = datetime.now(UTC)
         elif result["decision"] == "auto_approve":
             ticket.decided_by = "policy-engine"
             await _approve(ticket)
@@ -252,7 +251,7 @@ async def reject(ticket_id: str, principal: PrincipalDep, payload: Decision | No
         ticket.status = "rejected"
         ticket.decided_by = principal.user_id
         ticket.decision_note = note or "人工驳回"
-        ticket.decided_at = datetime.now(timezone.utc)
+        ticket.decided_at = datetime.now(UTC)
         await session.commit()
         result = ticket.to_dict()
     # 状态提交后再通知订单侧，驳回不涉及资金，无需与本地事务强绑定
@@ -272,7 +271,7 @@ async def refund_complete(ticket_id: str, principal: PrincipalDep) -> dict[str, 
         if ticket.status != "approved":
             raise ApiError("CONFLICT", "只有已通过的售后单可完成退款")
         ticket.status = "refunded"
-        ticket.decided_at = datetime.now(timezone.utc)
+        ticket.decided_at = datetime.now(UTC)
         await session.commit()
         result = ticket.to_dict()
 

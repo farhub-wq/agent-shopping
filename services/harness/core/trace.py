@@ -6,7 +6,7 @@
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ class TraceLedger:
         # seq 单调递增 + 追加写 jsonl：事件只增不改，任何删除或重排都会反映到 digest 上。
         event = {
             "seq": self._seq,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "type": event_type,
             **fields,
         }
@@ -76,7 +76,7 @@ class TraceLedger:
             # 外部核对时重算 jsonl 即可发现篡改。
             "trace_digest": self.digest(),
             "trace_path": str(self.path),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
         }
 
 

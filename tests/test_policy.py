@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-
 from harness.core.manifest import load_all, load_skill
 from harness.core.policy import ToolPolicy, enforce
 from shop_common.errors import ApiError

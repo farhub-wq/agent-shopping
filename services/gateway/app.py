@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-
 from shop_common.auth import Principal, PrincipalDep, create_token
 from shop_common.config import get_settings
 from shop_common.errors import ApiError, install_error_handlers

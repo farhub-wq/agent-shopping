@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from harness.core.llm import DeterministicPlanner
 
 SPECS = [

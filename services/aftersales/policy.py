@@ -3,7 +3,7 @@
 Agent 只能产出 recommendation，最终放行必须走人工或明确的高置信自动策略。
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 FRAUD_KEYWORDS = ["空包", "掉包", "少件", "假货", "未收到货却要求退款"]
@@ -25,7 +25,7 @@ def evaluate(
     recent_ticket_count: int,
     window_days: int,
 ) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # 超窗与订单状态属于硬性拒绝项，先短路返回，不进入打分，避免给出误导性的低风险分
     if now - order_created_at > timedelta(days=window_days):
         return {

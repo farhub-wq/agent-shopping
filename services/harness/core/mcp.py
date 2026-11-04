@@ -14,7 +14,6 @@ import sys
 from typing import Any
 
 import httpx
-
 from shop_common.logging import get_logger
 
 from .tools import Tool, ToolContext, ToolRegistry

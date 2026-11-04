@@ -6,7 +6,7 @@
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import DateTime, Integer, String, Text, select
@@ -30,7 +30,7 @@ class OutboxEvent(Base):
     tenant: Mapped[str] = mapped_column(String(64), default="default")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True  # noqa: UP017
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
     )
     # published_at 为空即待投递；attempts 与 last_error 用于重试与故障观测。
     published_at: Mapped[datetime | None] = mapped_column(
@@ -91,7 +91,7 @@ class OutboxRelay:
                         event_id=event.id,
                         tenant=event.tenant,
                     )
-                    event.published_at = datetime.now(timezone.utc)  # noqa: UP017
+                    event.published_at = datetime.now(UTC)
                     event.attempts += 1
                     sent += 1
                 except Exception as exc:  # 投递失败不阻塞后续事件，交给下一轮重试

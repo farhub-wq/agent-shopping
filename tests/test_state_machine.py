@@ -1,5 +1,4 @@
 import pytest
-
 from order.state_machine import resolve_target
 from shop_common.errors import ApiError
 

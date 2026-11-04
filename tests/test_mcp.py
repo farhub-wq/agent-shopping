@@ -1,5 +1,4 @@
 import pytest
-
 from harness.core.mcp import MCPServer
 from harness.core.policy import ToolPolicy
 from harness.core.tools import Tool, ToolContext, ToolRegistry

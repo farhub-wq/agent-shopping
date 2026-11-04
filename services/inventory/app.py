@@ -1,20 +1,19 @@
 import asyncio
 import uuid
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import select
-
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.logging import configure_logging, get_logger
+from sqlalchemy import select
 
 from .models import Reservation, Stock
 from .scripts import COMMIT_ORDER, RELEASE_ORDER, RESERVE_MULTI, SEC_KILL, SYNC_STOCK
@@ -82,7 +81,7 @@ async def seed_stocks() -> None:
 
 async def expire_stale_reservations() -> None:
     """预占超时未支付必须回补库存，否则大促期间库存会被幽灵订单吃光。"""
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=RESERVATION_TTL_SECONDS)
+    cutoff = datetime.now(UTC) - timedelta(seconds=RESERVATION_TTL_SECONDS)
     while True:
         await asyncio.sleep(30)
         try:
@@ -119,7 +118,7 @@ async def _release_locked(session, reservation: Reservation, *, reason: str) -> 
             stock.reserved = max(stock.reserved - item["qty"], 0)
     # 先标记 released，后续重复调用 release 会走幂等短路，不会二次回补。
     reservation.status = "released"
-    reservation.updated_at = datetime.now(timezone.utc)
+    reservation.updated_at = datetime.now(UTC)
     await _release_script(keys=[resv_key(reservation.order_id)])
     logger.info("释放预占 order=%s reason=%s", reservation.order_id, reason)
 
@@ -308,7 +307,7 @@ async def commit(payload: OrderRef, principal: PrincipalDep) -> dict[str, Any]:
                 stock.reserved = max(stock.reserved - item["qty"], 0)
                 stock.total = max(stock.total - item["qty"], 0)
         reservation.status = "committed"
-        reservation.updated_at = datetime.now(timezone.utc)
+        reservation.updated_at = datetime.now(UTC)
         await session.commit()
     await _commit_script(keys=[resv_key(payload.order_id)])
     return {"order_id": payload.order_id, "status": "committed"}

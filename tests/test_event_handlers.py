@@ -1,5 +1,4 @@
 import pytest
-
 from fulfillment import app as fulfillment_app
 
 

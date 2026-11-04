@@ -156,7 +156,7 @@ class SandboxManager:
         )
         try:
             stdout_raw, stderr_raw = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # 超时必须杀掉子进程并回收，否则脚本会在后台继续占用资源。
             process.kill()
             await process.wait()

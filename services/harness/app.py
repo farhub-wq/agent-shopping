@@ -8,7 +8,6 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import init_models

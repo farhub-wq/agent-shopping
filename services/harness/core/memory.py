@@ -13,17 +13,15 @@ import math
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from redis.asyncio import Redis
-from sqlalchemy import select
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import JSON, Float, Integer
-from sqlalchemy import DateTime, String, Text
-
 from shop_common.config import get_settings
 from shop_common.db import Base, get_session_factory
+from sqlalchemy import DateTime, String, Text, select
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import JSON, Float, Integer
 
 settings = get_settings()
 
@@ -39,8 +37,8 @@ class MemoryRecord(Base):
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     access_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    last_access: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    last_access: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class HashingEmbedder:
@@ -58,7 +56,7 @@ class HashingEmbedder:
                 # 每个 gram 做三次独立投影，降低哈希碰撞带来的伪相似度
                 for seed in range(3):
                     digest = hashlib.blake2b(
-                        f"{seed}:{gram}".encode("utf-8"), digest_size=8
+                        f"{seed}:{gram}".encode(), digest_size=8
                     ).digest()
                     slot = int.from_bytes(digest[:4], "big") % self.dim
                     sign = 1.0 if digest[4] % 2 == 0 else -1.0
@@ -143,7 +141,7 @@ class MemoryManager:
                 if cosine(embedding, record.embedding or []) >= 0.92:
                     record.text = text
                     record.importance = max(record.importance, importance)
-                    record.last_access = datetime.now(timezone.utc)
+                    record.last_access = datetime.now(UTC)
                     await session.commit()
                     return record.id
             record = MemoryRecord(
@@ -195,7 +193,7 @@ class MemoryManager:
                 if used + cost > token_budget:
                     continue
                 record.access_count += 1
-                record.last_access = datetime.now(timezone.utc)
+                record.last_access = datetime.now(UTC)
                 selected.append(
                     {
                         "id": record.id,

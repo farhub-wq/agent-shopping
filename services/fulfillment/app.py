@@ -2,14 +2,12 @@ import asyncio
 import contextlib
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from redis.asyncio import Redis
-from sqlalchemy import select
-
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
@@ -17,6 +15,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
+from sqlalchemy import select
 
 from .models import Shipment
 
@@ -41,7 +40,7 @@ async def handle_order_paid(event: dict[str, Any]) -> None:
         shipment = Shipment(
             id=str(uuid.uuid4()),
             order_id=order_id,
-            deadline_at=datetime.now(timezone.utc) + timedelta(hours=settings.fulfillment_sla_hours),
+            deadline_at=datetime.now(UTC) + timedelta(hours=settings.fulfillment_sla_hours),
         )
         session.add(shipment)
         await session.commit()
@@ -62,7 +61,7 @@ async def sla_scanner() -> None:
                             select(Shipment).where(
                                 Shipment.status == "pending",
                                 Shipment.sla_flagged.is_(False),
-                                Shipment.deadline_at < datetime.now(timezone.utc),
+                                Shipment.deadline_at < datetime.now(UTC),
                             )
                         )
                     )
@@ -170,7 +169,7 @@ async def ship(shipment_id: str, payload: ShipRequest, principal: PrincipalDep) 
         shipment.carrier = payload.carrier
         # 承运方未给单号时本地生成占位单号，保证下游事件始终有可追踪标识
         shipment.tracking_no = payload.tracking_no or f"{payload.carrier}{uuid.uuid4().hex[:12].upper()}"
-        shipment.shipped_at = datetime.now(timezone.utc)
+        shipment.shipped_at = datetime.now(UTC)
         # 状态变更与发货事件同事务入 outbox，避免出现「已发货但订单服务没收到事件」的不一致
         enqueue(
             session,
@@ -197,7 +196,7 @@ async def deliver(shipment_id: str, principal: PrincipalDep) -> dict[str, Any]:
         if shipment.status != "shipped":
             raise ApiError("CONFLICT", "只有已发货的履约单可签收")
         shipment.status = "delivered"
-        shipment.delivered_at = datetime.now(timezone.utc)
+        shipment.delivered_at = datetime.now(UTC)
         # 与发货同理：签收状态和事件必须原子落库，才能驱动订单侧转为已完成
         enqueue(
             session,

@@ -3,15 +3,12 @@ import contextlib
 import random
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
@@ -21,6 +18,8 @@ from shop_common.http import ServiceClient
 from shop_common.idempotency import IdempotencyStore
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Order, OrderEvent
 from .state_machine import STATE_LABELS, resolve_target
@@ -62,7 +61,7 @@ def _apply(
         )
     )
     order.status = target
-    order.updated_at = datetime.now(timezone.utc)
+    order.updated_at = datetime.now(UTC)
     return target
 
 
@@ -130,13 +129,13 @@ async def handle_event(event: dict[str, Any]) -> None:
             order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
             if order and order.status == "PAID":
                 _apply(session, order, "ship", actor="fulfillment")
-                order.shipped_at = datetime.now(timezone.utc)
+                order.shipped_at = datetime.now(UTC)
                 await session.commit()
         elif topic == "fulfillment.delivered":
             order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
             if order and order.status == "SHIPPED":
                 _apply(session, order, "deliver", actor="fulfillment")
-                order.completed_at = datetime.now(timezone.utc)
+                order.completed_at = datetime.now(UTC)
                 await session.commit()
         elif topic == "after-sales.approved":
             order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
@@ -259,7 +258,7 @@ async def create_order(
 
     order = Order(
         id=str(uuid.uuid4()),
-        order_no=f"SO{datetime.now(timezone.utc):%Y%m%d}{random.randint(0, 999999):06d}",
+        order_no=f"SO{datetime.now(UTC):%Y%m%d}{random.randint(0, 999999):06d}",
         user_id=principal.user_id,
         tenant=principal.tenant,
         status="CREATED",
@@ -396,7 +395,7 @@ async def pay_order(order_id: str, payload: PayRequest, principal: PrincipalDep)
             raise ApiError("CONFLICT", "支付失败，请更换支付方式", details={"order": order.to_dict()})
 
         _apply(session, order, "pay_success", actor=principal.user_id, detail={"method": payload.method})
-        order.paid_at = datetime.now(timezone.utc)
+        order.paid_at = datetime.now(UTC)
         # 支付成功事件与状态同事务入 outbox，下游（履约/通知）由 relay 异步投递。
         enqueue(session, "order", "order.paid", {"order_id": order.id, "amount_cents": order.amount_cents})
         await session.commit()
@@ -429,7 +428,7 @@ async def mark_shipped(order_id: str, principal: PrincipalDep) -> dict[str, Any]
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
         _apply(session, order, "ship", actor=principal.user_id)
-        order.shipped_at = datetime.now(timezone.utc)
+        order.shipped_at = datetime.now(UTC)
         await session.commit()
         return order.to_dict()
 
@@ -441,7 +440,7 @@ async def mark_completed(order_id: str, principal: PrincipalDep) -> dict[str, An
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
         _apply(session, order, "deliver", actor=principal.user_id)
-        order.completed_at = datetime.now(timezone.utc)
+        order.completed_at = datetime.now(UTC)
         await session.commit()
         return order.to_dict()
 

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import jwt
@@ -11,7 +11,7 @@ settings = get_settings()
 
 
 def create_token(*, user_id: str, role: str = "customer", tenant: str = "default") -> str:
-    now = datetime.now(timezone.utc)  # noqa: UP017
+    now = datetime.now(UTC)
     # 令牌无状态：tenant 供多租户隔离，exp 由配置统一控制有效期，签发时不查库。
     payload = {
         "sub": user_id,

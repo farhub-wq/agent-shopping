@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from aftersales.policy import evaluate
 
@@ -6,7 +6,7 @@ from aftersales.policy import evaluate
 def _evaluate(**overrides):
     base = dict(
         order_status="PAID",
-        order_created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        order_created_at=datetime.now(UTC) - timedelta(hours=3),
         amount_cents=9900,
         reason="quality_issue",
         description="收到时包装破损",
@@ -22,7 +22,7 @@ def test_small_low_risk_ticket_auto_approved():
 
 
 def test_expired_window_auto_rejected():
-    result = _evaluate(order_created_at=datetime.now(timezone.utc) - timedelta(days=10))
+    result = _evaluate(order_created_at=datetime.now(UTC) - timedelta(days=10))
     assert result["decision"] == "auto_reject"
 
 

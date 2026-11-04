@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-
 from shop_common.config import get_settings
 from shop_common.logging import get_logger
 

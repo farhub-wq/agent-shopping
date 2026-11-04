@@ -6,8 +6,9 @@
 
 import json
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 from shop_common.errors import ApiError
 from shop_common.logging import get_logger
