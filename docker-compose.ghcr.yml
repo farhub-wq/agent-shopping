@@ -1,0 +1,31 @@
+# 使用 CI/CD 构建的镜像运行，不重新构建。
+# 用法：REGISTRY_IMAGE=ghcr.io/farhub-wq/agent-shopping IMAGE_TAG=sha-<sha> \
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+# 需要 Docker Compose v2.24+（build: !reset 语法）。
+name: shop-agent
+
+services:
+  catalog:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/catalog:${IMAGE_TAG:-main}
+    build: !reset null
+  inventory:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/inventory:${IMAGE_TAG:-main}
+    build: !reset null
+  order:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/order:${IMAGE_TAG:-main}
+    build: !reset null
+  fulfillment:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/fulfillment:${IMAGE_TAG:-main}
+    build: !reset null
+  aftersales:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/aftersales:${IMAGE_TAG:-main}
+    build: !reset null
+  harness:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/harness:${IMAGE_TAG:-main}
+    build: !reset null
+  gateway:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/gateway:${IMAGE_TAG:-main}
+    build: !reset null
+  web:
+    image: ${REGISTRY_IMAGE:-ghcr.io/farhub-wq/agent-shopping}/web:${IMAGE_TAG:-main}
+    build: !reset null

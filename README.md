@@ -1,5 +1,8 @@
 # shop-agent
 
+[![CI](https://github.com/farhub-wq/agent-shopping/actions/workflows/ci.yml/badge.svg)](https://github.com/farhub-wq/agent-shopping/actions/workflows/ci.yml)
+[![CD](https://github.com/farhub-wq/agent-shopping/actions/workflows/cd.yml/badge.svg)](https://github.com/farhub-wq/agent-shopping/actions/workflows/cd.yml)
+
 **Harness 控制面 + 电商业务数据面的生产级参考实现。**
 
 目标不是再写一个商城 Demo，而是把电商最难的三类问题——**库存一致性、跨服务订单状态、Agent 权限与可验证性**——放进同一套可运行的骨架，并按生产标准逐步加固：真实资金、不丢单、不超卖、可回滚、可观测。
@@ -133,6 +136,18 @@ cd web && npm install && npm run build
 
 ---
 
+## CI/CD 与 PR 流程
+
+- **分支**：`main ← develop ← feature/<模块>`；一个 PR 只做一件事，后端、前端、文档分开提交。
+- **CI**：PR 触发 `backend`（ruff + pytest）、`frontend`（`tsc -b` + 构建）、`compose`（编排校验），汇总为必过检查 `ci`。
+- **AI 评审**：PR 打开/更新时读取 diff，按仓库规则检查状态机、库存原子性、Outbox/幂等、资金、权限与前端 API 层，回写到 PR 评论；只做建议，不阻塞合并。
+- **CD**：push `main` 或 `v*` 标签构建镜像并推送 GHCR，生产用不可变的 `sha-<sha>` 标签；部署按设计逐台主机执行，支持镜像标签回滚。
+- **必过门槛**：CI 全绿 + 人工批准 + 分支保护；真实资金开放前另需灰度与 1 元支付验证。
+
+配置项、分支保护步骤、GHCR 部署命令与本地复现见 [docs/CI-CD.md](docs/CI-CD.md)。
+
+---
+
 ## 三个难点怎么解
 
 | 难点 | 当前做法 | 生产目标 | 代码 |
@@ -244,6 +259,7 @@ web/                      React 18 + Vite：商城 / 订单售后 / 运营后台
 tests/                    状态机、售后政策、准入、策略、记忆、MCP、沙箱、事件过滤
 docs/design/              生产基线系统设计
 docs/requirements/        需求与验收标准
+.github/                  CI/CD、AI 评审脚本、PR 模板与 CODEOWNERS
 ```
 
 ---
@@ -253,6 +269,7 @@ docs/requirements/        需求与验收标准
 - [system-design.md](docs/design/system-design.md)：生产基线设计（部署、数据模型、资金、事件、沙箱、可观测、灾备、里程碑）
 - [requirements-shop-agent.md](docs/requirements/requirements-shop-agent.md)：需求、验收标准与差距
 - [implementation_plan.md](implementation_plan.md)：M1 账号与权限实施计划
+- [docs/CI-CD.md](docs/CI-CD.md)：CI/CD、分支保护、AI 评审配置与部署回滚
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层、数据所有权、事件契约、一致性设计
 - [docs/PUBLIC-SOLUTION.md](docs/PUBLIC-SOLUTION.md)：如何把这套骨架抽象成通用电商解决方案
 - [docs/RUNBOOK.md](docs/RUNBOOK.md)：启动、验收流程、故障排查
