@@ -64,10 +64,40 @@ app = FastAPI(title="identity", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "identity")
 
 
+# 字段名到展示名的映射，让校验错误能直接告诉调用方具体哪里不符合要求
+_FIELD_LABELS = {"phone": "手机号", "password": "密码", "email": "邮箱"}
+
+
+def _validation_message(errors: list[dict[str, Any]]) -> str:
+    """把 Pydantic 错误翻成中文提示，避免前端只看到笼统的“请求参数不合法”。"""
+    hints: list[str] = []
+    for error in errors:
+        # loc 形如 ("body", "phone")，取最后一个已知字段名做标签
+        field = next((str(part) for part in reversed(error.get("loc", ())) if part in _FIELD_LABELS), "")
+        label = _FIELD_LABELS.get(field, "参数")
+        kind = error.get("type", "")
+        ctx = error.get("ctx", {})
+        if kind == "string_pattern_mismatch" and field == "phone":
+            hints.append("手机号需为 11 位大陆手机号（1 开头，第二位 3-9）")
+        elif kind == "string_too_short":
+            hints.append(f"{label}不能少于 {ctx.get('min_length', 0)} 位")
+        elif kind == "string_too_long":
+            hints.append(f"{label}不能超过 {ctx.get('max_length', 0)} 位")
+        elif kind == "missing":
+            hints.append(f"缺少{label}")
+        else:
+            hints.append(f"{label}格式不正确")
+    return "；".join(dict.fromkeys(hints)) or "请求参数不合法"
+
+
 @app.exception_handler(RequestValidationError)
 async def _handle_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
     # 入口参数校验失败对外统一 400：422 是 FastAPI 默认行为，不符合本仓库的错误契约
-    return JSONResponse(status_code=400, content={"code": "BAD_REQUEST", "message": "请求参数不合法", "details": {"errors": exc.errors()}})
+    errors = exc.errors()
+    return JSONResponse(
+        status_code=400,
+        content={"code": "BAD_REQUEST", "message": _validation_message(errors), "details": {"errors": errors}},
+    )
 
 
 @app.get("/healthz")
@@ -144,9 +174,15 @@ def _primary_role(roles: list[str]) -> str:
 def _set_session_cookies(response: Response, refresh_raw: str, csrf: str) -> None:
     # refresh 走 HttpOnly Cookie，JS 读不到；csrf 非 HttpOnly，前端读取后回放到 X-CSRF-Token
     # path 限定为 /api/auth：浏览器只把凭证发给网关的认证路由，不随业务请求带出去
-    common = {"samesite": "lax", "secure": settings.env == "prod", "max_age": settings.refresh_ttl_seconds, "path": "/api/auth"}
-    response.set_cookie("shop_refresh", refresh_raw, httponly=True, **common)
-    response.set_cookie("shop_csrf", csrf, httponly=False, **common)
+    refresh_options = {"samesite": "lax", "secure": settings.env == "prod", "max_age": settings.refresh_ttl_seconds, "path": "/api/auth"}
+    # CSRF 需要被前端页面读取（双提交），path 不能限定在 /api/auth，
+    # 否则刷新页面后 /ops 等页面读不到 Cookie，access token 无法恢复
+    csrf_options = {**refresh_options, "path": "/"}
+    # 兼容旧版本写入的 /api/auth path：先让旧 Cookie 过期，避免浏览器里同名 Cookie 存在两个
+    # path 时读到旧值，导致刷新后 CSRF 校验失败
+    response.set_cookie("shop_csrf", "", max_age=0, path="/api/auth", httponly=False, samesite="lax", secure=settings.env == "prod")
+    response.set_cookie("shop_refresh", refresh_raw, httponly=True, **refresh_options)
+    response.set_cookie("shop_csrf", csrf, httponly=False, **csrf_options)
 
 
 async def _new_refresh_row(session, user_id: str, request: Request, rotated_from: str | None = None) -> str:
