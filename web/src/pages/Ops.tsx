@@ -24,9 +24,15 @@ export default function Ops() {
   };
 
   // 只有运营/管理员才请求数据；顾客身份直接走下面的拦截页。
+  // 依赖里带上登录身份：退出后在同一页面重新登录时，仅 tab 不变不会触发 effect，
+  // 会导致列表继续停留在旧会话的空数据上。
   useEffect(() => {
-    if (session && session.role !== "customer") load();
-  }, [tab]);
+    if (session && session.role !== "customer") {
+      // 各 tab 的数据结构不同，切换时先清空，避免用上一 tab 的行渲染（如库存行没有 order_id）
+      setRows([]);
+      load();
+    }
+  }, [tab, session?.user_id, session?.role]);
 
   // 前端仅做入口收敛，真正的权限校验由网关与服务端再验一次。
   if (!session || session.role === "customer") {
@@ -58,7 +64,15 @@ export default function Ops() {
           ["shipments", "履约"],
           ["tickets", "售后待审"],
         ] as [Tab, string][]).map(([key, label]) => (
-          <button key={key} className={tab === key ? "chip active" : "chip"} onClick={() => setTab(key)}>
+          <button
+            key={key}
+            className={tab === key ? "chip active" : "chip"}
+            onClick={() => {
+              // 切换 tab 与清空列表放在同一次事件里，避免 React 先用上一 tab 的数据渲染新 tab
+              setTab(key);
+              setRows([]);
+            }}
+          >
             {label}
           </button>
         ))}

@@ -116,6 +116,19 @@ export async function logout(): Promise<void> {
   }
 }
 
+let refreshPromise: Promise<Session | null> | null = null;
+
+// 刷新页面后 access token 只存在内存会丢失，但本地 session 还在。
+// 此时先静默换一次 token，否则运营接口会以匿名身份返回 403，页面只显示空列表。
+// 用共享 Promise 合并并发请求的刷新，避免同时发多个 /auth/refresh。
+async function ensureAccessToken(): Promise<void> {
+  if (accessToken || !getSession()) return;
+  refreshPromise ??= refreshSession().finally(() => {
+    refreshPromise = null;
+  });
+  await refreshPromise;
+}
+
 /**
  * 全站唯一的 HTTP 出口：统一拼 /api 前缀、注入登录态、解析错误响应。
  * 页面组件不得自行 fetch，避免路径与鉴权头散落各处。
@@ -125,6 +138,7 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string> | undefined),
   };
+  await ensureAccessToken();
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   let response = await fetch(`/api${path}`, { ...options, credentials: "include", headers });
   // access token 过期时只在已登录状态下自动刷新一次并重放；刷新失败会话已被清空，原错误继续抛出
@@ -228,6 +242,8 @@ export async function chatStream(
   sessionId: string,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
+  // 流式接口同样要保证 token 已恢复，否则刷新页面后首条消息会以匿名身份被拒
+  await ensureAccessToken();
   const response = await fetch(`/api/agents/${skill}/chat`, {
     method: "POST",
     credentials: "include",

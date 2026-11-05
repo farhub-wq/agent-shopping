@@ -8,6 +8,16 @@ import Orders from "./pages/Orders";
 import Ops from "./pages/Ops";
 import Agent from "./pages/Agent";
 
+const PHONE_PATTERN = /^1[3-9]\d{9}$/;
+
+// 与服务端 identity 的注册/登录校验保持一致，先在前端拦住明显不合规的输入，
+// 避免用户只收到笼统的“请求参数不合法”。
+function validateCredentials(phone: string, password: string): string {
+  if (!PHONE_PATTERN.test(phone)) return "手机号需为 11 位大陆手机号，例如 13800000000";
+  if (password.length < 8 || password.length > 72) return "密码长度需为 8-72 位";
+  return "";
+}
+
 function Header({ session, onSession }: { session: Session | null; onSession: (s: Session | null) => void }) {
   const [cartCount, setCartCount] = useState(0);
   const [showLogin, setShowLogin] = useState(false);
@@ -27,10 +37,16 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
 
   const submit = async () => {
     setError("");
+    // 先做本地校验，规则不合规时直接给出具体原因，不发无意义的请求
+    const invalid = validateCredentials(phone.trim(), password);
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
     try {
       // 注册成功后立刻登录建立会话，用户不用再输一次密码
-      if (mode === "register") await register(phone, password);
-      const next = await login(phone, password);
+      if (mode === "register") await register(phone.trim(), password);
+      const next = await login(phone.trim(), password);
       onSession(next);
       setShowLogin(false);
       // 运营/管理员登录后直接进入后台，顾客仍留在商城流程；角色来自服务端返回值
@@ -79,10 +95,12 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
             <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </label>
           <button className="primary" onClick={submit}>{mode === "login" ? "登录" : "注册并登录"}</button>
+          {/* 把账号规则前置展示，避免用户试错后才发现格式要求 */}
+          <p className="hint">手机号 11 位；密码 8-72 位</p>
           <button className="ghost small" onClick={() => setMode(mode === "login" ? "register" : "login")}>
             {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
           </button>
-          {error && <p className="hint">{error}</p>}
+          {error && <p className="form-error">{error}</p>}
         </div>
       )}
     </header>
