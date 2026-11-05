@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes, useNavigate } from "react-router-dom";
-import { cartItems, getSession, login, logout, type Role, type Session } from "./lib/api";
+import { cartItems, getSession, login, logout, refreshSession, register, type Session } from "./lib/api";
 import Home from "./pages/Home";
 import Product from "./pages/Product";
 import Cart from "./pages/Cart";
@@ -11,8 +11,10 @@ import Agent from "./pages/Agent";
 function Header({ session, onSession }: { session: Session | null; onSession: (s: Session | null) => void }) {
   const [cartCount, setCartCount] = useState(0);
   const [showLogin, setShowLogin] = useState(false);
-  const [userId, setUserId] = useState("demo-customer");
-  const [role, setRole] = useState<Role>("customer");
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [phone, setPhone] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -24,11 +26,18 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
   }, []);
 
   const submit = async () => {
-    const next = await login(userId, role);
-    onSession(next);
-    setShowLogin(false);
-    // 运营/管理员登录后直接进入后台，顾客仍留在商城流程。
-    if (role !== "customer") navigate("/ops");
+    setError("");
+    try {
+      // 注册成功后立刻登录建立会话，用户不用再输一次密码
+      if (mode === "register") await register(phone, password);
+      const next = await login(phone, password);
+      onSession(next);
+      setShowLogin(false);
+      // 运营/管理员登录后直接进入后台，顾客仍留在商城流程；角色来自服务端返回值
+      if (next.role !== "customer") navigate("/ops");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "操作失败");
+    }
   };
 
   return (
@@ -52,29 +61,28 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
           购物车 {cartCount > 0 && <span className="badge">{cartCount}</span>}
         </button>
         {session ? (
-          <button className="ghost" onClick={() => { logout(); onSession(null); }}>
+          <button className="ghost" onClick={() => { void logout().finally(() => onSession(null)); }}>
             {session.user_id} · {session.role === "customer" ? "顾客" : "运营"} / 退出
           </button>
         ) : (
-          <button className="primary small" onClick={() => setShowLogin((value) => !value)}>身份登录</button>
+          <button className="primary small" onClick={() => setShowLogin((value) => !value)}>登录 / 注册</button>
         )}
       </div>
       {showLogin && (
         <div className="login-panel">
           <label>
-            用户标识
-            <input value={userId} onChange={(event) => setUserId(event.target.value)} />
+            手机号
+            <input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="13800000000" />
           </label>
           <label>
-            角色
-            <select value={role} onChange={(event) => setRole(event.target.value as Role)}>
-              <option value="customer">顾客</option>
-              <option value="operator">运营</option>
-              <option value="admin">管理员</option>
-            </select>
+            密码
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </label>
-          <button className="primary" onClick={submit}>进入</button>
-          <p className="hint">演示环境直接签发身份令牌，生产环境应接统一登录。</p>
+          <button className="primary" onClick={submit}>{mode === "login" ? "登录" : "注册并登录"}</button>
+          <button className="ghost small" onClick={() => setMode(mode === "login" ? "register" : "login")}>
+            {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
+          </button>
+          {error && <p className="hint">{error}</p>}
         </div>
       )}
     </header>
@@ -83,6 +91,14 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(getSession());
+
+  useEffect(() => {
+    // access token 只在内存里，刷新页面后已丢失；挂载时靠 refresh Cookie 恢复一次会话
+    // 恢复失败保持未登录状态，不跳转、不弹错误
+    void refreshSession().then((restored) => {
+      if (restored) setSession(restored);
+    });
+  }, []);
   return (
     <BrowserRouter>
       <Header session={session} onSession={setSession} />

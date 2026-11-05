@@ -1,14 +1,16 @@
 export type Role = "customer" | "operator" | "admin";
 
 export interface Session {
-  token: string;
   user_id: string;
   role: Role;
+  phone: string;
 }
 
-// 登录态与购物车都只落在 localStorage，前端不保存任何服务端会话副本。
+// localStorage 只存展示用的会话快照；access token 只放内存，刷新页面后靠 Cookie 重新换
 const SESSION_KEY = "shop_session";
 const CART_KEY = "shop_cart";
+
+let accessToken: string | null = null;
 
 export interface CartItem {
   sku: string;
@@ -27,22 +29,91 @@ export function setSession(session: Session) {
   localStorage.setItem(SESSION_KEY, JSON.stringify(session));
 }
 
-export function logout() {
+function clearSession() {
+  accessToken = null;
   localStorage.removeItem(SESSION_KEY);
 }
 
-// 登录直接调用网关换取 token；拿到后立刻写回本地，后续请求统一读这份 session。
-export async function login(userId: string, role: Role): Promise<Session> {
-  const response = await fetch("/api/auth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_id: userId, role }),
-  });
-  if (!response.ok) throw new Error("登录失败");
-  const data = await response.json();
-  const session: Session = { token: data.token, user_id: data.user_id, role: data.role };
+interface AuthPayload {
+  access_token: string;
+  expires_in: number;
+  user: { id: string; phone: string; roles: Role[] };
+}
+
+// JWT 与服务端一样只认单一角色：多角色用户按最高权限角色展示与路由
+function primaryRole(roles: Role[]): Role {
+  if (roles.includes("admin")) return "admin";
+  if (roles.includes("operator")) return "operator";
+  return "customer";
+}
+
+function applyAuth(data: AuthPayload): Session {
+  accessToken = data.access_token;
+  const session: Session = { user_id: data.user.id, phone: data.user.phone, role: primaryRole(data.user.roles) };
   setSession(session);
   return session;
+}
+
+async function readError(response: Response): Promise<string> {
+  const body = (await response.json().catch(() => ({}))) as { message?: string };
+  return body.message || `请求失败 (${response.status})`;
+}
+
+// 登录只提交手机号与密码；角色永远由服务端按 DB 下发，前端不传角色
+export async function login(phone: string, password: string): Promise<Session> {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone, password }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return applyAuth((await response.json()) as AuthPayload);
+}
+
+export async function register(phone: string, password: string): Promise<void> {
+  const response = await fetch("/api/auth/register", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ phone, password }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
+}
+
+// 双提交 CSRF：读非 HttpOnly 的 shop_csrf Cookie，刷新/登出时回放到 Header
+export function csrfToken(): string | null {
+  const match = document.cookie.match(/(?:^|;\s*)shop_csrf=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+export async function refreshSession(): Promise<Session | null> {
+  const csrf = csrfToken();
+  if (!csrf) return null;
+  const response = await fetch("/api/auth/refresh", {
+    method: "POST",
+    credentials: "include",
+    headers: { "X-CSRF-Token": csrf },
+  });
+  if (!response.ok) {
+    clearSession();
+    return null;
+  }
+  return applyAuth((await response.json()) as AuthPayload);
+}
+
+export async function logout(): Promise<void> {
+  const csrf = csrfToken();
+  try {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      credentials: "include",
+      headers: csrf ? { "X-CSRF-Token": csrf } : {},
+    });
+  } finally {
+    // 无论服务端是否成功，本地会话都必须清掉，避免残留身份展示
+    clearSession();
+  }
 }
 
 /**
@@ -50,14 +121,20 @@ export async function login(userId: string, role: Role): Promise<Session> {
  * 页面组件不得自行 fetch，避免路径与鉴权头散落各处。
  */
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
-  const session = getSession();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string> | undefined),
   };
-  // 已登录时把 token 放进 Authorization；未登录请求走访客权限上限。
-  if (session) headers.Authorization = `Bearer ${session.token}`;
-  const response = await fetch(`/api${path}`, { ...options, headers });
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  let response = await fetch(`/api${path}`, { ...options, credentials: "include", headers });
+  // access token 过期时只在已登录状态下自动刷新一次并重放；刷新失败会话已被清空，原错误继续抛出
+  if (response.status === 401 && getSession()) {
+    const restored = await refreshSession();
+    if (restored) {
+      headers.Authorization = `Bearer ${accessToken}`;
+      response = await fetch(`/api${path}`, { ...options, credentials: "include", headers });
+    }
+  }
   // 后端错误体约定为 { code, message }，这里优先透出 message 供页面展示。
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
@@ -151,12 +228,12 @@ export async function chatStream(
   sessionId: string,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
-  const session = getSession();
   const response = await fetch(`/api/agents/${skill}/chat`, {
     method: "POST",
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
-      ...(session ? { Authorization: `Bearer ${session.token}` } : {}),
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     },
     body: JSON.stringify({ message, session_id: sessionId }),
   });
