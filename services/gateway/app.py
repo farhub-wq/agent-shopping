@@ -37,6 +37,30 @@ SERVICES = {
 
 RATE_LIMIT_PER_MINUTE = 120
 LOGIN_RATE_LIMIT_PER_MINUTE = 10
+
+# 服务名与下游真实路由前缀并非一一对应：inventory/orders/aftersales 带服务前缀，
+# fulfillment/harness 的路由没有前缀；agents 是 harness 的别名，还需要兼容
+# /agents/{skill}/chat 这类带前缀的路由。
+SERVICE_PATH_PREFIX = {
+    "catalog": "",
+    "inventory": "/inventory",
+    "orders": "/orders",
+    "fulfillment": "",
+    "aftersales": "/aftersales",
+    "harness": "",
+}
+# 这些路径属于 harness 根路由，不能再补 /agents 前缀
+HARNESS_ROOT_PREFIXES = ("runs/", "memory/", "sandbox/", "mcp")
+
+
+def _upstream_path(service: str, rest: str) -> str:
+    """把浏览器侧 /api/{service}/{rest} 还原成下游服务的真实路径。"""
+    if service == "agents":
+        # /api/agents/runs/... 等直接对应 harness 根路由，其余（如 {skill}/chat）补 /agents
+        return f"/{rest}" if rest.startswith(HARNESS_ROOT_PREFIXES) else f"/agents/{rest}"
+    prefix = SERVICE_PATH_PREFIX.get(service, "")
+    return f"{prefix}/{rest}" if prefix else f"/{rest}"
+
 redis: Redis | None = None
 
 
@@ -293,7 +317,7 @@ async def proxy(service: str, rest: str, request: Request, principal: PrincipalD
     base = SERVICES.get(service)
     if base is None:
         raise ApiError("NOT_FOUND", f"未知服务 {service}")
-    url = f"{base}/{rest}"
+    url = f"{base}{_upstream_path(service, rest)}"
     # 透传业务头但剔除 hop-by-hop 头（Host/Content-Length 等），否则 httpx 重建请求会冲突
     headers = {
         key: value
