@@ -5,7 +5,7 @@
 
 from typing import Any
 
-from shop_common.auth import Principal
+from shop_common.auth import Principal, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.http import ServiceClient
 
@@ -24,8 +24,8 @@ sandbox = SandboxManager()
 
 def _headers(ctx: ToolContext) -> dict[str, str]:
     # 把调用者身份透传给下游服务，让每个服务按自己的规则再做一次授权，
-    # Agent 侧放行不等于数据侧放行。
-    return {"X-User-Id": ctx.user_id, "X-User-Role": ctx.role, "X-Tenant": ctx.tenant}
+    # Agent 侧放行不等于数据侧放行；身份头必须带签名，否则下游会拒绝
+    return signed_identity_headers(ctx.user_id, ctx.role, ctx.tenant)
 
 
 def _principal(ctx: ToolContext) -> Principal:

@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from fastapi import FastAPI, Header, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import PrincipalDep
+from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
@@ -87,7 +87,7 @@ async def _reserve_inventory(order: Order) -> tuple[bool, str]:
             "POST",
             "/inventory/reserve",
             json={"order_id": order.id, "items": order.items},
-            headers={"Idempotency-Key": order.id, "X-User-Id": "system", "X-User-Role": "operator"},
+            headers={"Idempotency-Key": order.id, **signed_identity_headers("system", "operator", order.tenant)},
         )
         return True, ""
     except ApiError as exc:
@@ -104,7 +104,8 @@ async def _release_inventory(order_id: str, reason: str) -> None:
             "POST",
             "/inventory/release",
             json={"order_id": order_id, "reason": reason},
-            headers={"X-User-Id": "system", "X-User-Role": "operator"},
+            # 内部释放以系统身份调用，必须带签名头，否则下游会按未签名请求拒绝
+            headers=signed_identity_headers("system", "operator"),
         )
 
 
@@ -115,7 +116,8 @@ async def _commit_inventory(order_id: str) -> None:
             "POST",
             "/inventory/commit",
             json={"order_id": order_id},
-            headers={"X-User-Id": "system", "X-User-Role": "operator"},
+            # 与预占/释放一致：库存服务开启身份头信任后，未签名调用会被 401 拒绝
+            headers=signed_identity_headers("system", "operator"),
         )
 
 

@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import Principal, PrincipalDep
+from shop_common.auth import Principal, PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
@@ -30,12 +30,14 @@ order_client = ServiceClient(settings.order_url)
 
 
 def _forward(principal: Principal) -> dict[str, str]:
-    # 调用订单服务时只透传已鉴权身份，不接受客户端自定义角色，防止越权调用
-    return {
-        "X-User-Id": principal.user_id,
-        "X-User-Role": principal.role,
-        "X-Tenant": principal.tenant,
-    }
+    # 调用订单服务时只透传已鉴权身份，不接受客户端自定义角色，防止越权调用；
+    # 同时必须带上内网签名，否则订单服务会按未签名身份头拒绝
+    return signed_identity_headers(principal.user_id, principal.role, principal.tenant)
+
+
+def _operator_forward(principal: Principal) -> dict[str, str]:
+    # 资金动作以 operator 身份发起：按 operator 重新签名，不能只改头里的角色导致签名失效
+    return signed_identity_headers(principal.user_id, "operator", principal.tenant)
 
 
 @asynccontextmanager
@@ -154,7 +156,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
                 f"/orders/{ticket.order_id}/refund",
                 json={"amount_cents": ticket.amount_cents},
                 # 退款是内部资金动作，需以 operator 身份调用订单服务而非发起人的原始角色
-                headers={**_forward(principal), "X-User-Role": "operator"},
+                headers=_operator_forward(principal),
             )
     return {**ticket_dict, "policy": result}
 
@@ -232,7 +234,7 @@ async def approve(ticket_id: str, principal: PrincipalDep, payload: Decision | N
             f"/orders/{ticket.order_id}/refund",
             json={"amount_cents": ticket.amount_cents},
             # 与自动通过一致，以 operator 身份发起资金动作
-            headers={**_forward(principal), "X-User-Role": "operator"},
+            headers=_operator_forward(principal),
         )
     return result
 
@@ -282,7 +284,7 @@ async def refund_complete(ticket_id: str, principal: PrincipalDep) -> dict[str, 
             f"/orders/{ticket.order_id}/refund-complete",
             json={},
             # 同样以 operator 身份推进订单侧资金状态
-            headers={**_forward(principal), "X-User-Role": "operator"},
+            headers=_operator_forward(principal),
         )
     await _notify_order(ticket, "after-sales.refunded", {"amount_cents": ticket.amount_cents})
     return result

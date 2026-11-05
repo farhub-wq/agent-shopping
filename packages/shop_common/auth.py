@@ -53,6 +53,30 @@ def create_internal_signature(*, user_id: str, role: str, tenant: str, ts: str, 
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
+def signed_identity_headers(user_id: str, role: str, tenant: str = "default") -> dict[str, str]:
+    """服务间调用使用的身份头：现签时间戳 + 请求号，下游按签名校验身份。
+
+    服务间调用不能再手写 X-User-* 头，否则开启 TRUST_IDENTITY_HEADERS 后会被判无签名。
+    """
+    ts = str(int(time.time()))
+    request_id = uuid4().hex
+    signature = create_internal_signature(
+        user_id=user_id,
+        role=role,
+        tenant=tenant,
+        ts=ts,
+        request_id=request_id,
+        secret=settings.internal_signing_secret,
+    )
+    return {
+        "X-User-Id": user_id,
+        "X-User-Role": role,
+        "X-Tenant": tenant,
+        "X-Request-Id": request_id,
+        "X-Internal-Signature": f"{ts}.{signature}",
+    }
+
+
 def verify_internal_signature(
     signature: str,
     *,
