@@ -192,13 +192,18 @@ async def approve_run(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
 
 
 @app.get("/runs/{run_id}/evidence")
-async def get_evidence(run_id: str) -> dict[str, Any]:
+async def get_evidence(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
     trace = load_trace(run_id)
     if not trace:
         raise ApiError("NOT_FOUND", "运行记录不存在")
     # 证据接口只做投影，不重算：直接读 jsonl 里已落盘的事件，
     # 保证返回内容与当时 trace_digest 覆盖的内容一致。
     start = next((item for item in trace if item["type"] == "run.start"), {})
+    # 证据包含工具入参与结果，可能带用户数据：只允许运行发起人或运营人员查看，
+    # 防止拿到 run_id 就能读别人的运行轨迹（IDOR）。
+    owner = start.get("user")
+    if not principal.is_staff() and owner != principal.user_id:
+        raise ApiError("FORBIDDEN", "无权查看该运行证据")
     end = next((item for item in trace if item["type"] == "run.end"), {})
     tool_calls = [item for item in trace if item["type"] == "tool.result"]
     return {

@@ -8,11 +8,12 @@ from typing import Any
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from redis.asyncio import Redis
-from shop_common.auth import PrincipalDep
+from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
+from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
 from sqlalchemy import select
@@ -24,6 +25,7 @@ logger = get_logger(__name__)
 
 redis: Redis | None = None
 bus: EventBus | None = None
+order_client = ServiceClient(settings.order_url)
 
 
 async def handle_order_paid(event: dict[str, Any]) -> None:
@@ -146,7 +148,24 @@ async def list_shipments(
 
 @app.get("/shipments/by-order/{order_id}")
 async def shipment_by_order(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
-    # 按订单查履约单是用户侧高频入口，不做员工限制，但只返回本服务自有字段
+    # 按订单查履约单是用户侧高频入口：非员工必须先确认订单归属，
+    # 否则拿到 order_id 就能枚举他人物流状态。
+    if not principal.is_staff():
+        if principal.user_id == "guest":
+            raise ApiError("FORBIDDEN", "请先登录后查看履约信息")
+        try:
+            order = await order_client.request(
+                "GET",
+                f"/orders/{order_id}",
+                headers=signed_identity_headers(principal.user_id, principal.role, principal.tenant),
+            )
+        except ApiError as exc:
+            # 订单不存在与无权查看统一返回 403，避免通过状态码探测他人订单
+            if exc.code in {"FORBIDDEN", "NOT_FOUND"}:
+                raise ApiError("FORBIDDEN", "无权查看该订单的履约信息") from exc
+            raise
+        if order.get("user_id") != principal.user_id:
+            raise ApiError("FORBIDDEN", "无权查看该订单的履约信息")
     async with get_session_factory()() as session:
         shipment = await session.scalar(select(Shipment).where(Shipment.order_id == order_id))
         if shipment is None:
