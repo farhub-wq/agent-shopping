@@ -1,0 +1,88 @@
+# 生产差异 overlay：只覆盖与本地开发的差异，公共定义仍在 docker-compose.yml。
+# 需要 Docker Compose v2.24+（ports !reset 语法）。
+# 双主机部署、LB 与托管 PostgreSQL/Redis 在 M3 接入；M1 只验证本 overlay 可解析。
+name: shop-agent
+
+services:
+  # 内网服务一律不暴露宿主机端口，外部流量只能走 gateway / web
+  catalog:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: &logging
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  inventory:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  order:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  fulfillment:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  aftersales:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  harness:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  identity:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  postgres:
+    restart: unless-stopped
+    ports: !reset []
+    logging: *logging
+
+  redis:
+    restart: unless-stopped
+    ports: !reset []
+    logging: *logging
+
+  gateway:
+    restart: unless-stopped
+    environment:
+      # 生产只认 JWT + HMAC 签名身份头（设计 §5.1）：dev 换 token 关闭；
+      # TRUST_IDENTITY_HEADERS 必须保持 true（基座默认），否则 BFF 转发会退化为访客，
+      # 前提是 INTERNAL_SIGNING_SECRET 已注入随机值且内网不对外开放
+      ENV: prod
+      AUTH_DEV_MODE: "false"
+    logging: *logging
+
+  web:
+    restart: unless-stopped
+    logging: *logging

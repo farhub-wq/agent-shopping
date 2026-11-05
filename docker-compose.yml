@@ -3,6 +3,11 @@ name: shop-agent
 x-service-env: &service-env
   REDIS_URL: redis://redis:6379/0
   JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
+  # 本地开发默认信任网关签名的身份头；生产 overlay 里会关掉
+  INTERNAL_SIGNING_SECRET: ${INTERNAL_SIGNING_SECRET:-dev-internal-signing-secret}
+  TRUST_IDENTITY_HEADERS: ${TRUST_IDENTITY_HEADERS:-true}
+  AUTH_DEV_MODE: ${AUTH_DEV_MODE:-false}
+  ENV: ${ENV:-dev}
   INVENTORY_URL: http://inventory:8000
   CATALOG_URL: http://catalog:8000
   ORDER_URL: http://order:8000
@@ -10,6 +15,7 @@ x-service-env: &service-env
   AFTERSALES_URL: http://aftersales:8000
   GATEWAY_URL: http://gateway:8000
   HARNESS_URL: http://harness:8000
+  IDENTITY_URL: http://identity:8000
   LLM_BASE_URL: ${LLM_BASE_URL:-}
   LLM_API_KEY: ${LLM_API_KEY:-}
   LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
@@ -124,11 +130,23 @@ services:
     ports: ["8006:8000"]
     healthcheck: *healthcheck
 
+  identity:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: identity } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/identity_db
+      BOOTSTRAP_ADMIN_PHONE: ${BOOTSTRAP_ADMIN_PHONE:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8007:8000"]
+    healthcheck: *healthcheck
+
   gateway:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: gateway } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/order_db
       SERVICE_NAME: gateway
     depends_on:
       catalog: { condition: service_healthy }
@@ -137,6 +155,7 @@ services:
       fulfillment: { condition: service_healthy }
       aftersales: { condition: service_healthy }
       harness: { condition: service_healthy }
+      identity: { condition: service_healthy }
     ports: ["8080:8000"]
     healthcheck: *healthcheck
 
