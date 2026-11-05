@@ -5,16 +5,17 @@
 
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import Principal, PrincipalDep, create_token
+from shop_common.auth import Principal, PrincipalDep, create_internal_signature, create_token
 from shop_common.config import get_settings
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
@@ -35,16 +36,33 @@ SERVICES = {
 }
 
 RATE_LIMIT_PER_MINUTE = 120
+LOGIN_RATE_LIMIT_PER_MINUTE = 10
 redis: Redis | None = None
 
 
-def _forward(principal: Principal) -> dict[str, str]:
-    # 网关鉴权后重建身份头：下游服务只信任这里写入的身份，客户端自带的同名头已被覆盖
+def _forward(principal: Principal, request_id: str) -> dict[str, str]:
+    # 网关鉴权后重建身份头并加内网签名：下游只信任这里写入的身份，客户端自带的同名头已被覆盖
+    ts = str(int(time.time()))
+    signature = create_internal_signature(
+        user_id=principal.user_id,
+        role=principal.role,
+        tenant=principal.tenant,
+        ts=ts,
+        request_id=request_id,
+        secret=settings.internal_signing_secret,
+    )
     return {
         "X-User-Id": principal.user_id,
         "X-User-Role": principal.role,
         "X-Tenant": principal.tenant,
+        "X-Request-Id": request_id,
+        "X-Internal-Signature": f"{ts}.{signature}",
     }
+
+
+def _request_id(request: Request) -> str:
+    # 优先沿用调用方带来的请求号，没有则现场生成，保证审计链可串起来
+    return request.headers.get("x-request-id") or uuid.uuid4().hex
 
 
 @asynccontextmanager
@@ -67,23 +85,39 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def rate_limit(request: Request, call_next):
-    # 只限流业务接口；非 /api 路径与换 token 接口放行，否则登录会被自己的限流挡住
-    if not request.url.path.startswith("/api") or request.url.path == "/api/auth/token":
-        return await call_next(request)
+async def _hit(key: str) -> int:
     assert redis is not None
-    # 优先按已鉴权用户维度计数，未带身份时退化为客户端 IP，避免匿名流量绕过限额
-    identity = request.headers.get("x-user-id") or (request.client.host if request.client else "unknown")
-    # 固定时间窗（按自然分钟取整），窗口内共享同一个 Redis 计数器
-    window = int(time.time() // 60)
-    key = f"shop:rl:{identity}:{window}"
     count = await redis.incr(key)
     if count == 1:
         # 首次计数时设 TTL，留 5 秒余量保证跨窗口时旧 key 能自然过期
         await redis.expire(key, 65)
-    if count > RATE_LIMIT_PER_MINUTE:
-        raise ApiError("RATE_LIMITED", "请求过于频繁，请稍后再试")
+    return count
+
+
+def _rate_limited(message: str) -> JSONResponse:
+    # 中间件里抛 ApiError 到不了异常处理器，直接组装 429 响应返回
+    return JSONResponse(status_code=429, content={"code": "RATE_LIMITED", "message": message, "details": {}})
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    path = request.url.path
+    # 只限流业务接口；非 /api 路径与认证类接口另行处理，否则登录会被自己的限流挡住
+    if not path.startswith("/api"):
+        return await call_next(request)
+    window = int(time.time() // 60)
+    if path == "/api/auth/login":
+        # 登录单独按客户端 IP 严格限流，提高暴力破解成本
+        ip = request.client.host if request.client else "unknown"
+        if await _hit(f"shop:rl:login:{ip}:{window}") > LOGIN_RATE_LIMIT_PER_MINUTE:
+            return _rate_limited("登录请求过于频繁，请稍后再试")
+        return await call_next(request)
+    if path in {"/api/auth/register", "/api/auth/refresh", "/api/auth/token"}:
+        return await call_next(request)
+    # 优先按已鉴权用户维度计数，未带身份时退化为客户端 IP，避免匿名流量绕过限额
+    identity = request.headers.get("x-user-id") or (request.client.host if request.client else "unknown")
+    if await _hit(f"shop:rl:{identity}:{window}") > RATE_LIMIT_PER_MINUTE:
+        return _rate_limited("请求过于频繁，请稍后再试")
     return await call_next(request)
 
 
@@ -97,13 +131,67 @@ class TokenRequest(BaseModel):
     role: str = "customer"
 
 
+def _dev_token_enabled() -> bool:
+    # dev 换 token 只用于本地演示：生产环境或非显式开启时等同接口不存在
+    return settings.env == "dev" and settings.auth_dev_mode
+
+
 @app.post("/api/auth/token")
 async def issue_token(payload: TokenRequest) -> dict[str, Any]:
+    if not _dev_token_enabled():
+        raise ApiError("NOT_FOUND", "接口不存在")
     # 角色白名单收口在这里：签发端只认这三种，避免下游拿到未定义角色
     if payload.role not in {"customer", "operator", "admin"}:
         raise ApiError("BAD_REQUEST", "不支持的角色")
     token = create_token(user_id=payload.user_id, role=payload.role)
     return {"token": token, "role": payload.role, "user_id": payload.user_id}
+
+
+async def _proxy_auth(request: Request, path: str) -> Response:
+    """把认证请求代理到 identity；Set-Cookie 原样回传，让会话 Cookie 落在网关域上。"""
+    headers = {}
+    for name in ("content-type", "cookie", "x-csrf-token", "authorization"):
+        if value := request.headers.get(name):
+            headers[name] = value
+    body = await request.body()
+    async with httpx.AsyncClient(timeout=10) as client:
+        upstream = await client.request(
+            request.method, f"{settings.identity_url}{path}", content=body or None, headers=headers
+        )
+    # 只透传 set-cookie，不复制 content-length 等 hop-by-hop 头
+    response = Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+    for value in upstream.headers.get_list("set-cookie"):
+        response.headers.append("set-cookie", value)
+    return response
+
+
+@app.post("/api/auth/register")
+async def auth_register(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/register")
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/login")
+
+
+@app.post("/api/auth/refresh")
+async def auth_refresh(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/refresh")
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/logout")
+
+
+@app.get("/api/me")
+async def auth_me(request: Request) -> Response:
+    return await _proxy_auth(request, "/me")
 
 
 @app.get("/api/storefront/products/{product_id}")
@@ -136,7 +224,7 @@ async def storefront_feed(principal: PrincipalDep, q: str | None = None, categor
 @app.post("/api/storefront/checkout")
 async def checkout(request: Request, principal: PrincipalDep) -> dict[str, Any]:
     body = await request.json()
-    headers = {"Content-Type": "application/json", **_forward(principal)}
+    headers = {"Content-Type": "application/json", **_forward(principal, _request_id(request))}
     # 透传幂等键给订单服务：客户端重试下单时由下游保证只创建一单
     if key := request.headers.get("idempotency-key"):
         headers["Idempotency-Key"] = key
@@ -150,12 +238,12 @@ async def checkout(request: Request, principal: PrincipalDep) -> dict[str, Any]:
 
 
 @app.get("/api/storefront/orders")
-async def my_orders(principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
+async def my_orders(request: Request, principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(
             f"{settings.order_url}/orders",
             params={"status": status} if status else {},
-            headers=_forward(principal),
+            headers=_forward(principal, _request_id(request)),
         )
     return response.json()
 
@@ -166,7 +254,7 @@ async def pay(order_id: str, request: Request, principal: PrincipalDep) -> dict[
     body = await request.json() if await request.body() else {}
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"{settings.order_url}/orders/{order_id}/pay", json=body, headers=_forward(principal)
+            f"{settings.order_url}/orders/{order_id}/pay", json=body, headers=_forward(principal, _request_id(request))
         )
     payload = response.json()
     if response.status_code >= 400:
@@ -175,26 +263,26 @@ async def pay(order_id: str, request: Request, principal: PrincipalDep) -> dict[
 
 
 @app.get("/api/agents")
-async def agents(principal: PrincipalDep) -> dict[str, Any]:
+async def agents(request: Request, principal: PrincipalDep) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(f"{settings.harness_url}/agents", headers=_forward(principal))
+        response = await client.get(f"{settings.harness_url}/agents", headers=_forward(principal, _request_id(request)))
     return response.json()
 
 
 @app.get("/api/policies")
-async def policies(principal: PrincipalDep) -> dict[str, Any]:
+async def policies(request: Request, principal: PrincipalDep) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(f"{settings.harness_url}/policies", headers=_forward(principal))
+        response = await client.get(f"{settings.harness_url}/policies", headers=_forward(principal, _request_id(request)))
     return response.json()
 
 
 @app.get("/api/orders")
-async def all_orders(principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
+async def all_orders(request: Request, principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(
             f"{settings.order_url}/orders",
             params={"status": status} if status else {},
-            headers=_forward(principal),
+            headers=_forward(principal, _request_id(request)),
         )
     return response.json()
 
@@ -213,7 +301,7 @@ async def proxy(service: str, rest: str, request: Request, principal: PrincipalD
         if key.lower() not in {"host", "content-length", "connection", "accept-encoding"}
     }
     # 身份头以网关鉴权结果为准，覆盖客户端传入值
-    headers.update(_forward(principal))
+    headers.update(_forward(principal, _request_id(request)))
     body = await request.body()
     method = request.method
 

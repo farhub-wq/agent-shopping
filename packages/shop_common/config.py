@@ -19,7 +19,19 @@ class ServiceSettings(BaseSettings):
 
     jwt_secret: str = "dev-only-secret-change-me"
     jwt_algorithm: str = "HS256"
-    jwt_ttl_seconds: int = 86400
+    # access token 只活 15 分钟，长期会话靠 refresh cookie 轮换
+    jwt_ttl_seconds: int = 900
+    # 运行环境标识：prod 下 Cookie 加 secure、dev 换 token 接口关闭
+    env: str = "dev"
+    refresh_ttl_seconds: int = 604800
+    login_max_failures: int = 5
+    login_lock_minutes: int = 15
+    # 内网身份头签名密钥与信任开关：仅网关签名后的 X-User-* 才可信，生产必须注入密钥
+    internal_signing_secret: str = ""
+    trust_identity_headers: bool = False
+    identity_url: str = "http://localhost:8007"
+    # 本地演示用的自选角色换 token 接口：只在 env=dev 且显式开启时挂载，生产必须关闭
+    auth_dev_mode: bool = False
 
     catalog_url: str = "http://localhost:8001"
     inventory_url: str = "http://localhost:8002"
