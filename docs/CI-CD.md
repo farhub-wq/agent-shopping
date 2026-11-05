@@ -31,6 +31,29 @@ main ← develop ← feature/<模块>
 
 这些是仓库设置，不在代码里；需管理员在 GitHub 界面开启。
 
+### 分支保护配置步骤（管理员操作）
+
+前置条件：CI 至少在 PR 或 push 上跑过一次，否则第 4 步的 check 名称搜索不到。可先向 `develop` 提一个 PR 触发。
+
+**`main` 分支**
+
+1. 打开仓库 → **Settings** → 左侧 **Code and automation → Branches**。
+2. 点 **Add branch protection rule**（若仓库使用新版 Rulesets：Settings → **Rules → Rulesets** → **New ruleset → New branch ruleset**，规则项相同，Enforcement status 选 Active）。
+3. **Branch name pattern** 填 `main`（Rulesets 里走 Add target → Include by pattern）。
+4. 按本节要求逐项勾选：
+   - **Require a pull request before merging**：**Required approvals** 设 `1`，并勾选 **Dismiss stale pull request approvals when new commits are pushed**；
+   - **Require status checks to pass before merging**：勾选 **Require branches to be up to date before merging**，在搜索框依次添加 `ci`、`backend`、`frontend`、`compose` 四个 check；
+   - **Block force pushes**，不勾选 Allow deletions；
+   - 建议勾选 **Do not allow bypassing the above settings**，防止管理员临时绕过。
+5. 点 **Create**（或 **Save changes**）。
+
+**`develop` 分支**：重复上述步骤，pattern 填 `develop`，required checks 与 approvals 相同。
+
+**验证生效**
+
+- 直接 `git push origin main` 应被远端拒绝（`GH006: Protected branch update failed`）。
+- 向 `main` 开一个测试 PR：4 个 required check 未全绿或无 approval 时，合并按钮应显示 "Merging is blocked"。
+
 ## 3. CD（[.github/workflows/cd.yml](../.github/workflows/cd.yml)）
 
 触发：push 到 `main`、push `v*` 标签、手动 `workflow_dispatch`。
