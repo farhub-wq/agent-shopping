@@ -73,15 +73,29 @@ $env:SANDBOX_ENABLED='false'
 
 以下命令假设网关在 `http://localhost:8080`。
 
-### 4.1 登录
+### 4.1 注册与登录
 
 ```bash
-curl -s -X POST localhost:8080/api/auth/token \
+# 注册（默认授予 customer 角色；运营/管理员账号由 bootstrap 环境变量或后续管理接口发放）
+curl -s -X POST localhost:8080/api/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"user_id":"demo-customer","role":"customer"}'
+  -d '{"phone":"13800000001","password":"Passw0rd!"}'
+
+# 登录：返回 access_token，并把 refresh/CSRF Cookie 存到 cookies.txt
+curl -s -c cookies.txt -X POST localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"13800000001","password":"Passw0rd!"}'
+
+# 会话续期（access token 15 分钟过期后）：从 cookies.txt 里取 shop_csrf 的值填入 X-CSRF-Token
+curl -s -b cookies.txt -c cookies.txt -X POST localhost:8080/api/auth/refresh \
+  -H 'X-CSRF-Token: <shop_csrf 值>'
+
+# 登出：撤销服务端 refresh 令牌
+curl -s -b cookies.txt -X POST localhost:8080/api/auth/logout \
+  -H 'X-CSRF-Token: <shop_csrf 值>'
 ```
 
-保存返回的 `token`，后续用 `Authorization: Bearer $TOKEN`。运营操作用 `role=operator` 再取一个 token。
+保存登录返回的 `access_token`，后续用 `Authorization: Bearer $TOKEN`。运营/管理员账号：空库启动时设置 `BOOTSTRAP_ADMIN_PHONE` / `BOOTSTRAP_ADMIN_PASSWORD` 环境变量可引导第一个 admin；登录后按返回的 `role` 判断是否可进运营后台。
 
 ### 4.2 浏览与下单
 
@@ -175,11 +189,16 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
 | inventory 启动即退出 | Redis 不可达（启动要播种热库存） | `docker compose ps redis`，检查 `REDIS_URL` |
-| 下单 401 | 未带 token 或 `JWT_SECRET` 不一致 | 重新取 token，确认所有服务同一 secret |
+| 下单 401 | 未带 token 或 `JWT_SECRET` 不一致 | 重新登录取 token，确认所有服务同一 secret |
+| 登录返回 429 | 同一手机号+IP 连续失败 5 次，锁定 15 分钟 | 等锁定期满，或清 `login_attempts` 表对应行 |
+| 刷新会话返回 403 | 缺 `X-CSRF-Token` 或与 `shop_csrf` Cookie 不一致 | 从 Cookie 取值回填请求头 |
+| 刷新会话返回 401 | refresh Cookie 缺失/过期/已被轮换撤销 | 重新登录；确认请求走的是网关 `/api/auth/*` 路径 |
+| 业务接口 401 但 Cookie 还在 | access token 只有 15 分钟 | 前端会自动调一次 `/auth/refresh` 重放；仍失败则重新登录 |
+| 下游服务把用户当访客 | 身份头未签名或服务 `TRUST_IDENTITY_HEADERS=false` | 确认所有服务同一 `INTERNAL_SIGNING_SECRET` 且开关为 true |
 | 下单 409 `CONFLICT` | 库存不足 / 幂等键复用 | 查 `/api/inventory/stocks`；换幂等键 |
 | 订单卡在 `PAYING` | 支付回调失败 | 查 order 日志与 outbox `last_error` |
 | 履约单不出现 | fulfillment 未消费 `order.paid` | 查消费者组 `shop:events:order` 与 `shop:dedupe:*` |
-| 售后审批 403 | 用了 customer token | 换 `role=operator` 的 token |
+| 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
 | 记忆检索结果差 | 无模型时用哈希 n-gram | 属预期；接真实 embedding 后重建索引 |
@@ -188,12 +207,11 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 
 已执行：
 
-- `pytest -q` → **34 passed**
-- `ruff check --select F,E9` → **All checks passed**
+- `pytest -q` → **49 passed**
+- `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
-- `cd web && npm install && npm run build` → **构建成功**（约 188 KB JS / 61 KB gzip）
-- `docker compose config --quiet` → **通过**
-- 本地冒烟：catalog 返回 8 个商品；harness 加载 3 个技能、13 个工具，沙箱 `print(6*7)` 返回 `42`；gateway 健康与签发 token 正常
+- `cd web && npm install && npm run build` → **构建成功**
+- `docker compose -f docker-compose.yml -f docker-compose.prod.yml config` → **通过**（生产配置仅 gateway:8080 / web:5173 对外）
 
 未执行：
 

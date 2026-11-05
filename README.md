@@ -119,7 +119,7 @@ docker compose up --build -d
 
 首次启动会建库并播种：catalog 8 个 SKU、inventory 120 件库存、harness 3 个技能。未配置模型也能运行——`LLM_BASE_URL` 留空时使用内置确定性规划器（关键词路由 + 观测后汇总），适合演示与回归。
 
-> 当前登录接口 `/api/auth/token` 是**本地开发用**，按请求体里的 `role` 签发 token。M1 完成后会替换为 identity 的注册/登录，生产模式禁用该接口。
+> 登录已切换为 identity 账号体系：注册/登录返回 15 分钟 access token（Bearer），refresh 走 HttpOnly Cookie（7 天轮换），角色由服务端按 DB 下发。旧 `/api/auth/token` 自选角色接口只在 `ENV=dev` 且 `AUTH_DEV_MODE=true` 时存在，生产固定 404。
 
 ### 本地验证（不依赖 Docker）
 
@@ -182,16 +182,15 @@ cd web && npm install && npm run build
 - **售后**：政策引擎自动 / 人工分流、风险评分、审批与退款闭环、不可逆动作审批留痕。
 - **运营后台**：订单 / 履约 / 售后操作入口、Agent 运行记录与证据查看、人工审批。
 - **Harness 控制面**：技能六类准入、信任四档封顶、工具网关、Docker / 本地沙箱、MCP（HTTP / stdio）、三层记忆、离线确定性规划器、Trace 证据账本。
-- **工程能力**：JWT 鉴权（开发接口）、限流、BFF 聚合、代理白名单、审计、事务性 Outbox、幂等键、pytest / ruff / Docker Compose 一键启动。
+- **工程能力**：账号注册/登录（Argon2id、15 分钟 access + 7 天 refresh 轮换、失败锁定）、内网身份签名头、限流、BFF 聚合、代理白名单、审计、事务性 Outbox、幂等键、pytest / ruff / Docker Compose 一键启动。
 
 ### 生产化缺口（按优先级）
 
-1. **账号越权**：`/api/auth/token` 允许请求体自选角色，生产必须移除（M1）。
-2. **资金**：支付是 mock，没有回调验签、总账、退款与对账（M2）。
-3. **订单**：只有整单发货/退款，缺部分履约与部分退款聚合（M2）。
-4. **事件**：relay 随进程启动，多实例会重复投递；缺 DLQ 与重放（M3）。
-5. **运维**：单机 Compose、无指标/告警/备份演练/SLO（M3）。
-6. **沙箱**：默认关闭，开启后 API 持有 Docker socket，本地兜底不是安全边界（M3）。
+1. **资金**：支付是 mock，没有回调验签、总账、退款与对账（M2）。
+2. **订单**：只有整单发货/退款，缺部分履约与部分退款聚合（M2）。
+3. **事件**：relay 随进程启动，多实例会重复投递；缺 DLQ 与重放（M3）。
+4. **运维**：单机 Compose、无指标/告警/备份演练/SLO（M3）。
+5. **沙箱**：默认关闭，开启后 API 持有 Docker socket，本地兜底不是安全边界（M3）。
 
 ---
 
@@ -210,30 +209,37 @@ cd web && npm install && npm run build
 ## 端到端验收（本地）
 
 ```bash
-# 1. 登录（仅本地开发接口，M1 后移除）
-curl -s -X POST localhost:8080/api/auth/token \
+# 1. 注册（默认授予 customer 角色）
+curl -s -X POST localhost:8080/api/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"user_id":"demo-customer","role":"customer"}'
+  -d '{"phone":"13800000001","password":"Passw0rd!"}'
 
-# 2. 浏览商品
+# 2. 登录：返回 access_token，同时下发 HttpOnly refresh Cookie（shop_refresh）与 CSRF Cookie（shop_csrf）
+curl -s -c cookies.txt -X POST localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"13800000001","password":"Passw0rd!"}'
+# 取返回里的 access_token 作为 $TOKEN；会话续期：
+# curl -s -b cookies.txt -c cookies.txt -X POST localhost:8080/api/auth/refresh -H "X-CSRF-Token: <shop_csrf 值>"
+
+# 3. 浏览商品
 curl -s localhost:8080/api/storefront/feed -H "Authorization: Bearer $TOKEN"
 
-# 3. 下单（Idempotency-Key 必须唯一）
+# 4. 下单（Idempotency-Key 必须唯一）
 curl -s -X POST localhost:8080/api/storefront/checkout \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-001' \
   -d '{"items":[{"sku":"SKU-1001","qty":1}],"address":{"receiver":"张三","phone":"13800001111","province":"上海","city":"上海","detail":"浦东新区世纪大道 100 号"}}'
 
-# 4. 支付（当前为 mock）
+# 5. 支付（当前为 mock）
 curl -s -X POST localhost:8080/api/storefront/orders/$ORDER_ID/pay \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"method":"mock"}'
 
-# 5. 与 Agent 对话（SSE，加 ?stream=false 可拿 JSON）
+# 6. 与 Agent 对话（SSE，加 ?stream=false 可拿 JSON）
 curl -s -X POST localhost:8080/api/agents/customer-service/chat \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"message":"SKU-1001 还有库存吗？"}'
 
-# 6. 查看本次运行的证据
+# 7. 查看本次运行的证据
 curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Bearer $TOKEN"
 ```
 
