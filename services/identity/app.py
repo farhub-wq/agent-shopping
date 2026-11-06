@@ -3,6 +3,8 @@
 账号与角色是唯一身份真相；其他服务只认本服务签发的 JWT 与角色声明。
 """
 
+import asyncio
+import contextlib
 import hmac
 import os
 import secrets
@@ -15,21 +17,31 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, create_token
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
+from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
+from shop_common.outbox import OutboxRelay
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from . import models  # noqa: F401  # 注册到 Base.metadata，init_models 才能建表
+from . import (
+    models,  # noqa: F401  # 注册到 Base.metadata，init_models 才能建表
+    totp,
+)
 from .models import LoginAttempt, RefreshToken, User, UserRole
-from .security import hash_password, verify_password
+from .security import decrypt_secret, encrypt_secret, hash_password, verify_password
 from .tokens import hash_refresh_token, new_refresh_token
 
 settings = get_settings()
 logger = get_logger(__name__)
+
+redis: Redis | None = None
 
 # 角色优先级：JWT 只放单个 role 声明，多角色用户取最高权限那一个
 _ROLE_PRIORITY = ("customer", "operator", "admin")
@@ -54,17 +66,33 @@ async def bootstrap_admin() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global redis
     configure_logging("identity")
     await init_models()
     await bootstrap_admin()
+    tasks: list[asyncio.Task] = []
+    if settings.background_tasks:
+        # 管理员登录审计走 outbox 投递；单测关闭后台任务避免依赖 Redis
+        redis = create_redis(settings.redis_url)
+        bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
+        relay = OutboxRelay(get_session_factory(), bus)
+        tasks = [asyncio.create_task(relay.run_forever())]
     try:
         yield
     finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if redis is not None:
+            await redis.close()
         await dispose_engine()
 
 
 app = FastAPI(title="identity", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "identity")
+install_metrics(app, "identity")
 
 
 # 字段名到展示名的映射，让校验错误能直接告诉调用方具体哪里不符合要求
@@ -140,6 +168,8 @@ async def register(body: RegisterReq) -> dict[str, Any]:
 class LoginReq(BaseModel):
     phone: str = Field(pattern=r"^1[3-9]\d{9}$")
     password: str = Field(min_length=8, max_length=72)
+    # 已启用 MFA 时必填；未启用时忽略，保持单因素登录行为不变
+    otp: str = Field(default="", pattern=r"^\d{6}$")
 
 
 def _mask_phone(phone: str) -> str:
@@ -245,11 +275,39 @@ async def login(body: LoginReq, request: Request, response: Response) -> dict[st
             await _record_failure(session, key, now)
             logger.info("login failed phone=%s", _mask_phone(body.phone))
             raise ApiError("UNAUTHORIZED", "账号或密码错误")
+        # MFA 二次验证：启用后必须携带 6 位动态码；密码正确但缺码时返回专用错误码，
+        # 前端据此弹出验证码输入框。缺码不计失败（密码本身是对的），错误码/重放才计失败。
+        if user.totp_enabled and user.totp_secret:
+            if not body.otp:
+                raise ApiError("MFA_REQUIRED", "需要动态验证码")
+            try:
+                secret = decrypt_secret(user.totp_secret)
+            except ValueError as exc:
+                logger.error("mfa secret decrypt failed user=%s", user.id)
+                raise ApiError("INTERNAL", str(exc)) from exc
+            step = totp.verify(secret, body.otp, int(now.timestamp()))
+            if step is None or step == user.last_totp_step:
+                await _record_failure(session, key, now)
+                logger.info("mfa verify failed phone=%s", _mask_phone(body.phone))
+                raise ApiError("UNAUTHORIZED", "动态验证码错误或已使用")
+            user.last_totp_step = step
         # 登录成功清除失败计数；角色从 DB 读取，请求体与 Header 都无权指定
         if attempt:
             await session.delete(attempt)
         roles = await _roles_of(session, user.id)
         refresh_raw = await _new_refresh_row(session, user.id, request)
+        # 管理员登录属敏感操作：成功进入即留痕，IP 哈希必填，供 audit 服务追溯
+        if _primary_role(roles) == "admin":
+            enqueue_audit(
+                session,
+                actor_id=user.id,
+                actor_role="admin",
+                action="identity.admin_login",
+                target_type="user",
+                target_id=user.id,
+                request=request,
+                tenant=user.tenant_id,
+            )
         await session.commit()
     _set_session_cookies(response, refresh_raw, secrets.token_urlsafe(24))
     return _session_body(user, roles)
@@ -289,6 +347,112 @@ async def logout(request: Request) -> None:
             if token and token.revoked_at is None:
                 token.revoked_at = datetime.now(UTC)
                 await session.commit()
+
+
+class MfaConfirmReq(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class MfaDisableReq(BaseModel):
+    password: str = Field(min_length=8, max_length=72)
+
+
+@app.post("/auth/mfa/enroll")
+async def enroll_mfa(principal: PrincipalDep, request: Request) -> dict[str, Any]:
+    principal.require_admin()
+    async with get_session_factory()() as session:
+        user = await session.get(User, principal.user_id)
+        if user is None:
+            raise ApiError("UNAUTHORIZED", "账号不存在")
+        if user.totp_enabled:
+            raise ApiError("CONFLICT", "已启用 MFA，需先关闭后再重新绑定")
+        # 明文 secret 只在此次响应返回一次；落库为密文，扫码未确认前不阻塞登录
+        secret = totp.new_secret()
+        user.totp_secret = encrypt_secret(secret)
+        user.totp_enabled = False
+        enqueue_audit(
+            session,
+            actor_id=user.id,
+            actor_role="admin",
+            action="identity.mfa_enroll",
+            target_type="user",
+            target_id=user.id,
+            request=request,
+            tenant=user.tenant_id,
+        )
+        await session.commit()
+    return {"otpauth_url": totp.otpauth_url(secret, user.phone), "secret": secret}
+
+
+@app.post("/auth/mfa/confirm")
+async def confirm_mfa(body: MfaConfirmReq, principal: PrincipalDep, request: Request) -> dict[str, Any]:
+    principal.require_admin()
+    async with get_session_factory()() as session:
+        user = await session.get(User, principal.user_id)
+        if user is None:
+            raise ApiError("UNAUTHORIZED", "账号不存在")
+        if user.totp_enabled:
+            raise ApiError("CONFLICT", "MFA 已启用")
+        if not user.totp_secret:
+            raise ApiError("CONFLICT", "尚未发起绑定，请先调用 enroll")
+        try:
+            secret = decrypt_secret(user.totp_secret)
+        except ValueError as exc:
+            raise ApiError("INTERNAL", str(exc)) from exc
+        step = totp.verify(secret, body.code, int(datetime.now(UTC).timestamp()))
+        if step is None:
+            raise ApiError("UNAUTHORIZED", "动态验证码错误")
+        user.totp_enabled = True
+        user.last_totp_step = step
+        enqueue_audit(
+            session,
+            actor_id=user.id,
+            actor_role="admin",
+            action="identity.mfa_enabled",
+            target_type="user",
+            target_id=user.id,
+            request=request,
+            tenant=user.tenant_id,
+        )
+        await session.commit()
+    return {"enabled": True}
+
+
+@app.post("/auth/mfa/disable")
+async def disable_mfa(body: MfaDisableReq, principal: PrincipalDep, request: Request) -> dict[str, Any]:
+    principal.require_admin()
+    async with get_session_factory()() as session:
+        user = await session.get(User, principal.user_id)
+        if user is None:
+            raise ApiError("UNAUTHORIZED", "账号不存在")
+        # 关闭 MFA 会削弱账号保护：必须重新校验密码，防已登录会话被劫持后直接关掉二次验证
+        if not verify_password(body.password, user.password_hash):
+            raise ApiError("UNAUTHORIZED", "密码错误")
+        user.totp_secret = None
+        user.totp_enabled = False
+        user.last_totp_step = None
+        enqueue_audit(
+            session,
+            actor_id=user.id,
+            actor_role="admin",
+            action="identity.mfa_disabled",
+            target_type="user",
+            target_id=user.id,
+            request=request,
+            tenant=user.tenant_id,
+        )
+        await session.commit()
+    return {"enabled": False}
+
+
+@app.get("/auth/mfa")
+async def mfa_status(principal: PrincipalDep) -> dict[str, Any]:
+    principal.require_admin()
+    async with get_session_factory()() as session:
+        user = await session.get(User, principal.user_id)
+        if user is None:
+            raise ApiError("UNAUTHORIZED", "账号不存在")
+        return {"enabled": bool(user.totp_enabled)}
 
 
 @app.get("/me")

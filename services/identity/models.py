@@ -6,7 +6,7 @@
 from datetime import UTC, datetime
 
 from shop_common.db import Base, UTCDateTime
-from sqlalchemy import Integer, String
+from sqlalchemy import Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 
@@ -24,6 +24,11 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(128), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(256))
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    # 管理员 TOTP：secret 为 Fernet 密文；enabled 未置位前不阻塞登录，避免未扫码即被锁死
+    totp_secret: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 最近一次成功验证的时间步：同一时间步的验证码二次使用判重放
+    last_totp_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
