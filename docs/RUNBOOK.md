@@ -52,7 +52,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 ```
 
-当前结果：`61 passed`。
+当前结果：`68 passed`。
 
 只启动不依赖 Redis 的服务做冒烟：
 
@@ -214,6 +214,9 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 | 支付回调 409 金额不一致 | 渠道回调金额/币种与建单不一致 | 不落账；按日志排查建单与渠道对账 |
 | 退款 409 | 累计退款超过支付金额或工单重复 | 查 `refunds` 表与订单行 `refunded_amount_cents` |
 | 对账出现 diff | 渠道账单缺失/金额不一致/迟到回调 | 查 `reconciliation_diffs`，人工核实，不自动改资金 |
+| 用户付款了但订单已取消 | 迟到支付：回调晚于超时关单到达 | 属预期：订单侧自动全额退款（`latepay-{order_id}` 幂等），时间线有 `late_payment` 事件 |
+| 日志反复出现「库存提交失败」 | 支付后 commit 失败且预占已被 TTL 释放 | 订单 `inventory_committed=False`，补偿扫单持续重试；仍失败需人工核对库存与订单后手动 commit 或退款 |
+| 退款后库存没回来 | 该订单行已发货数量不回补 / commit 未成功 | 只回补未发货数量；退货收货确认回补未实现，需人工调整 |
 | 履约单不出现 | fulfillment 未消费 `order.paid` | 查消费者组 `shop:events:order` 与 `shop:dedupe:*` |
 | 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
@@ -224,7 +227,7 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 
 已执行：
 
-- `pytest -q` → **61 passed**
+- `pytest -q` → **68 passed**
 - `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
 - `cd web && npm install && npm run build` → **构建成功**
