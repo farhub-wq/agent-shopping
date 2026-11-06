@@ -32,7 +32,9 @@ class ServiceClient:
         # 仅 5xx 与网络异常会进入重试；4xx 已在下面直接抛 ApiError，不会落到这里。
         for attempt in range(self.retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                # trust_env=False：服务间调用只走内网地址，不读取系统/环境代理，
+                # 避免本机 NO_PROXY 或代理配置污染内网 URL 解析（如 IPv6 回环地址）。
+                async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
                     response = await client.request(method, url, json=json, headers=headers)
                 if response.status_code >= 500:
                     # 5xx 转成 HTTPStatusError，借统一异常分支触发重试。
