@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
-from shop_common.db import Base
-from sqlalchemy import DateTime, Integer, String, Text
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -37,9 +37,9 @@ class AfterSaleTicket(Base):
     decided_by: Mapped[str] = mapped_column(String(64), default="")
     # 支付服务的退款单号与完成时间，由 payment.refunded 事件回填
     refund_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     # 只挑对外字段返回，不把 ORM 对象整体序列化
     def to_dict(self) -> dict:

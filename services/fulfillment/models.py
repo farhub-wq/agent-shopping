@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
-from shop_common.db import Base
-from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import Boolean, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 
@@ -19,12 +19,12 @@ class Shipment(Base):
     carrier: Mapped[str] = mapped_column(String(32), default="")
     tracking_no: Mapped[str] = mapped_column(String(64), default="")
     # SLA 截止时间在创建履约单时确定，扫描器据此判定超时
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime] = mapped_column(UTCDateTime())
     # 超时只告警一次的开关，避免同一履约单在每轮扫描中重复产生事件
     sla_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    shipped_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     # 发货重试次数，供后续接入承运方失败重试时统计使用
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 

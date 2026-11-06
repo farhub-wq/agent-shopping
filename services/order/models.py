@@ -1,8 +1,8 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from shop_common.db import Base
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import Boolean, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -30,7 +30,7 @@ class Order(Base):
     pay_url: Mapped[str] = mapped_column(Text, default="")
     # 取值包含 partially_refunded（18 字符），列宽按最长状态留余量，避免 Postgres 截断写入失败
     payment_status: Mapped[str] = mapped_column(String(32), default="unpaid")
-    payment_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     # 退款进入 REFUNDING 前的状态快照：退款驳回/部分退款完成时据此回退到原状态。
     refund_previous: Mapped[str | None] = mapped_column(String(16), nullable=True)
     refund_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
@@ -38,11 +38,11 @@ class Order(Base):
     inventory_committed: Mapped[bool] = mapped_column(Boolean, default=False)
     # 已处理事件 ID：outbox 去重窗口只有 24h，业务侧再留一层，防止部分发货/部分退款被重复累加
     processed_event_ids: Mapped[list] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
+    paid_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    shipped_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
         # 显式挑选对外字段，不直接序列化 ORM 实例；时间统一转 ISO 字符串。
@@ -83,4 +83,4 @@ class OrderEvent(Base):
     event: Mapped[str] = mapped_column(String(32))
     actor: Mapped[str] = mapped_column(String(64), default="system")
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)

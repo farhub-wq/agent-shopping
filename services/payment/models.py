@@ -6,8 +6,8 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from shop_common.db import Base
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text, UniqueConstraint
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import BigInteger, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 
@@ -30,10 +30,10 @@ class Payment(Base):
     # pending → paid / expired / refunded；失败回调不覆盖已支付状态
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     pay_url: Mapped[str] = mapped_column(Text, default="")
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
     def to_dict(self) -> dict[str, Any]:
         # 显式挑字段，内部租户、渠道签名等不对外暴露
@@ -66,8 +66,8 @@ class Refund(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     provider_refund_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     failure_reason: Mapped[str] = mapped_column(Text, default="")
-    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,7 +96,7 @@ class Settlement(Base):
     fee_cents: Mapped[int] = mapped_column(BigInteger, default=0)
     net_cents: Mapped[int] = mapped_column(BigInteger, default=0)
     currency: Mapped[str] = mapped_column(String(8), default="CNY")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 class LedgerTransaction(Base):
@@ -109,7 +109,7 @@ class LedgerTransaction(Base):
     ref_type: Mapped[str] = mapped_column(String(16))
     ref_id: Mapped[str] = mapped_column(String(36), index=True)
     currency: Mapped[str] = mapped_column(String(8), default="CNY")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, index=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, index=True)
 
 
 class LedgerEntry(Base):
@@ -121,7 +121,7 @@ class LedgerEntry(Base):
     # direction 只用 debit / credit；金额始终为正，方向决定借贷
     direction: Mapped[str] = mapped_column(String(8))
     amount_cents: Mapped[int] = mapped_column(BigInteger)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 class ReconciliationDiff(Base):
@@ -138,4 +138,4 @@ class ReconciliationDiff(Base):
     # missing_local / missing_provider / amount_mismatch
     kind: Mapped[str] = mapped_column(String(24))
     status: Mapped[str] = mapped_column(String(16), default="open", index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)

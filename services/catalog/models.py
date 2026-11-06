@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
-from shop_common.db import Base
-from sqlalchemy import DateTime, Integer, String, Text
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -26,8 +26,8 @@ class Product(Base):
     status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
     # 显式挑选对外字段，不直接序列化 ORM 实例，避免后续新增内部字段时意外泄露。
     def to_dict(self) -> dict:

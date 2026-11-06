@@ -5,8 +5,8 @@
 
 from datetime import UTC, datetime
 
-from shop_common.db import Base
-from sqlalchemy import DateTime, Integer, String
+from shop_common.db import Base, UTCDateTime
+from sqlalchemy import Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 
@@ -24,8 +24,8 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(128), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(256))
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
 
 class UserRole(Base):
@@ -35,7 +35,7 @@ class UserRole(Base):
     role: Mapped[str] = mapped_column(String(16), primary_key=True)
     tenant: Mapped[str] = mapped_column(String(36), primary_key=True, default="default")
     granted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    granted_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 class RefreshToken(Base):
@@ -45,12 +45,12 @@ class RefreshToken(Base):
     user_id: Mapped[str] = mapped_column(String(36), index=True)
     # 只存 sha256 哈希：即使库泄露也无法还原出可用令牌
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     # 轮换链：指向被本令牌替换的旧令牌 id，用于审计与重放排查
     rotated_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
     user_agent: Mapped[str] = mapped_column(String(256), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 class LoginAttempt(Base):
@@ -59,5 +59,5 @@ class LoginAttempt(Base):
     # key 为 phone+ip 的组合，防同一来源对同一账号的暴力破解
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
-    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    window_start: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

@@ -9,12 +9,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, select
+from sqlalchemy import Integer, String, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
-from .db import Base
+from .db import Base, UTCDateTime
 from .events import EventBus
 from .logging import get_logger
 
@@ -30,11 +30,11 @@ class OutboxEvent(Base):
     tenant: Mapped[str] = mapped_column(String(64), default="default")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+        UTCDateTime(), default=lambda: datetime.now(UTC), index=True
     )
     # published_at 为空即待投递；attempts 与 last_error 用于重试与故障观测。
     published_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
+        UTCDateTime(), nullable=True, index=True
     )
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
