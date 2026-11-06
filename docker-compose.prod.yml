@@ -1,6 +1,6 @@
 # 生产差异 overlay：只覆盖与本地开发的差异，公共定义仍在 docker-compose.yml。
 # 需要 Docker Compose v2.24+（ports !reset 语法）。
-# 双主机部署、LB 与托管 PostgreSQL/Redis 在 M3 接入；M1 只验证本 overlay 可解析。
+# 双主机部署、LB 与托管 MySQL / MongoDB / Redis 在 M3 接入；M1 只验证本 overlay 可解析。
 name: shop-agent
 
 services:
@@ -74,7 +74,12 @@ services:
       PAYMENT_MOCK_MODE: "false"
     logging: *logging
 
-  postgres:
+  mysql:
+    restart: unless-stopped
+    ports: !reset []
+    logging: *logging
+
+  mongo:
     restart: unless-stopped
     ports: !reset []
     logging: *logging

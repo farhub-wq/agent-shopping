@@ -23,21 +23,39 @@ x-service-env: &service-env
   EMBEDDING_DIM: ${EMBEDDING_DIM:-256}
 
 services:
-  postgres:
-    image: postgres:16-alpine
+  mysql:
+    image: mysql:8.0
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-shop}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shop}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-shop-root}
+      MYSQL_USER: ${MYSQL_USER:-shop}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-shop}
+      # 建库与授权在 init.sql 里统一完成，这里不设 MYSQL_DATABASE，避免只授权一个库
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - mysqldata:/var/lib/mysql
+      - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
     ports:
-      - "5432:5432"
+      - "3306:3306"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shop}"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p${MYSQL_ROOT_PASSWORD:-shop-root} --silent"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  mongo:
+    image: mongo:7.0
+    volumes:
+      - mongodata:/data/db
+      - ./infra/mongo/init.js:/docker-entrypoint-initdb.d/00-init.js:ro
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
       retries: 20
+      start_period: 20s
 
   redis:
     image: redis:7-alpine
@@ -54,9 +72,9 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: catalog } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/catalog_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/catalog_db?charset=utf8mb4
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8001:8000"]
     healthcheck: &healthcheck
@@ -70,9 +88,9 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: inventory } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/inventory_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/inventory_db?charset=utf8mb4
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8002:8000"]
     healthcheck: *healthcheck
@@ -81,9 +99,9 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: order } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/order_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/order_db?charset=utf8mb4
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8003:8000"]
     healthcheck: *healthcheck
@@ -92,11 +110,11 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: fulfillment } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/fulfillment_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/fulfillment_db?charset=utf8mb4
       ORDER_URL: http://order:8000
       FULFILLMENT_SLA_HOURS: ${FULFILLMENT_SLA_HOURS:-48}
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8004:8000"]
     healthcheck: *healthcheck
@@ -105,10 +123,10 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: aftersales } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/aftersales_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/aftersales_db?charset=utf8mb4
       REFUND_WINDOW_DAYS: ${REFUND_WINDOW_DAYS:-7}
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8005:8000"]
     healthcheck: *healthcheck
@@ -117,13 +135,15 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: harness } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/harness_db
+      # Harness 的记忆与轨迹存 Mongo，不再需要关系库
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: ${MONGO_DB:-shop_harness}
       SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-shop-agent-sandbox:latest}
       SANDBOX_TIMEOUT_SECONDS: ${SANDBOX_TIMEOUT_SECONDS:-20}
       SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
     depends_on:
-      postgres: { condition: service_healthy }
+      mongo: { condition: service_healthy }
       redis: { condition: service_healthy }
       inventory: { condition: service_healthy }
       order: { condition: service_healthy }
@@ -135,11 +155,11 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: identity } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/identity_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/identity_db?charset=utf8mb4
       BOOTSTRAP_ADMIN_PHONE: ${BOOTSTRAP_ADMIN_PHONE:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8007:8000"]
     healthcheck: *healthcheck
@@ -148,7 +168,7 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: payment } }
     environment:
       <<: *service-env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:-shop}@postgres:5432/payment_db
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/payment_db?charset=utf8mb4
       PAYMENT_PROVIDER: mock
       PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-dev-payment-webhook-secret}
       PAYMENT_MOCK_MODE: ${PAYMENT_MOCK_MODE:-true}
@@ -157,7 +177,7 @@ services:
       # 收银台 pay_url 必须是浏览器可访问的网关地址，不能写容器内域名
       PAYMENT_PUBLIC_BASE_URL: ${PAYMENT_PUBLIC_BASE_URL:-http://localhost:8080}
     depends_on:
-      postgres: { condition: service_healthy }
+      mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports: ["8008:8000"]
     healthcheck: *healthcheck
@@ -186,4 +206,5 @@ services:
     ports: ["5173:80"]
 
 volumes:
-  pgdata:
+  mysqldata:
+  mongodata:
