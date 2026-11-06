@@ -344,7 +344,7 @@ git commit -m "feat(web): 接入账号登录、注册与令牌刷新"
 **Files:**
 - Create: `docker-compose.prod.yml`
 - Modify: `docker-compose.yml`
-- Modify: `infra/postgres/init.sql`
+- Modify: `infra/mysql/init.sql`
 - Modify: `.env.example`
 
 **Interfaces:**
@@ -353,14 +353,14 @@ git commit -m "feat(web): 接入账号登录、注册与令牌刷新"
 
 - [ ] **Step 1: 更新本地编排**
 
-- `init.sql` 增加 `CREATE DATABASE identity_db;` 并 `\connect identity_db` 建 `pgcrypto`。
-- `docker-compose.yml` 新增 `identity` 服务，`DATABASE_URL=...@postgres:5432/identity_db`，依赖 postgres/redis 健康；本地映射 `8007:8000`。
+- `infra/mysql/init.sql` 增加 `CREATE DATABASE IF NOT EXISTS identity_db`（utf8mb4）+ `GRANT ALL PRIVILEGES ON identity_db.* TO 'shop'@'%'`；MySQL 建库时声明字符集，无 pgcrypto 扩展。
+- `docker-compose.yml` 新增 `identity` 服务，`DATABASE_URL=mysql+aiomysql://...@mysql:3306/identity_db?charset=utf8mb4`，依赖 mysql/redis 健康；本地映射 `8007:8000`。
 - `gateway` 增加 `IDENTITY_URL: http://identity:8000`、`depends_on.identity: service_healthy`；删除 gateway 的 `DATABASE_URL`（不再直连 order_db）。
 - 公共 env 增加 `INTERNAL_SIGNING_SECRET`（dev 用固定值，prod 必须注入）、`TRUST_IDENTITY_HEADERS`（dev 为 `true`）。
 
 - [ ] **Step 2: 新增生产 overlay 骨架**
 
-- `docker-compose.prod.yml` 只包含生产差异：`backend` internal 网络、`restart: unless-stopped`、资源上限、日志轮转、`TRUST_IDENTITY_HEADERS=false`、`AUTH_DEV_MODE=false`。
+- `docker-compose.prod.yml` 只包含生产差异：`restart: unless-stopped`、资源上限、日志轮转、`ENV=prod`、`AUTH_DEV_MODE=false`；`TRUST_IDENTITY_HEADERS` 保持 `true`（依赖内网隔离 + 注入的 `INTERNAL_SIGNING_SECRET`，见 design §5.1）。
 - 内网服务用 `ports: !reset []` 清空本地端口映射；`gateway` 与 `web` 保留对外端口。
 - 文件顶部注明需 Docker Compose v2.24+（`!reset` 语法），并注明双主机部署、LB 与托管 DB/Redis 在 M3 接入；M1 只验证单机 overlay 可解析。
 
@@ -372,7 +372,7 @@ git commit -m "feat(web): 接入账号登录、注册与令牌刷新"
 - [ ] **Step 4: 提交**
 
 ```bash
-git add docker-compose.yml docker-compose.prod.yml infra/postgres/init.sql .env.example
+git add docker-compose.yml docker-compose.prod.yml infra/mysql/init.sql .env.example
 git commit -m "chore(infra): 增加 identity 服务与生产编排"
 ```
 
