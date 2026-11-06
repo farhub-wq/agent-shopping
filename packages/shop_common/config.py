@@ -13,9 +13,14 @@ class ServiceSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     service_name: str = "shop"
+    # 生产注入 mysql+aiomysql://...；本地缺省仍退化为 SQLite，单测不依赖中间件
     database_url: str = ""
 
     redis_url: str = "redis://localhost:6379/0"
+
+    # Harness 的文档型数据（记忆与 Agent 轨迹）存 MongoDB，懒连接，缺省本地地址
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_db: str = "shop_harness"
 
     jwt_secret: str = "dev-only-secret-change-me"
     jwt_algorithm: str = "HS256"

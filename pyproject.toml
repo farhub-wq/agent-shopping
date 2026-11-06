@@ -9,8 +9,11 @@ dependencies = [
   "pydantic>=2.8.0",
   "pydantic-settings>=2.4.0",
   "sqlalchemy[asyncio]>=2.0.30",
-  "asyncpg>=0.29.0",
+  "aiomysql>=0.2.0",
+  # MySQL 8 默认 caching_sha2_password，aiomysql 认证需要 cryptography
+  "cryptography>=42.0.0",
   "aiosqlite>=0.20.0",
+  "motor>=3.6.0",
   "redis>=5.0.8",
   "httpx>=0.27.0",
   "pyyaml>=6.0.2",

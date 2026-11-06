@@ -1,6 +1,9 @@
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
+from sqlalchemy import DateTime, TypeDecorator
+from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -11,6 +14,38 @@ settings = get_settings()
 
 class Base(DeclarativeBase):
     pass
+
+
+class UTCDateTime(TypeDecorator):
+    """统一按 UTC 存取时间，屏蔽 MySQL 无时区 DATETIME 的差异。
+
+    MySQL 的 DATETIME 不带时区且默认只有秒级精度，这里显式用 DATETIME(6)；
+    bind 时把 aware datetime 归一为 UTC naive，读回时补上 UTC，
+    调用方始终拿到 aware UTC，与原先 PostgreSQL timestamptz 行为一致。
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "mysql":
+            return dialect.type_descriptor(mysql.DATETIME(fsp=6))
+        return dialect.type_descriptor(DateTime(timezone=True))
+
+    def process_bind_param(self, value: datetime | None, dialect):
+        if value is None:
+            return None
+        # naive 值按 UTC 处理，避免服务端把本地时区写入数据库
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 _engine = None
@@ -28,6 +63,18 @@ def get_engine():
             Path("data").mkdir(parents=True, exist_ok=True)
             # aiosqlite 在线程池中执行 SQL，需要放开 SQLite 的同线程检查。
             kwargs["connect_args"] = {"check_same_thread": False}
+        elif url.startswith("mysql"):
+            kwargs.update(
+                {
+                    "pool_size": 10,
+                    "max_overflow": 20,
+                    # MySQL 默认 8 小时空闲断连，提前回收，避免拿到被服务端关掉的连接。
+                    "pool_recycle": 3600,
+                    # 与原 PostgreSQL 的 READ COMMITTED 语义保持一致，
+                    # 避免 REPEATABLE READ 快照让 outbox 轮询读不到新事件。
+                    "isolation_level": "READ COMMITTED",
+                }
+            )
         else:
             kwargs.update({"pool_size": 10, "max_overflow": 20})
         _engine = create_async_engine(url, **kwargs)
