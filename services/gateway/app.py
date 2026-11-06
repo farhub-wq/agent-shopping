@@ -222,6 +222,26 @@ async def auth_logout(request: Request) -> Response:
     return await _proxy_auth(request, "/auth/logout")
 
 
+@app.get("/api/auth/mfa")
+async def auth_mfa_status(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/mfa")
+
+
+@app.post("/api/auth/mfa/enroll")
+async def auth_mfa_enroll(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/mfa/enroll")
+
+
+@app.post("/api/auth/mfa/confirm")
+async def auth_mfa_confirm(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/mfa/confirm")
+
+
+@app.post("/api/auth/mfa/disable")
+async def auth_mfa_disable(request: Request) -> Response:
+    return await _proxy_auth(request, "/auth/mfa/disable")
+
+
 @app.get("/api/me")
 async def auth_me(request: Request) -> Response:
     return await _proxy_auth(request, "/me")

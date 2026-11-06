@@ -62,3 +62,23 @@ async def test_storefront_orders_passes_status(monkeypatch):
     monkeypatch.setattr(gateway_app.httpx, "AsyncClient", lambda *a, **kw: fake)
     await gateway_app.my_orders(_FakeRequest(), Principal("u1", "operator", "default"), status="PAID")
     assert fake.params == {"user_id": "u1", "status": "PAID"}
+
+
+@pytest.mark.asyncio
+async def test_mfa_proxy_routes_forward_to_identity(monkeypatch):
+    # 回归：MFA 接口必须经网关代理到 identity，否则前端 /api/auth/mfa/* 会落到 404
+    calls: list[str] = []
+
+    async def fake_proxy(request, path: str) -> str:
+        calls.append(path)
+        return f"ok:{path}"
+
+    monkeypatch.setattr(gateway_app, "_proxy_auth", fake_proxy)
+    req = _FakeRequest()
+
+    await gateway_app.auth_mfa_status(req)
+    await gateway_app.auth_mfa_enroll(req)
+    await gateway_app.auth_mfa_confirm(req)
+    await gateway_app.auth_mfa_disable(req)
+
+    assert calls == ["/auth/mfa", "/auth/mfa/enroll", "/auth/mfa/confirm", "/auth/mfa/disable"]
