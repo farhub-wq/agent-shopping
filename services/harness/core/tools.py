@@ -11,6 +11,7 @@ from typing import Any
 
 from shop_common.errors import ApiError
 from shop_common.logging import get_logger
+from shop_common.metrics import AGENT_TOOL_DENIED
 
 from .policy import ToolPolicy, enforce
 
@@ -117,6 +118,8 @@ class ToolRegistry:
             # 第 1 步：权限上限。denied 也是正常返回值，不是异常。
             enforce(trust, tool.policy)
         except ApiError as exc:
+            # 越权动作被策略拦截是安全事件，计数后告警观测暴力试探。
+            AGENT_TOOL_DENIED.labels("harness").inc()
             return ToolResult("denied", message=exc.message)
 
         # 第 2 步：审批门槛。未在 ctx.approved 中的高风险工具一律转待审批，

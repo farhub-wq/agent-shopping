@@ -7,6 +7,7 @@ import uuid
 from typing import Literal
 
 from shop_common.errors import ApiError
+from shop_common.metrics import LEDGER_IMBALANCE
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import LedgerEntry, LedgerTransaction
@@ -52,6 +53,7 @@ def post_transaction(
             credit += amount
     if debit != credit:
         # 借贷不平直接拒绝写入，这是资金系统最强的本地不变量
+        LEDGER_IMBALANCE.labels("payment").inc()
         raise ApiError("CONFLICT", f"总账借贷不平：debit={debit} credit={credit}")
 
     txn = LedgerTransaction(

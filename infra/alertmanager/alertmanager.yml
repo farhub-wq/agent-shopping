@@ -1,0 +1,25 @@
+# Alertmanager 默认配置：路由 + 占位 receiver。
+# 通知渠道（邮件/企微/Slack/电话）在部署阶段按团队基础设施配置；
+# 这里只保证告警进入 Alertmanager 且可被 /api/v1/alerts 观测，不实际外发。
+
+route:
+  # 按 severity 分组发送，避免一次风暴打爆通知渠道
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: default
+  routes:
+    - matchers: ['severity="P0"']
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      receiver: default
+    - matchers: ['severity="P1"']
+      receiver: default
+    - matchers: ['severity="P2"']
+      receiver: default
+
+receivers:
+  - name: default
+    # 占位：未配置任何通知集成时 Alertmanager 只保留告警状态不发送。

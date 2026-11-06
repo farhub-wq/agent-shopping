@@ -10,6 +10,7 @@ from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
 from sqlalchemy import func, or_, select
 
 from .models import Product
@@ -76,6 +77,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="catalog-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "catalog")
+install_metrics(app, "catalog")
 
 
 class ProductCreate(BaseModel):

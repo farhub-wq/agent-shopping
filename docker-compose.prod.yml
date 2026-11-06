@@ -102,3 +102,18 @@ services:
   web:
     restart: unless-stopped
     logging: *logging
+
+  # 观测组件：Prometheus / Alertmanager 只在容器内网暴露，Grafana 保留宿主机端口供运维访问
+  prometheus:
+    restart: unless-stopped
+    ports: !reset []
+    logging: *logging
+
+  alertmanager:
+    restart: unless-stopped
+    ports: !reset []
+    logging: *logging
+
+  grafana:
+    restart: unless-stopped
+    logging: *logging

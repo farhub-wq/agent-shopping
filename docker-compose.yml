@@ -5,6 +5,7 @@ x-service-env: &service-env
   JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
   # 本地开发默认信任网关签名的身份头；生产 overlay 里会关掉
   INTERNAL_SIGNING_SECRET: ${INTERNAL_SIGNING_SECRET:-dev-internal-signing-secret}
+  MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU=}
   TRUST_IDENTITY_HEADERS: ${TRUST_IDENTITY_HEADERS:-true}
   AUTH_DEV_MODE: ${AUTH_DEV_MODE:-false}
   ENV: ${ENV:-dev}
@@ -17,6 +18,7 @@ x-service-env: &service-env
   HARNESS_URL: http://harness:8000
   IDENTITY_URL: http://identity:8000
   PAYMENT_URL: http://payment:8000
+  AUDIT_URL: http://audit:8000
   LLM_BASE_URL: ${LLM_BASE_URL:-}
   LLM_API_KEY: ${LLM_API_KEY:-}
   LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
@@ -182,6 +184,17 @@ services:
     ports: ["8008:8000"]
     healthcheck: *healthcheck
 
+  audit:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: audit } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/audit_db?charset=utf8mb4
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8009:8000"]
+    healthcheck: *healthcheck
+
   gateway:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: gateway } }
     environment:
@@ -196,6 +209,7 @@ services:
       payment: { condition: service_healthy }
       harness: { condition: service_healthy }
       identity: { condition: service_healthy }
+      audit: { condition: service_healthy }
     ports: ["8080:8000"]
     healthcheck: *healthcheck
 
@@ -205,6 +219,41 @@ services:
       gateway: { condition: service_healthy }
     ports: ["5173:80"]
 
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheusdata:/prometheus
+    ports: ["9090:9090"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ["9093:9093"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      # 初始管理员密码：生产必须通过 .env 注入强口令，禁止默认值上线
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on:
+      prometheus: { condition: service_started }
+
 volumes:
   mysqldata:
   mongodata:
+  prometheusdata:
+  grafanadata:

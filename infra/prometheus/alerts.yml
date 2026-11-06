@@ -1,0 +1,126 @@
+# §10 阈值告警规则。severity 分级：P0 资金/超卖/验签/卡死；P1 失败率/延迟/积压；P2 次日处理。
+# 计数型「>0 立即」用 increase()[5m] 表达，既保留「新出现即告警」语义，又避免计数器永不回退导致告警永久粘滞。
+
+groups:
+  - name: p0-critical
+    rules:
+      # 验签失败：伪造/无效回调的前置信号，出现即 P0
+      - alert: PaymentCallbackVerificationFailed
+        expr: increase(payment_callback_total{result="verification_failed"}[5m]) > 0
+        for: 0s
+        labels: { severity: P0 }
+        annotations:
+          summary: "支付回调验签失败"
+          description: "近 5 分钟出现 {{ $value }} 次验签失败回调，疑似伪造或密钥泄漏，立即核查渠道密钥。"
+          runbook: docs/RUNBOOK.md
+
+      # 订单卡死：超过支付窗口仍 PAYING 或超过 5 分钟仍 RESERVED
+      - alert: OrderStuck
+        expr: order_stuck_total > 0
+        for: 0s
+        labels: { severity: P0 }
+        annotations:
+          summary: "存在卡死订单（{{ $labels.service }}）"
+          description: "{{ $labels.service }} 检出 {{ $value }} 笔 RESERVED/PAYING 超时订单，补偿扫单已介入，需确认是否持续新增。"
+          runbook: docs/RUNBOOK.md
+
+      # 库存扣减不足：超卖/超买的前置信号
+      - alert: InventoryNegative
+        expr: increase(inventory_negative_total[5m]) > 0
+        for: 0s
+        labels: { severity: P0 }
+        annotations:
+          summary: "库存扣减不足（{{ $labels.service }}）"
+          description: "近 5 分钟出现 {{ $value }} 次扣减不足，检查 Redis 热点库存与 DB 是否漂移。"
+          runbook: docs/RUNBOOK.md
+
+      # 总账借贷不平：资金系统最强不变量被破坏
+      - alert: LedgerImbalance
+        expr: increase(ledger_imbalance_total[5m]) > 0
+        for: 0s
+        labels: { severity: P0 }
+        annotations:
+          summary: "总账借贷不平（{{ $labels.service }}）"
+          description: "近 5 分钟出现 {{ $value }} 次借贷不平写入被拒，立即排查分录构造逻辑。"
+          runbook: docs/RUNBOOK.md
+
+  - name: p1-operational
+    rules:
+      # 5xx 错误率 >1% 持续 5 分钟
+      - alert: High5xxRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+            / clamp_min(sum(rate(http_requests_total[5m])) by (service), 0.0001) > 0.01
+        for: 5m
+        labels: { severity: P1 }
+        annotations:
+          summary: "{{ $labels.service }} 5xx 错误率超 1%"
+          description: "{{ $labels.service }} 近 5 分钟 5xx 占比 {{ $value | humanizePercentage }}。"
+          runbook: docs/RUNBOOK.md
+
+      # 下单 P95 时延 >800ms 持续 10 分钟（order 服务 POST 请求）
+      - alert: CheckoutLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{service="order", method="POST"}[10m]))
+          ) > 0.8
+        for: 10m
+        labels: { severity: P1 }
+        annotations:
+          summary: "下单 P95 时延超 800ms"
+          description: "order 服务下单 P95 时延 {{ $value | humanizeDuration }}。"
+          runbook: docs/RUNBOOK.md
+
+      # 下单失败率 >5% 持续 5 分钟
+      - alert: CheckoutFailureRateHigh
+        expr: |
+          sum(rate(checkout_total{result!="success"}[5m])) by (service)
+            / clamp_min(sum(rate(checkout_total[5m])) by (service), 0.0001) > 0.05
+        for: 5m
+        labels: { severity: P1 }
+        annotations:
+          summary: "下单失败率超 5%"
+          description: "{{ $labels.service }} 近 5 分钟下单失败率 {{ $value | humanizePercentage }}。"
+          runbook: docs/RUNBOOK.md
+
+      # outbox 投递延迟 >10s 持续 2 分钟
+      - alert: OutboxLagHigh
+        expr: outbox_lag_seconds > 10
+        for: 2m
+        labels: { severity: P1 }
+        annotations:
+          summary: "Outbox 投递延迟超 10s（{{ $labels.service }}）"
+          description: "{{ $labels.service }} 最老未投递事件已积压 {{ $value }}s，检查消费者与 relay 锁。"
+          runbook: docs/RUNBOOK.md
+
+      # 连接池耗尽 >0 持续 5 分钟
+      - alert: DbPoolExhausted
+        expr: increase(db_pool_exhausted_total[5m]) > 0
+        for: 5m
+        labels: { severity: P1 }
+        annotations:
+          summary: "连接池耗尽（{{ $labels.service }}）"
+          description: "{{ $labels.service }} 近 5 分钟连接池耗尽 {{ $value }} 次，检查 pool_size 与慢查询。"
+          runbook: docs/RUNBOOK.md
+
+      # Agent 工具被策略拒绝：5 分钟 >10 次，疑似越权试探
+      - alert: AgentToolDeniedBurst
+        expr: increase(agent_tool_denied_total[5m]) > 10
+        for: 5m
+        labels: { severity: P1 }
+        annotations:
+          summary: "Agent 工具拒绝次数异常（{{ $labels.service }}）"
+          description: "近 5 分钟被策略拒绝 {{ $value }} 次，核查是否存在越权试探。"
+          runbook: docs/RUNBOOK.md
+
+  - name: p2-daily
+    rules:
+      # 日终对账开放差异 >0：次日处理进日报
+      - alert: ReconciliationDiff
+        expr: reconciliation_diff_total > 0
+        for: 0s
+        labels: { severity: P2 }
+        annotations:
+          summary: "日终对账存在差异（{{ $labels.service }}）"
+          description: "对账检出 {{ $value }} 条开放差异，次日人工核查渠道账单。"
+          runbook: docs/RUNBOOK.md

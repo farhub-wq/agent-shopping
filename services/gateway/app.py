@@ -20,6 +20,7 @@ from shop_common.config import get_settings
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -34,6 +35,7 @@ SERVICES = {
     "agents": settings.harness_url,
     "harness": settings.harness_url,
     "payments": settings.payment_url,
+    "audit": settings.audit_url,
 }
 
 RATE_LIMIT_PER_MINUTE = 120
@@ -50,6 +52,7 @@ SERVICE_PATH_PREFIX = {
     "aftersales": "/aftersales",
     "payments": "/payments",
     "harness": "",
+    "audit": "/audit",
 }
 # 这些路径属于 harness 根路由，不能再补 /agents 前缀
 HARNESS_ROOT_PREFIXES = ("runs/", "memory/", "sandbox/", "mcp")
@@ -102,6 +105,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="api-gateway", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "gateway")
+install_metrics(app, "gateway")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:8080", "http://127.0.0.1:5173"],

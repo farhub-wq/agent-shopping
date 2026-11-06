@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # 10 个业务服务 + 网关：容器内网直连 service:8000/metrics，不经过网关
+  - job_name: "shop-services"
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - gateway:8000
+          - catalog:8000
+          - inventory:8000
+          - order:8000
+          - fulfillment:8000
+          - aftersales:8000
+          - harness:8000
+          - identity:8000
+          - payment:8000
+          - audit:8000
+
+  # Prometheus 自身：观测观测系统
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
