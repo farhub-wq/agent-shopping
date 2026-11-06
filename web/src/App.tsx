@@ -111,11 +111,9 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(getSession());
 
   useEffect(() => {
-    // access token 只在内存里，刷新页面后已丢失；挂载时靠 refresh Cookie 恢复一次会话
-    // 恢复失败保持未登录状态，不跳转、不弹错误
-    void refreshSession().then((restored) => {
-      if (restored) setSession(restored);
-    });
+    // access token 只在内存里，刷新页面后已丢失；挂载时靠 refresh Cookie 恢复一次会话。
+    // 失败也同步 state（置空），否则 header 会残留旧身份而页面已按 localStorage 判定未登录。
+    void refreshSession().then(setSession);
   }, []);
   return (
     <BrowserRouter>
@@ -123,7 +121,7 @@ export default function App() {
       <main className="page">
         {/* 页面组件只负责渲染与交互，所有接口调用都封在 lib/api.ts 里。 */}
         <Routes>
-          <Route path="/" element={<Home />} />
+          <Route path="/" element={<Home session={session} />} />
           <Route path="/product/:id" element={<Product />} />
           <Route path="/cart" element={<Cart />} />
           <Route path="/orders" element={<Orders />} />

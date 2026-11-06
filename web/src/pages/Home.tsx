@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, money } from "../lib/api";
+import { api, money, type Session } from "../lib/api";
 
 const CATEGORIES = [
   { key: "", label: "全部" },
@@ -10,7 +10,7 @@ const CATEGORIES = [
   { key: "home", label: "家居" },
 ];
 
-export default function Home() {
+export default function Home({ session }: { session: Session | null }) {
   const [items, setItems] = useState<any[]>([]);
   const [category, setCategory] = useState("");
   const [query, setQuery] = useState("");
@@ -43,7 +43,10 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <button className="primary" onClick={() => (window.location.href = "/agent")}>和智能助手聊聊</button>
-            <button className="ghost" onClick={() => (window.location.href = "/ops")}>看运营后台</button>
+            {/* 运营后台入口只对运营/管理员展示，顾客与未登录用户不显示；后端接口仍会二次校验角色。 */}
+            {(session?.role === "operator" || session?.role === "admin") && (
+              <button className="ghost" onClick={() => (window.location.href = "/ops")}>看运营后台</button>
+            )}
           </div>
         </div>
         <div className="hero-card">

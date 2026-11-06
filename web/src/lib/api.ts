@@ -87,7 +87,18 @@ export function csrfToken(): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-export async function refreshSession(): Promise<Session | null> {
+let refreshPromise: Promise<Session | null> | null = null;
+
+export function refreshSession(): Promise<Session | null> {
+  // 并发调用共享同一次刷新：refresh token 轮换会让第二次请求被判重放，
+  // 若各发各的会 401 并把刚恢复的会话清掉。
+  refreshPromise ??= doRefresh().finally(() => {
+    refreshPromise = null;
+  });
+  return refreshPromise;
+}
+
+async function doRefresh(): Promise<Session | null> {
   const csrf = csrfToken();
   if (!csrf) return null;
   const response = await fetch("/api/auth/refresh", {
@@ -116,17 +127,11 @@ export async function logout(): Promise<void> {
   }
 }
 
-let refreshPromise: Promise<Session | null> | null = null;
-
 // 刷新页面后 access token 只存在内存会丢失，但本地 session 还在。
 // 此时先静默换一次 token，否则运营接口会以匿名身份返回 403，页面只显示空列表。
-// 用共享 Promise 合并并发请求的刷新，避免同时发多个 /auth/refresh。
 async function ensureAccessToken(): Promise<void> {
   if (accessToken || !getSession()) return;
-  refreshPromise ??= refreshSession().finally(() => {
-    refreshPromise = null;
-  });
-  await refreshPromise;
+  await refreshSession();
 }
 
 /**
