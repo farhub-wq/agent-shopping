@@ -3,7 +3,6 @@ from datetime import UTC, datetime
 from shop_common.db import Base, UTCDateTime
 from sqlalchemy import Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import JSON
 
 
 def _now() -> datetime:
@@ -23,17 +22,24 @@ class Stock(Base):
 
 
 class Reservation(Base):
-    __tablename__ = "reservations"
+    __tablename__ = "stock_reservations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    # order_id 唯一索引既是业务约束，也是预占接口的幂等依据：一个订单只允许一条预占记录。
-    order_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
-    items: Mapped[list] = mapped_column(JSON, default=list)
+    order_id: Mapped[str] = mapped_column(String(36), index=True)
+    # 行级预占：一个订单的每个 SKU 一行，(order_id, sku) 唯一既是业务约束也是幂等依据。
+    sku: Mapped[str] = mapped_column(String(64))
+    qty: Mapped[int] = mapped_column(Integer)
     # 状态机：reserved → committed（已售）或 released（回补），重复请求按当前状态幂等处理。
     status: Mapped[str] = mapped_column(String(16), default="reserved", index=True)
+    # 兜底释放的触发点：支付窗口 + 5 分钟缓冲；payment.expires_at 是唯一权威，这里只作兜底。
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_now, onupdate=_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("order_id", "sku", name="uq_stock_reservation_order_sku"),
     )
 
 

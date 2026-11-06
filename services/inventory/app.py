@@ -7,11 +7,12 @@ from typing import Annotated, Any
 from fastapi import FastAPI, Header
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import PrincipalDep
+from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
+from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from sqlalchemy import select
 
@@ -22,9 +23,12 @@ settings = get_settings()
 logger = get_logger(__name__)
 
 NAMESPACE = "shop:inv"
-# 预占 TTL（秒）：超时未支付由后台任务回补，避免幽灵订单长期占用库存。
-RESERVATION_TTL_SECONDS = 900
+# 预占 TTL = 支付窗口（15 分钟）+ 5 分钟缓冲：payment.expires_at 是唯一权威，这里只做兜底。
+RESERVATION_TTL_SECONDS = settings.payment_ttl_seconds + 300
 FLASH_LIMIT_PER_USER = 1
+
+# 兜底释放前查支付单用：释放前必须确认支付单已关闭（非 pending），否则 fail closed。
+payment_svc = ServiceClient(settings.payment_url)
 
 SEED_SKUS = [f"SKU-100{i}" for i in range(1, 9)]
 
@@ -81,29 +85,50 @@ async def seed_stocks() -> None:
 
 
 async def expire_stale_reservations() -> None:
-    """预占超时未支付必须回补库存，否则大促期间库存会被幽灵订单吃光。"""
-    cutoff = datetime.now(UTC) - timedelta(seconds=RESERVATION_TTL_SECONDS)
+    """预占超时未支付必须回补库存，否则大促期间库存会被幽灵订单吃光。
+
+    释放前必须确认支付单已关闭（非 pending）：兜底扫描是最后防线，
+    支付单仍 pending 或查询失败则 fail closed 等下一轮，宁少卖不超卖。
+    """
     while True:
         await asyncio.sleep(30)
         try:
+            now = datetime.now(UTC)
             async with get_session_factory()() as session:
-                # 超过 TTL 仍为 reserved 的记录视为未支付幽灵订单，释放后统一提交。
                 stale = (
                     (
                         await session.execute(
                             select(Reservation).where(
-                                Reservation.status == "reserved", Reservation.created_at < cutoff
+                                Reservation.status == "reserved", Reservation.expires_at < now
                             )
                         )
                     )
                     .scalars()
                     .all()
                 )
-                for reservation in stale:
-                    await _release_locked(session, reservation, reason="expired")
-                if stale:
-                    await session.commit()
-                    logger.info("已回补 %s 条超时预占", len(stale))
+            by_order: dict[str, list[Reservation]] = {}
+            for row in stale:
+                by_order.setdefault(row.order_id, []).append(row)
+            for order_id in by_order:
+                if not await _payment_releasable(order_id):
+                    continue
+                async with get_session_factory()() as session:
+                    # 重新取当前仍为 reserved 的行，避免与并发提交/释放互相踩。
+                    rows = (
+                        (
+                            await session.execute(
+                                select(Reservation).where(
+                                    Reservation.order_id == order_id,
+                                    Reservation.status == "reserved",
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    if rows:
+                        await _release_locked(session, rows, reason="expired")
+                        await session.commit()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -111,17 +136,65 @@ async def expire_stale_reservations() -> None:
             logger.exception("超时预占扫描失败")
 
 
-async def _release_locked(session, reservation: Reservation, *, reason: str) -> None:
+async def _payment_releasable(order_id: str) -> bool:
+    """兜底释放前确认支付单已关闭且未支付：expired/failed/不存在才可释放。
+
+    paid/refunded 走提交与退款链路，pending 尚未关闭，都不满足释放条件；
+    查询失败按 fail closed 处理（宁少卖不超卖），等下一轮扫描。
+    """
+    try:
+        data = await payment_svc.request(
+            "GET", f"/payments/{order_id}", headers=signed_identity_headers("system", "operator")
+        )
+    except ApiError as exc:
+        if exc.code == "NOT_FOUND":
+            # 支付单不存在说明从未成功建单，可安全释放
+            return True
+        logger.warning("查询支付单失败，跳过兜底释放 order=%s code=%s", order_id, exc.code)
+        return False
+    status = data.get("status")
+    if status in {"expired", "failed"}:
+        return True
+    logger.info("支付单状态 %s 不满足释放条件 order=%s", status, order_id)
+    return False
+
+
+async def reconcile_stock() -> None:
+    """每 5 分钟比对 Redis 与 DB：DB 是真相源，差异以 DB 为准重建并告警。
+
+    对账兜住 Redis 重启、Lua 与事务失败留下的漂移；当前单实例运行，
+    Unit C 引入 redis_lock 后改为多实例互斥。
+    """
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with get_session_factory()() as session:
+                rows = (await session.execute(select(Stock))).scalars().all()
+            for row in rows:
+                expected = max(row.total - row.reserved, 0)
+                key = stock_key(row.sku)
+                current = await r().get(key)
+                if current is None or int(current) != expected:
+                    await _sync_script(keys=[key], args=[expected])
+                    logger.warning("库存对账重建 sku=%s redis=%s db=%s", row.sku, current, expected)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("库存对账任务失败")
+
+
+async def _release_locked(session, rows: list[Reservation], *, reason: str) -> None:
     # DB 的 reserved 计数与 Redis 可用量必须同步回补，否则两边会长期漂移。
-    for item in reservation.items:
-        stock = await session.get(Stock, item["sku"])
+    order_id = rows[0].order_id
+    for row in rows:
+        stock = await session.get(Stock, row.sku)
         if stock:
-            stock.reserved = max(stock.reserved - item["qty"], 0)
-    # 先标记 released，后续重复调用 release 会走幂等短路，不会二次回补。
-    reservation.status = "released"
-    reservation.updated_at = datetime.now(UTC)
-    await _release_script(keys=[resv_key(reservation.order_id)])
-    logger.info("释放预占 order=%s reason=%s", reservation.order_id, reason)
+            stock.reserved = max(stock.reserved - row.qty, 0)
+        # 先标记 released，后续重复调用 release 会走幂等短路，不会二次回补。
+        row.status = "released"
+        row.updated_at = datetime.now(UTC)
+    await _release_script(keys=[resv_key(order_id)])
+    logger.info("释放预占 order=%s reason=%s", order_id, reason)
 
 
 @asynccontextmanager
@@ -138,14 +211,19 @@ async def lifespan(_: FastAPI):
     _sec_kill_script = redis.register_script(SEC_KILL)
     _sync_script = redis.register_script(SYNC_STOCK)
     await seed_stocks()
-    # 超时回补任务与 HTTP 服务同生命周期，关闭时取消并等待退出。
-    task = asyncio.create_task(expire_stale_reservations())
+    # 后台任务与 HTTP 服务同生命周期，关闭时统一取消并等待退出。
+    tasks = [
+        asyncio.create_task(expire_stale_reservations()),
+        asyncio.create_task(reconcile_stock()),
+    ]
     try:
         yield
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
         await redis.close()
 
 
@@ -241,16 +319,22 @@ async def reserve(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> dict[str, Any]:
     async with get_session_factory()() as session:
-        # 幂等以 order_id 唯一行为准：同一订单重复预占直接返回既有结果，不会重复扣减。
-        existing = await session.scalar(
-            select(Reservation).where(Reservation.order_id == payload.order_id)
+        # 幂等以 (order_id, sku) 行级记录为准：同一订单重复预占直接返回既有结果，不会重复扣减。
+        existing = (
+            (
+                await session.execute(
+                    select(Reservation).where(Reservation.order_id == payload.order_id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        if existing is not None:
+        if existing:
             return {
                 "order_id": payload.order_id,
-                "status": existing.status,
+                "status": existing[0].status,
                 "idempotent": True,
-                "items": existing.items,
+                "items": [{"sku": row.sku, "qty": row.qty} for row in existing],
             }
 
         keys = [resv_key(payload.order_id)] + [stock_key(item.sku) for item in payload.items]
@@ -266,12 +350,19 @@ async def reserve(
                 details={"sku": failed_sku, "available": int(result[2])},
             )
 
-        reservation = Reservation(
-            id=str(uuid.uuid4()),
-            order_id=payload.order_id,
-            items=[item.model_dump() for item in payload.items],
-            status="reserved",
-        )
+        # 行级预占：每个 SKU 一行，expires_at 统一为支付窗口 + 缓冲，供兜底扫描触发。
+        expires_at = datetime.now(UTC) + timedelta(seconds=RESERVATION_TTL_SECONDS)
+        reservations = [
+            Reservation(
+                id=str(uuid.uuid4()),
+                order_id=payload.order_id,
+                sku=item.sku,
+                qty=item.qty,
+                status="reserved",
+                expires_at=expires_at,
+            )
+            for item in payload.items
+        ]
         try:
             for item in payload.items:
                 stock = await session.get(Stock, item.sku)
@@ -279,37 +370,47 @@ async def reserve(
                     stock = Stock(sku=item.sku, total=item.qty, reserved=0)
                     session.add(stock)
                 stock.reserved += item.qty
-            session.add(reservation)
+            session.add_all(reservations)
             await session.commit()
         except Exception:
             # 本地落库失败时回滚 DB，并立即释放 Redis 已扣减的额度，保持两侧一致。
             await session.rollback()
             await _release_script(keys=[resv_key(payload.order_id)])
             raise
-        return {"order_id": payload.order_id, "status": "reserved", "items": reservation.items}
+        return {
+            "order_id": payload.order_id,
+            "status": "reserved",
+            "items": [item.model_dump() for item in payload.items],
+        }
 
 
 @app.post("/inventory/commit")
 async def commit(payload: OrderRef, principal: PrincipalDep) -> dict[str, Any]:
     async with get_session_factory()() as session:
-        reservation = await session.scalar(
-            select(Reservation).where(Reservation.order_id == payload.order_id)
+        rows = (
+            (
+                await session.execute(
+                    select(Reservation).where(Reservation.order_id == payload.order_id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        if reservation is None:
+        if not rows:
             raise ApiError("NOT_FOUND", "预占记录不存在")
-        if reservation.status == "committed":
+        if all(row.status == "committed" for row in rows):
             # 已提交视为成功幂等返回，不重复扣减 total。
             return {"order_id": payload.order_id, "status": "committed", "idempotent": True}
-        if reservation.status != "reserved":
-            raise ApiError("CONFLICT", f"预占状态 {reservation.status} 不可提交")
+        if any(row.status != "reserved" for row in rows):
+            raise ApiError("CONFLICT", "预占状态不可提交")
         # 提交把「预占」转为「已售」：同时扣减 reserved 与 total，可用量保持不变。
-        for item in reservation.items:
-            stock = await session.get(Stock, item["sku"])
+        for row in rows:
+            stock = await session.get(Stock, row.sku)
             if stock:
-                stock.reserved = max(stock.reserved - item["qty"], 0)
-                stock.total = max(stock.total - item["qty"], 0)
-        reservation.status = "committed"
-        reservation.updated_at = datetime.now(UTC)
+                stock.reserved = max(stock.reserved - row.qty, 0)
+                stock.total = max(stock.total - row.qty, 0)
+            row.status = "committed"
+            row.updated_at = datetime.now(UTC)
         await session.commit()
     await _commit_script(keys=[resv_key(payload.order_id)])
     return {"order_id": payload.order_id, "status": "committed"}
@@ -318,16 +419,22 @@ async def commit(payload: OrderRef, principal: PrincipalDep) -> dict[str, Any]:
 @app.post("/inventory/release")
 async def release(payload: OrderRef, principal: PrincipalDep) -> dict[str, Any]:
     async with get_session_factory()() as session:
-        reservation = await session.scalar(
-            select(Reservation).where(Reservation.order_id == payload.order_id)
+        rows = (
+            (
+                await session.execute(
+                    select(Reservation).where(Reservation.order_id == payload.order_id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        if reservation is None:
+        if not rows:
             # 订单从未预占（或已清理）时按成功幂等返回，取消流程无需特殊分支。
             return {"order_id": payload.order_id, "status": "not_found", "idempotent": True}
-        if reservation.status in {"released", "committed"}:
+        if all(row.status != "reserved" for row in rows):
             # 已释放/已提交不可回退，直接返回当前状态，避免重复回补库存。
-            return {"order_id": payload.order_id, "status": reservation.status, "idempotent": True}
-        await _release_locked(session, reservation, reason=payload.reason)
+            return {"order_id": payload.order_id, "status": rows[0].status, "idempotent": True}
+        await _release_locked(session, rows, reason=payload.reason)
         await session.commit()
     return {"order_id": payload.order_id, "status": "released"}
 

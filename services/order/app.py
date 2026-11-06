@@ -146,7 +146,21 @@ async def _reserve_inventory(order: Order) -> tuple[bool, str]:
         return False, "inventory_unavailable"
 
 
-async def _release_inventory(order_id: str, reason: str) -> None:
+async def _release_inventory(order_id: str, reason: str, *, ensure_closed: bool = True) -> None:
+    # 释放库存前必须先关闭支付单（非 pending）：若释放后用户才付款成功，
+    # 订单已取消无法履约，只能走迟到支付自动退款。先关单把竞态窗口压到最小，
+    # payment 不可用时 fail closed（宁少卖不超卖），由补偿/兜底扫描重试。
+    if ensure_closed:
+        try:
+            await payment_svc.request(
+                "POST",
+                f"/payments/{order_id}/expire",
+                json={},
+                headers=signed_identity_headers("system", "operator"),
+            )
+        except ApiError as exc:
+            logger.error("关单失败，暂不释放库存 order_id=%s code=%s", order_id, exc.code)
+            return
     # 释放是尽力而为：库存侧还有超时回补兜底，不能因下游失败回滚订单已提交的取消状态。
     with contextlib.suppress(ApiError):
         await inventory.request(
@@ -510,7 +524,8 @@ async def handle_event(event: dict[str, Any]) -> None:
                 row.inventory_committed = True
                 await session.commit()
     if release_reason:
-        await _release_inventory(order_id, release_reason)
+        # payment.expired 事件意味着支付单已关闭，无需再关一次，直接释放。
+        await _release_inventory(order_id, release_reason, ensure_closed=False)
     if late_refund_amount is not None:
         await _refund_late_payment(order_id, late_refund_amount)
     if restock_items:
@@ -679,7 +694,7 @@ async def create_order(
             )
             await session.commit()
             result = order.to_dict()
-        await _release_inventory(order.id, "payment_unavailable")
+        await _release_inventory(order.id, "payment_unavailable", ensure_closed=False)
         with contextlib.suppress(Exception):
             await idem.finish(scope, idempotency_key, result)
         raise ApiError("CONFLICT", "支付服务不可用，订单已取消", details={"order": result})

@@ -188,6 +188,32 @@ async def get_payment(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
         return payment.to_dict()
 
 
+@app.post("/payments/{order_id}/expire")
+async def expire_payment(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    """内部关单：订单取消链路在释放库存前调用，把 pending 支付单原子关闭。
+
+    幂等：已过期/已支付/已退款只返回当前状态，不重复发事件；
+    关单成功后订单侧才能释放库存，杜绝「释放后用户付款成功」的迟到支付窗口。
+    """
+    principal.require_staff()
+    async with get_session_factory()() as session:
+        payment = await session.scalar(select(Payment).where(Payment.order_id == order_id))
+        if payment is None:
+            # 支付单不存在说明从未成功建单，视为已关闭，订单侧可继续释放
+            return {"order_id": order_id, "status": "not_found", "idempotent": True}
+        if payment.status == "pending":
+            payment.status = "expired"
+            enqueue(
+                session,
+                "payment",
+                "payment.expired",
+                {"payment_id": payment.id, "order_id": payment.order_id},
+                tenant=payment.tenant_id,
+            )
+            await session.commit()
+        return {"order_id": order_id, "status": payment.status}
+
+
 @app.post("/payments/callback/{provider_name}")
 async def payment_callback(provider_name: str, request: Request) -> dict[str, Any]:
     """渠道回调入口：原始 body + 签名头，重复回调同样返回 2xx。"""
