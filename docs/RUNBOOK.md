@@ -4,7 +4,7 @@
 
 | 组件 | 版本 | 用途 |
 |---|---|---|
-| Docker + Compose | 24+ / v2+ | 一键起 PostgreSQL、Redis、七个服务与前端 |
+| Docker + Compose | 24+ / v2+ | 一键起 PostgreSQL、Redis、八个业务服务与前端 |
 | Python | 3.11+ | 本地单测与离线冒烟 |
 | Node.js | 20+ | 前端构建 |
 
@@ -38,6 +38,12 @@ docker compose down -v                                # 连数据库卷一起清
 
 `down -v` 会删除 `pgdata`，属于破坏性操作，执行前确认没有需要保留的数据。
 
+已有 `pgdata` 卷时 `infra/postgres/init.sql` 不会重跑；M2 新增 `payment_db`，升级时需要手动建库：
+
+```bash
+docker compose exec postgres psql -U shop -c 'CREATE DATABASE payment_db;'
+```
+
 ## 3. 本地验证（不依赖 Docker）
 
 ```bash
@@ -46,7 +52,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 ```
 
-当前结果：`34 passed`。
+当前结果：`61 passed`。
 
 只启动不依赖 Redis 的服务做冒烟：
 
@@ -120,40 +126,46 @@ curl -s -X POST localhost:8080/api/storefront/checkout \
 ### 4.3 支付与履约
 
 ```bash
-curl -s -X POST localhost:8080/api/storefront/orders/$ORDER_ID/pay \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"method":"mock"}'
+# 下单响应里会带 payment_id / pay_url / payment_expires_at；mock 收银台确认支付
+curl -s -X POST localhost:8080/api/storefront/payments/$PAYMENT_ID/pay \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 运营侧：
 
 ```bash
 curl -s localhost:8080/api/fulfillment/shipments -H "Authorization: Bearer $OPS_TOKEN"
+# 整单发货：不带 items
 curl -s -X POST localhost:8080/api/fulfillment/shipments/$SHIPMENT_ID/ship \
   -H "Authorization: Bearer $OPS_TOKEN" -H 'Content-Type: application/json' -d '{"carrier":"SF"}'
+# 部分发货：只发 item-a 1 件，剩余数量自动拆到新的 pending 履约单
+curl -s -X POST localhost:8080/api/fulfillment/shipments/$SHIPMENT_ID/ship \
+  -H "Authorization: Bearer $OPS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"carrier":"SF","items":[{"order_item_id":"'"$ITEM_ID"'","qty":1}]}'
 curl -s -X POST localhost:8080/api/fulfillment/shipments/$SHIPMENT_ID/deliver \
   -H "Authorization: Bearer $OPS_TOKEN"
 ```
 
-验证点：订单状态按 `PAID → SHIPPED → COMPLETED` 推进，`/api/orders/$ORDER_ID/timeline` 可见轨迹。
+验证点：部分发货时订单保持 `PAID`；全部行发完才 `PAID → SHIPPED`；所有履约单签收后才 `→ COMPLETED`，`/api/orders/$ORDER_ID/timeline` 可见轨迹。
 
 ### 4.4 售后
 
 ```bash
-# 用户申请
+# 用户申请（整单退款金额必须等于剩余可退额；部分退款请传 order_item_id + quantity）
 curl -s -X POST localhost:8080/api/aftersales/tickets \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"order_id":"'$ORDER_ID'","type":"refund_only","reason":"商品破损"}'
 
-# 运营审批（body 里的 note 会写入 decision_note）
+# 运营审批（通过后由 payment 服务同步出款，工单状态随 payment.refunded 事件回填）
 curl -s -X POST localhost:8080/api/aftersales/tickets/$TICKET_ID/approve \
   -H "Authorization: Bearer $OPS_TOKEN" -H 'Content-Type: application/json' -d '{"note":"人工审核通过"}'
 
-# 退款完成
-curl -s -X POST localhost:8080/api/aftersales/tickets/$TICKET_ID/refund-complete \
+# 日终对账（默认昨天，可传 biz_date）；差异只记录，不自动改资金
+curl -s -X POST "localhost:8080/api/payments/reconciliation?biz_date=2026-11-05" \
   -H "Authorization: Bearer $OPS_TOKEN"
 ```
 
-小额低风险工单会被政策引擎 `auto_approve`；大额、高频、欺诈词会升级 `manual`。退款完成后订单进入 `REFUNDED`。
+小额低风险工单会被政策引擎 `auto_approve`；大额、高频、欺诈词会升级 `manual`。全额退款完成后订单进入 `REFUNDED`，部分退款回退到退款前状态，订单行保留已退数量与金额。
 
 ### 4.5 Agent 与证据
 
@@ -195,8 +207,13 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 | 刷新会话返回 401 | refresh Cookie 缺失/过期/已被轮换撤销 | 重新登录；确认请求走的是网关 `/api/auth/*` 路径 |
 | 业务接口 401 但 Cookie 还在 | access token 只有 15 分钟 | 前端会自动调一次 `/auth/refresh` 重放；仍失败则重新登录 |
 | 下游服务把用户当访客 | 身份头未签名或服务 `TRUST_IDENTITY_HEADERS=false` | 确认所有服务同一 `INTERNAL_SIGNING_SECRET` 且开关为 true |
-| 下单 409 `CONFLICT` | 库存不足 / 幂等键复用 | 查 `/api/inventory/stocks`；换幂等键 |
-| 订单卡在 `PAYING` | 支付回调失败 | 查 order 日志与 outbox `last_error` |
+| 下单 409 `CONFLICT` | 库存不足 / 幂等键复用 / 支付服务不可用 | 查 `/api/inventory/stocks` 与 payment 日志；换幂等键 |
+| 订单卡在 `PAYING` | 支付回调失败或 outbox 未投递 | 查 payment/order 日志与 outbox `last_error`，手动重放 `payment.succeeded` |
+| 订单被自动取消 | 支付单超时（`PAYMENT_TTL_SECONDS`，默认 900s） | 重新下单；或调大 TTL |
+| 支付回调 401 | 签名密钥不一致或时间戳超出 5 分钟 | 确认 `PAYMENT_WEBHOOK_SECRET` 一致与机器时钟 |
+| 支付回调 409 金额不一致 | 渠道回调金额/币种与建单不一致 | 不落账；按日志排查建单与渠道对账 |
+| 退款 409 | 累计退款超过支付金额或工单重复 | 查 `refunds` 表与订单行 `refunded_amount_cents` |
+| 对账出现 diff | 渠道账单缺失/金额不一致/迟到回调 | 查 `reconciliation_diffs`，人工核实，不自动改资金 |
 | 履约单不出现 | fulfillment 未消费 `order.paid` | 查消费者组 `shop:events:order` 与 `shop:dedupe:*` |
 | 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
@@ -207,7 +224,7 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 
 已执行：
 
-- `pytest -q` → **49 passed**
+- `pytest -q` → **61 passed**
 - `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
 - `cd web && npm install && npm run build` → **构建成功**

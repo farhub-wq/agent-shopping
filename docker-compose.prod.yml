@@ -63,6 +63,17 @@ services:
         limits: { cpus: "1.0", memory: 512M }
     logging: *logging
 
+  payment:
+    restart: unless-stopped
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    environment:
+      # 生产必须关闭 mock 收银台；真实渠道接入前 payment 只能接受内部创建与已配置渠道回调
+      PAYMENT_MOCK_MODE: "false"
+    logging: *logging
+
   postgres:
     restart: unless-stopped
     ports: !reset []

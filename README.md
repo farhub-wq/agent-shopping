@@ -44,12 +44,12 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | gateway | 8080 | 鉴权、限流、BFF、代理、SSE、审计 | 无业务主数据 | 已实现 |
 | catalog | 8001 | 商品、类目属性、违规词与合规检查 | catalog_db | 已实现 |
 | inventory | 8002 | 库存、预占/提交/释放、秒杀 | inventory_db | 已实现 |
-| order | 8003 | 订单状态机、支付、退款、Saga 补偿 | order_db | 已实现（支付为 mock） |
-| fulfillment | 8004 | 履约单、SLA 超时扫描、发货/签收 | fulfillment_db | 已实现 |
-| aftersales | 8005 | 售后单、政策引擎、风险评分、审批 | aftersales_db | 已实现 |
+| order | 8003 | 订单状态机、支付编排、退款聚合、Saga 补偿 | order_db | 已实现 |
+| fulfillment | 8004 | 履约单、部分发货、SLA 超时扫描、发货/签收 | fulfillment_db | 已实现 |
+| aftersales | 8005 | 售后单、政策引擎、风险评分、行级退款审批 | aftersales_db | 已实现 |
 | harness | 8006 | 技能准入、工具权限、沙箱、MCP、记忆、Trace | harness_db | 已实现 |
-| identity | 8007 | 注册、登录、refresh 轮换、角色授予 | identity_db | 规划（M1） |
-| payment | 8008 | 支付单、退款、拒付、复式总账、对账 | payment_db | 规划（M2） |
+| identity | 8007 | 注册、登录、refresh 轮换、角色授予 | identity_db | 已实现（M1） |
+| payment | 8008 | 支付单、退款、复式总账、回调幂等、日终对账 | payment_db | 已实现（M2，Mock 渠道） |
 | audit | 8009 | 长期审计、查询、导出 | audit_db | 规划（M3） |
 | notify | 8010 | 发货/退款/审批通知 | notify_db | 规划（Should） |
 | web | 5173 | 商城前台 / 订单售后 / 运营后台 / Agent 对话 | — | 已实现 |
@@ -61,8 +61,8 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | 维度 | 常见商城 Demo / Agent 框架 | 本项目（当前 → 生产目标） |
 |---|---|---|
 | 库存一致性 | 先查再减，或依赖单库事务 | 当前：Lua 原子预占 + DB 落库；目标：DB 为最终真相 + Redis 闸门 + 预占表 + 定时对账，fail closed |
-| 资金正确性 | 只存支付状态，靠渠道后台 | 目标：独立 payment 服务 + 内部复式总账 + 日终对账，渠道是结算事实、内部账是业务事实 |
-| 订单生命周期 | 整单发货 / 整单退款 | 当前：整单；目标：部分发货、部分退款、退货退款，订单状态与履约解耦 |
+| 资金正确性 | 只存支付状态，靠渠道后台 | 当前：独立 payment 服务 + 复式总账 + 日终对账（Mock 渠道）；目标：接真实聚合支付，渠道是结算事实、内部账是业务事实 |
+| 订单生命周期 | 整单发货 / 整单退款 | 当前：部分发货 + 部分退款；目标：退货退款与换货/拒收 |
 | 服务边界 | 单服务单库，或跨库直连 | 五个业务服务各自持库，跨服务只走 HTTP / 事件，共享能力收敛到 `shop_common` |
 | 事件可靠 | 事务提交后再发消息，可能丢或重 | 业务写入与 outbox 同事务；目标补齐消费组、`XAUTOCLAIM`、DLQ、重放与 relay 分布式锁 |
 | Agent 权限 | 直接把工具列表交给模型 | 准入 → 信任封顶 → 权限 → 审批 → 脱敏 → 证据；不可逆动作只返回 `needs_approval` |
@@ -94,7 +94,7 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | 阶段 | 内容 |
 |---|---|
 | M1 账号与权限 | identity 服务、注册/登录/refresh、网关改造、前端登录（见 [implementation_plan.md](implementation_plan.md)） |
-| M2 资金与订单 | payment 服务、复式总账、回调幂等、部分发货/退款、对账、超时关单 |
+| M2 资金与订单 | payment 服务、复式总账、回调幂等、部分发货/退款、对账、超时关单（见 [implementation_plan_m2.md](implementation_plan_m2.md)） |
 | M3 生产加固 | 事件 DLQ/重放、audit、可观测与告警、沙箱 runner、双主机/托管 DB、Alembic、灾备 |
 | M4 上线准入 | 五场景压测与混沌、灰度、1 元真实支付验证、三方签字、范围冻结 |
 
@@ -176,8 +176,9 @@ cd web && npm install && npm run build
 
 ## 已实现的功能
 
-- **商城前台**：商品列表与详情、购物车、幂等下单、mock 支付、订单列表、售后申请、Agent 客服对话（SSE 流式）。
-- **订单与履约**：显式订单状态机（支付 / 取消 / 退款 / 完成）、Saga 补偿、履约单生成、SLA 超时扫描、发货与签收回写状态。
+- **商城前台**：商品列表与详情、购物车、幂等下单、payment 服务 mock 收银台、订单列表、售后申请、Agent 客服对话（SSE 流式）。
+- **订单与履约**：显式订单状态机（支付 / 取消 / 退款 / 完成）、Saga 补偿、履约单生成、部分发货与拆单、SLA 超时扫描、发货与签收回写状态。
+- **资金**：独立 payment 服务、HMAC 签名回调、回调幂等、复式总账（借贷平衡校验）、超时关单、行级部分退款、日终对账与差异记录。
 - **库存与商品**：多 SKU 原子预占 / 提交 / 释放、超时预占回补、秒杀限购、类目属性校验与违规词合规检查。
 - **售后**：政策引擎自动 / 人工分流、风险评分、审批与退款闭环、不可逆动作审批留痕。
 - **运营后台**：订单 / 履约 / 售后操作入口、Agent 运行记录与证据查看、人工审批。
@@ -186,8 +187,8 @@ cd web && npm install && npm run build
 
 ### 生产化缺口（按优先级）
 
-1. **资金**：支付是 mock，没有回调验签、总账、退款与对账（M2）。
-2. **订单**：只有整单发货/退款，缺部分履约与部分退款聚合（M2）。
+1. **资金**：payment 已具备回调验签、总账、退款与对账，但渠道仍是 Mock；真实聚合支付、拒付与异步退款回调待接入。
+2. **订单**：已支持部分发货与行级部分退款；退货物流收货、回补库存与换货/拒收仍未实现。
 3. **事件**：relay 随进程启动，多实例会重复投递；缺 DLQ 与重放（M3）。
 4. **运维**：单机 Compose、无指标/告警/备份演练/SLO（M3）。
 5. **沙箱**：默认关闭，开启后 API 持有 Docker socket，本地兜底不是安全边界（M3）。
@@ -258,8 +259,8 @@ services/fulfillment/     履约单、SLA 超时扫描、发货/签收
 services/aftersales/      售后单、政策引擎、风险评分、审批
 services/gateway/         鉴权、限流、BFF、反向代理、SSE、审计
 services/harness/         技能准入、策略、工具、沙箱、MCP、记忆、Runtime、Trace
-services/identity/        账号与权限（规划，M1）
-services/payment/         支付、退款、总账、对账（规划，M2）
+services/identity/        账号与权限（M1）
+services/payment/         支付、退款、复式总账、回调幂等、对账（M2）
 services/audit/           长期审计（规划，M3）
 web/                      React 18 + Vite：商城 / 订单售后 / 运营后台 / Agent
 tests/                    状态机、售后政策、准入、策略、记忆、MCP、沙箱、事件过滤
@@ -275,6 +276,7 @@ docs/requirements/        需求与验收标准
 - [system-design.md](docs/design/system-design.md)：生产基线设计（部署、数据模型、资金、事件、沙箱、可观测、灾备、里程碑）
 - [requirements-shop-agent.md](docs/requirements/requirements-shop-agent.md)：需求、验收标准与差距
 - [implementation_plan.md](implementation_plan.md)：M1 账号与权限实施计划
+- [implementation_plan_m2.md](implementation_plan_m2.md)：M2 资金与订单实施计划
 - [docs/CI-CD.md](docs/CI-CD.md)：CI/CD、分支保护、AI 评审配置与部署回滚
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层、数据所有权、事件契约、一致性设计
 - [docs/PUBLIC-SOLUTION.md](docs/PUBLIC-SOLUTION.md)：如何把这套骨架抽象成通用电商解决方案
@@ -286,8 +288,8 @@ docs/requirements/        需求与验收标准
 
 1. 单镜像多入口（`SERVICE_NAME` 选择应用）是为了本地一键启动；生产按设计拆成独立镜像与独立部署单元。
 2. 当前库存是“Redis 先扣、DB 后写”；生产目标改为 DB 真相 + Redis 闸门 + 预占表 + 对账，见设计文档第 4.4、5.2 节。
-3. 当前支付是 mock，没有渠道回调、总账与对账；M2 接入真实聚合支付。
-4. 当前只支持整单发货/退款；部分履约与部分退款在 M2 落地。
+3. payment 已实现回调验签、总账与对账，但渠道为 Mock；真实聚合支付与拒付处理待接入。
+4. 已支持部分发货与行级部分退款；退货物流收货与库存回补尚未实现。
 5. Outbox relay 随服务进程启动，多实例会重复投递；M3 补 relay 锁、DLQ 与重放。
 6. 本地子进程沙箱不是安全边界；生产必须使用独立 runner，Docker 不可用时失败而不是本地降级。
 7. 哈希 n-gram 向量是离线兜底，不是语义模型；接入真实 embedding 后应重建索引。
