@@ -33,6 +33,7 @@ SERVICES = {
     "aftersales": settings.aftersales_url,
     "agents": settings.harness_url,
     "harness": settings.harness_url,
+    "payments": settings.payment_url,
 }
 
 RATE_LIMIT_PER_MINUTE = 120
@@ -47,6 +48,7 @@ SERVICE_PATH_PREFIX = {
     "orders": "/orders",
     "fulfillment": "",
     "aftersales": "/aftersales",
+    "payments": "/payments",
     "harness": "",
 }
 # 这些路径属于 harness 根路由，不能再补 /agents 前缀
@@ -137,6 +139,9 @@ async def rate_limit(request: Request, call_next):
             return _rate_limited("登录请求过于频繁，请稍后再试")
         return await call_next(request)
     if path in {"/api/auth/register", "/api/auth/refresh", "/api/auth/token"}:
+        return await call_next(request)
+    # 渠道回调由服务商按签名鉴权且可能短时高频重试，不能套用按用户的业务限流
+    if path.startswith("/api/payments/callback/"):
         return await call_next(request)
     # 优先按已鉴权用户维度计数，未带身份时退化为客户端 IP，避免匿名流量绕过限额
     identity = request.headers.get("x-user-id") or (request.client.host if request.client else "unknown")
@@ -272,17 +277,40 @@ async def my_orders(request: Request, principal: PrincipalDep, status: str | Non
     return response.json()
 
 
-@app.post("/api/storefront/orders/{order_id}/pay")
-async def pay(order_id: str, request: Request, principal: PrincipalDep) -> dict[str, Any]:
-    # 允许空 body：支付接口的扩展参数可缺省，直接透传订单服务处理
-    body = await request.json() if await request.body() else {}
+@app.post("/api/payments/callback/{provider}")
+async def payment_callback(provider: str, request: Request) -> JSONResponse:
+    """渠道回调入口：不做网关鉴权，必须原样透传原始 body 与签名头，由 payment 服务验签。"""
+    raw_body = await request.body()
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in {"host", "content-length", "connection", "accept-encoding"}
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"{settings.payment_url}/payments/callback/{provider}",
+            content=raw_body,
+            headers=headers,
+        )
+    # 原样返回下游状态码：验签失败保持 401、金额不符保持 409，渠道据此重试或告警
+    return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+@app.post("/api/storefront/payments/{payment_id}/pay")
+async def pay(payment_id: str, request: Request, principal: PrincipalDep) -> dict[str, Any]:
+    """本地 mock 收银台确认入口；真实渠道是用户跳转服务商页面后由回调驱动。"""
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            f"{settings.order_url}/orders/{order_id}/pay", json=body, headers=_forward(principal, _request_id(request))
+            f"{settings.payment_url}/payments/cashier/{payment_id}/pay",
+            headers=_forward(principal, _request_id(request)),
         )
     payload = response.json()
     if response.status_code >= 400:
-        raise ApiError(payload.get("code", "CONFLICT"), payload.get("message", "支付失败"), details=payload.get("details", {}))
+        raise ApiError(
+            payload.get("code", "CONFLICT"),
+            payload.get("message", "支付失败"),
+            details=payload.get("details", {}),
+        )
     return payload
 
 
