@@ -74,6 +74,14 @@ redis.call('EXPIRE', users_key, 86400)
 return {1, 'OK', stock - 1}
 """
 
+# KEYS[1] = 库存键；ARGV[1] = 回补量。只回补已存在的热点键；冷键以 DB 为真相，不凭空造键。
+RESTOCK = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return redis.call('INCRBY', KEYS[1], tonumber(ARGV[1]))
+end
+return -1
+"""
+
 # 从数据库全量重建热点库存：仅用于启动对账或人工修复
 SYNC_STOCK = """
 redis.call('SET', KEYS[1], ARGV[1])

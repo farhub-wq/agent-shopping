@@ -15,8 +15,8 @@ from shop_common.events import create_redis
 from shop_common.logging import configure_logging, get_logger
 from sqlalchemy import select
 
-from .models import Reservation, Stock
-from .scripts import COMMIT_ORDER, RELEASE_ORDER, RESERVE_MULTI, SEC_KILL, SYNC_STOCK
+from .models import Reservation, Restock, Stock
+from .scripts import COMMIT_ORDER, RELEASE_ORDER, RESERVE_MULTI, RESTOCK, SEC_KILL, SYNC_STOCK
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -32,6 +32,7 @@ redis: Redis | None = None
 _reserve_script = None
 _release_script = None
 _commit_script = None
+_restock_script = None
 _sec_kill_script = None
 _sync_script = None
 
@@ -125,7 +126,7 @@ async def _release_locked(session, reservation: Reservation, *, reason: str) -> 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global redis, _reserve_script, _release_script, _commit_script, _sec_kill_script, _sync_script
+    global redis, _reserve_script, _release_script, _commit_script, _restock_script, _sec_kill_script, _sync_script
     configure_logging("inventory")
     await init_models()
     redis = create_redis(settings.redis_url)
@@ -133,6 +134,7 @@ async def lifespan(_: FastAPI):
     _reserve_script = redis.register_script(RESERVE_MULTI)
     _release_script = redis.register_script(RELEASE_ORDER)
     _commit_script = redis.register_script(COMMIT_ORDER)
+    _restock_script = redis.register_script(RESTOCK)
     _sec_kill_script = redis.register_script(SEC_KILL)
     _sync_script = redis.register_script(SYNC_STOCK)
     await seed_stocks()
@@ -328,6 +330,62 @@ async def release(payload: OrderRef, principal: PrincipalDep) -> dict[str, Any]:
         await _release_locked(session, reservation, reason=payload.reason)
         await session.commit()
     return {"order_id": payload.order_id, "status": "released"}
+
+
+class RestockItem(BaseModel):
+    sku: str
+    # 回补目标总量（绝对值）：端点按 (order_id, sku) 已回补量取增量，重复调用幂等
+    qty: int = Field(ge=0)
+
+
+class RestockRequest(BaseModel):
+    order_id: str
+    items: list[RestockItem] = Field(min_length=1)
+
+
+@app.post("/inventory/restock")
+async def restock(payload: RestockRequest, principal: PrincipalDep) -> dict[str, Any]:
+    """退款后回补库存：qty 是目标总量而非增量，由本服务按记录取差值，重试不会重复回补。"""
+    deltas: list[dict[str, Any]] = []
+    async with get_session_factory()() as session:
+        skus = [row.sku for row in payload.items]
+        records = {
+            rec.sku: rec
+            for rec in (
+                await session.execute(
+                    select(Restock).where(
+                        Restock.order_id == payload.order_id, Restock.sku.in_(skus)
+                    )
+                )
+            ).scalars()
+        }
+        stocks = {
+            stock.sku: stock
+            for stock in (await session.execute(select(Stock).where(Stock.sku.in_(skus)))).scalars()
+        }
+        for row in payload.items:
+            rec = records.get(row.sku)
+            done = rec.qty if rec is not None else 0
+            delta = row.qty - done
+            if delta < 0:
+                # 目标只允许单调增长；变小说明上游计算出错，拒绝而不是悄悄冲减库存
+                raise ApiError("CONFLICT", f"SKU {row.sku} 回补目标 {row.qty} 小于已回补量 {done}")
+            if delta == 0:
+                continue
+            stock = stocks.get(row.sku)
+            if stock is None:
+                raise ApiError("NOT_FOUND", f"SKU {row.sku} 不存在")
+            stock.total += delta
+            if rec is None:
+                session.add(Restock(order_id=payload.order_id, sku=row.sku, qty=row.qty))
+            else:
+                rec.qty = row.qty
+            deltas.append({"sku": row.sku, "qty": delta})
+        await session.commit()
+    # DB 提交后再同步热点库存；脚本对不存在的键跳过，冷 SKU 以 DB 为准
+    for row in deltas:
+        await _restock_script(keys=[stock_key(row["sku"])], args=[row["qty"]])
+    return {"order_id": payload.order_id, "restocked": deltas}
 
 
 @app.post("/inventory/flash-sale/{sku}/seckill")
