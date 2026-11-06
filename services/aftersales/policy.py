@@ -34,7 +34,7 @@ def evaluate(
             "risk_reasons": ["超出售后申请窗口"],
             "note": f"订单创建已超过 {window_days} 天，不符合售后政策",
         }
-    if order_status not in {"PAID", "SHIPPED", "COMPLETED"}:
+    if order_status not in {"PAID", "SHIPPING", "SHIPPED", "COMPLETED"}:
         return {
             "decision": "auto_reject",
             "risk_score": 0,

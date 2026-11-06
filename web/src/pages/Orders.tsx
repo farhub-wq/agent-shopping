@@ -8,6 +8,7 @@ const STATUS_LABELS: Record<string, string> = {
   RESERVED: "库存已锁定",
   PAYING: "支付中",
   PAID: "已支付",
+  SHIPPING: "部分发货",
   SHIPPED: "已发货",
   COMPLETED: "已完成",
   CANCELLED: "已取消",
@@ -155,7 +156,7 @@ export default function Orders() {
                 {(order.status === "RESERVED" || order.status === "PAYING") && (
                   <button className="primary small" onClick={() => pay(order.payment_id)}>去支付</button>
                 )}
-                {(order.status === "PAID" || order.status === "SHIPPED" || order.status === "COMPLETED") && (
+                {(order.status === "PAID" || order.status === "SHIPPING" || order.status === "SHIPPED" || order.status === "COMPLETED") && (
                   <button className="ghost" onClick={() => {
                     setFormOrder(order.id);
                     setRefundItemId("");

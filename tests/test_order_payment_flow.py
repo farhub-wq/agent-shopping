@@ -69,12 +69,11 @@ async def test_payment_succeeded_moves_order_to_paid():
         order = await session.get(Order, order_id)
         assert order is not None
         assert order.status == "PAID"
-        assert order.payment_status == "paid"
         assert order.paid_at is not None
 
 
 @pytest.mark.asyncio
-async def test_partial_shipment_keeps_order_paid_until_all_shipped():
+async def test_partial_shipment_enters_shipping_then_shipped():
     order_id = await _create_order()
     await handle_event(
         {
@@ -97,7 +96,8 @@ async def test_partial_shipment_keeps_order_paid_until_all_shipped():
     async with get_session_factory()() as session:
         order = await session.get(Order, order_id)
         assert order is not None
-        assert order.status == "PAID"
+        # 首次部分发货：PAID 进入 SHIPPING
+        assert order.status == "SHIPPING"
         assert order.items[0]["shipped_qty"] == 1
 
     await handle_event(
@@ -117,6 +117,7 @@ async def test_partial_shipment_keeps_order_paid_until_all_shipped():
     async with get_session_factory()() as session:
         order = await session.get(Order, order_id)
         assert order is not None
+        # 全部发完：SHIPPING 收敛到 SHIPPED
         assert order.status == "SHIPPED"
         assert order.items[0]["shipped_qty"] == 2
 

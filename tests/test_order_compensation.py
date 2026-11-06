@@ -37,7 +37,7 @@ async def _create_order(**overrides) -> str:
                 status=overrides.get("status", "RESERVED"),
                 amount_cents=600,
                 cancel_reason=overrides.get("cancel_reason"),
-                payment_status=overrides.get("payment_status", "unpaid"),
+                paid_at=overrides.get("paid_at"),
                 inventory_committed=overrides.get("inventory_committed", False),
                 items=_items(overrides.get("shipped_a", 0)),
             )
@@ -61,7 +61,7 @@ async def test_late_payment_auto_refunds_full_amount(monkeypatch):
 
     monkeypatch.setattr(order_app.payment_svc, "request", fake_request)
     order_id = await _create_order(
-        status="CANCELLED", cancel_reason="payment_timeout", payment_status="expired"
+        status="CANCELLED", cancel_reason="payment_timeout"
     )
     await handle_event(
         _event("evt-late-1", "payment.succeeded", {"order_id": order_id, "amount_cents": 600})
@@ -70,9 +70,9 @@ async def test_late_payment_auto_refunds_full_amount(monkeypatch):
     async with get_session_factory()() as session:
         order = await session.get(Order, order_id)
         assert order is not None
-        # 迟到支付不改变终态，只落资金事实
+        # 迟到支付不改变终态，只落资金事实（paid_at）
         assert order.status == "CANCELLED"
-        assert order.payment_status == "paid"
+        assert order.paid_at is not None
         events = (
             (await session.execute(select(OrderEvent).where(OrderEvent.order_id == order_id)))
             .scalars()
@@ -91,7 +91,7 @@ async def test_late_payment_auto_refunds_full_amount(monkeypatch):
     }
     assert calls == [expected]
 
-    # 第二个支付成功事件到达时 payment_status 已是 paid，不会重复发起退款
+    # 第二个支付成功事件到达时 paid_at 已落，不会重复发起退款
     await handle_event(
         _event("evt-late-2", "payment.succeeded", {"order_id": order_id, "amount_cents": 600})
     )
@@ -180,7 +180,6 @@ async def test_refund_on_cancelled_order_skips_restock(monkeypatch):
     order_id = await _create_order(
         status="CANCELLED",
         cancel_reason="payment_timeout",
-        payment_status="paid",
         inventory_committed=True,
     )
     await handle_event(
@@ -202,4 +201,3 @@ async def test_refund_on_cancelled_order_skips_restock(monkeypatch):
         order = await session.get(Order, order_id)
         assert order is not None
         assert order.status == "CANCELLED"
-        assert order.payment_status == "refunded"

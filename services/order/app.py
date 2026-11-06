@@ -203,7 +203,7 @@ async def _refund_late_payment(order_id: str, amount_cents: int) -> None:
             headers=signed_identity_headers("system", "operator"),
         )
     except ApiError as exc:
-        # 失败不向上抛：补偿扫单按「CANCELLED + payment_status=paid」持续重试
+        # 失败不向上抛：补偿扫单按「CANCELLED + paid_at 已落」持续重试，退款按 ticket_id 幂等
         logger.error("迟到支付自动退款失败 order_id=%s code=%s", order_id, exc.code)
 
 
@@ -284,7 +284,6 @@ async def expire_unpaid_orders() -> None:
                     .all()
                 )
                 for order in rows:
-                    order.payment_status = "expired"
                     _cancel(order, session, "payment_timeout")
                     enqueue(
                         session,
@@ -310,7 +309,7 @@ async def expire_unpaid_orders() -> None:
 # 补偿扫单覆盖的三类失步窗口，所有补偿操作都幂等，可无限重放
 _LATE_REFUND_REASONS = {"payment_timeout", "payment_expired"}
 # 库存提交/回补只在「钱已收」的状态上做；CANCELLED 订单走预占释放，不在补偿范围内
-_COMMITTED_STATUSES = {"PAID", "SHIPPED", "COMPLETED", "REFUNDING", "REFUNDED"}
+_COMMITTED_STATUSES = {"PAID", "SHIPPING", "SHIPPED", "COMPLETED", "REFUNDING", "REFUNDED"}
 
 
 async def _compensation_sweeper() -> None:
@@ -325,7 +324,7 @@ async def _compensation_sweeper() -> None:
                         await session.execute(
                             select(Order).where(
                                 Order.status == "CANCELLED",
-                                Order.payment_status == "paid",
+                                Order.paid_at.is_not(None),
                                 Order.cancel_reason.in_(_LATE_REFUND_REASONS),
                             )
                         )
@@ -406,7 +405,6 @@ async def handle_event(event: dict[str, Any]) -> None:
                     _apply(session, order, "pay_start", actor="payment")
                 _apply(session, order, "pay_success", actor="payment")
                 order.paid_at = datetime.now(UTC)
-                order.payment_status = "paid"
                 enqueue(
                     session,
                     "order",
@@ -419,10 +417,11 @@ async def handle_event(event: dict[str, Any]) -> None:
             elif (
                 order.status == "CANCELLED"
                 and order.cancel_reason in {"payment_timeout", "payment_expired"}
-                and order.payment_status not in {"paid", "refunded"}
+                and order.paid_at is None
+                and order.refund_amount_cents == 0
             ):
                 # 迟到支付：订单已超时关单但用户实际付款成功，落资金事实并自动全额退款
-                order.payment_status = "paid"
+                order.paid_at = datetime.now(UTC)
                 _record(session, order, "late_payment", actor="payment")
                 await session.commit()
                 late_refund_amount = order.amount_cents
@@ -430,12 +429,10 @@ async def handle_event(event: dict[str, Any]) -> None:
             # 支付失败允许顾客换渠道重试，退回 RESERVED，不取消订单、不动库存
             if order.status == "PAYING":
                 _apply(session, order, "pay_fail", actor="payment")
-                order.payment_status = "failed"
                 await session.commit()
         elif topic == "payment.expired":
             # 超时未支付：取消订单并释放库存，支付单状态由 payment 服务维护
             if order.status in {"RESERVED", "PAYING"}:
-                order.payment_status = "expired"
                 _cancel(order, session, "payment_expired")
                 enqueue(
                     session,
@@ -466,8 +463,7 @@ async def handle_event(event: dict[str, Any]) -> None:
                     item["refunded_amount_cents"] = int(item.get("paid_amount_cents", 0))
             _touch_items(order)
             order.refund_amount_cents = int(order.refund_amount_cents or 0) + amount
-            order.payment_status = "refunded" if payload.get("fully_refunded") else "partially_refunded"
-            if order.status in {"PAID", "SHIPPED", "COMPLETED"}:
+            if order.status in {"PAID", "SHIPPING", "SHIPPED", "COMPLETED"}:
                 order.refund_previous = order.status
                 _apply(session, order, "refund_request", actor="payment")
             if order.status == "REFUNDING":
@@ -479,6 +475,7 @@ async def handle_event(event: dict[str, Any]) -> None:
             # 退款出款成功后回补未发货数量的库存；CANCELLED 订单的库存已由预占释放回补，跳过防双重回补
             if order.inventory_committed and order.status in {
                 "PAID",
+                "SHIPPING",
                 "SHIPPED",
                 "COMPLETED",
                 "REFUNDING",
@@ -496,9 +493,14 @@ async def handle_event(event: dict[str, Any]) -> None:
                 # 防御性收口：发货总量不允许超过下单数量
                 item["shipped_qty"] = min(item["shipped_qty"], int(item.get("qty", 0)))
             _touch_items(order)
-            if payload.get("all_shipped") and order.status == "PAID":
-                _apply(session, order, "ship", actor="fulfillment")
-                order.shipped_at = datetime.now(UTC)
+            if payload.get("all_shipped"):
+                # 全部发完：无论 PAID 还是 SHIPPING，都收敛到 SHIPPED
+                if order.status in {"PAID", "SHIPPING"}:
+                    _apply(session, order, "ship", actor="fulfillment")
+                    order.shipped_at = datetime.now(UTC)
+            elif order.status == "PAID":
+                # 首次部分发货进入 SHIPPING；后续部分发货只记轨迹不迁移
+                _apply(session, order, "ship_partial", actor="fulfillment")
             else:
                 _record(session, order, "partial_ship", actor="fulfillment", detail={"items": items})
             await session.commit()
@@ -683,7 +685,6 @@ async def create_order(
         async with get_session_factory()() as session:
             order = await session.get(Order, order.id)
             assert order is not None
-            order.payment_status = "failed"
             _cancel(order, session, "payment_unavailable")
             enqueue(
                 session,
@@ -704,7 +705,6 @@ async def create_order(
         assert order is not None
         order.payment_id = payment_data["id"]
         order.pay_url = payment_data["pay_url"]
-        order.payment_status = "pending"
         order.payment_expires_at = datetime.fromisoformat(payment_data["expires_at"])
         # 订单进入 PAYING 表示已下支付单；真正 PAID 由 payment.succeeded 事件驱动
         _apply(session, order, "pay_start", actor="system")

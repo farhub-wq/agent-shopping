@@ -10,7 +10,9 @@ TRANSITIONS: dict[str, dict[str, str]] = {
     "CREATED": {"reserve": "RESERVED", "cancel": "CANCELLED"},
     "RESERVED": {"pay_start": "PAYING", "cancel": "CANCELLED"},
     "PAYING": {"pay_success": "PAID", "pay_fail": "RESERVED", "cancel": "CANCELLED"},
-    "PAID": {"ship": "SHIPPED", "refund_request": "REFUNDING"},
+    # 首次部分发货进 SHIPPING，全部发完才进 SHIPPED；整单一次发完直接 PAID → SHIPPED
+    "PAID": {"ship_partial": "SHIPPING", "ship": "SHIPPED", "refund_request": "REFUNDING"},
+    "SHIPPING": {"ship": "SHIPPED", "refund_request": "REFUNDING"},
     "SHIPPED": {"deliver": "COMPLETED", "refund_request": "REFUNDING"},
     "COMPLETED": {"refund_request": "REFUNDING"},
     "REFUNDING": {"refund_complete": "REFUNDED"},
@@ -26,6 +28,7 @@ STATE_LABELS = {
     "RESERVED": "库存已锁定",
     "PAYING": "支付中",
     "PAID": "已支付",
+    "SHIPPING": "部分发货",
     "SHIPPED": "已发货",
     "COMPLETED": "已完成",
     "CANCELLED": "已取消",

@@ -177,7 +177,7 @@ def _resolve_refund(
 async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[str, Any]:
     # 售后必须建立在真实且可退的订单上，因此先向订单服务取权威状态，而不是信任请求参数
     order = await order_client.request("GET", f"/orders/{payload.order_id}", headers=_forward(principal))
-    if order["status"] not in {"PAID", "SHIPPED", "COMPLETED", "REFUNDING"}:
+    if order["status"] not in {"PAID", "SHIPPING", "SHIPPED", "COMPLETED", "REFUNDING"}:
         raise ApiError("CONFLICT", "当前订单状态不支持发起售后")
     created_at = datetime.fromisoformat(order["created_at"])
     amount, order_item_id, quantity = _resolve_refund(order, payload)

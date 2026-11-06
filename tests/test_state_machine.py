@@ -11,6 +11,15 @@ def test_happy_path_transitions():
     assert resolve_target("SHIPPED", "deliver") == "COMPLETED"
 
 
+def test_partial_shipment_path():
+    # 首次部分发货进 SHIPPING，全部发完才进 SHIPPED，SHIPPING 不能直接签收
+    assert resolve_target("PAID", "ship_partial") == "SHIPPING"
+    assert resolve_target("SHIPPING", "ship") == "SHIPPED"
+    assert resolve_target("SHIPPING", "refund_request") == "REFUNDING"
+    with pytest.raises(ApiError):
+        resolve_target("SHIPPING", "deliver")
+
+
 def test_illegal_transition_rejected():
     with pytest.raises(ApiError) as exc:
         resolve_target("CANCELLED", "ship")
