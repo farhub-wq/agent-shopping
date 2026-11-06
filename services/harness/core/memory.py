@@ -1,7 +1,7 @@
 """三层记忆框架（自研）：工作记忆 / 情节记忆 / 语义事实。
 
 - 工作记忆：Redis 列表，保留最近若干轮对话，控制上下文成本。
-- 情节记忆：向量化后落库，按「相似度 + 重要性 + 时间衰减」混合召回。
+- 情节记忆：向量化后存 MongoDB，按「相似度 + 重要性 + 时间衰减」混合召回。
 - 语义记忆：从对话中抽取稳定事实（称呼、偏好、地址、过敏史），高权重长期保留。
 
 向量由确定性哈希 n-gram 生成，离线可用；配置模型后可替换为真实 embedding。
@@ -18,27 +18,12 @@ from typing import Any
 
 from redis.asyncio import Redis
 from shop_common.config import get_settings
-from shop_common.db import Base, get_session_factory
-from sqlalchemy import DateTime, String, Text, select
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import JSON, Float, Integer
+from shop_common.mongo import get_mongo_db
 
 settings = get_settings()
 
-
-class MemoryRecord(Base):
-    __tablename__ = "memory_records"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    user_id: Mapped[str] = mapped_column(String(64), index=True)
-    kind: Mapped[str] = mapped_column(String(16), index=True)  # episodic | semantic
-    text: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list] = mapped_column(JSON)
-    importance: Mapped[float] = mapped_column(Float, default=0.5)
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    access_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-    last_access: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+# 记忆集合名与索引集中在这里：Mongo 没有 schema 迁移，索引需在首次使用时幂等补建。
+MEMORY_COLLECTION = "memory_records"
 
 
 class HashingEmbedder:
@@ -84,6 +69,21 @@ class MemoryManager:
         self.redis = redis
         self.namespace = namespace
         self.embedder = HashingEmbedder(settings.embedding_dim)
+        self._indexed = False
+
+    def _collection(self):
+        return get_mongo_db()[MEMORY_COLLECTION]
+
+    async def _ensure_indexes(self) -> None:
+        """首次访问时补建索引；create_index 幂等，重复调用不会报错。"""
+        if self._indexed:
+            return
+        collection = self._collection()
+        # (user_id, kind, created_at) 支撑去重时按用户+类型取最近记录；
+        # (user_id, created_at) 支撑列表与召回的时间排序。
+        await collection.create_index([("user_id", 1), ("kind", 1), ("created_at", -1)])
+        await collection.create_index([("user_id", 1), ("created_at", -1)])
+        self._indexed = True
 
     def _work_key(self, session_id: str) -> str:
         return f"{self.namespace}:mem:work:{session_id}"
@@ -123,90 +123,91 @@ class MemoryManager:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         embedding = self.embedder.embed(text)
-        async with get_session_factory()() as session:
-            recent = (
-                (
-                    await session.execute(
-                        select(MemoryRecord).where(
-                            MemoryRecord.user_id == user_id, MemoryRecord.kind == kind
-                        )
-                    )
+        await self._ensure_indexes()
+        now = datetime.now(UTC)
+        collection = self._collection()
+        recent = await collection.find({"user_id": user_id, "kind": kind}).to_list(length=None)
+        for record in recent:
+            # 相似度 ≥ 0.92 视为同一条记忆：用新文本覆盖并提升重要性，
+            # 既去重又保留最新表述，避免同一事实反复膨胀检索结果。
+            if cosine(embedding, record.get("embedding") or []) >= 0.92:
+                await collection.update_one(
+                    {"_id": record["_id"]},
+                    {
+                        "$set": {
+                            "text": text,
+                            "importance": max(record.get("importance", 0.0), importance),
+                            "last_access": now,
+                        }
+                    },
                 )
-                .scalars()
-                .all()
-            )
-            for record in recent:
-                # 相似度 ≥ 0.92 视为同一条记忆：用新文本覆盖并提升重要性，
-                # 既去重又保留最新表述，避免同一事实反复膨胀检索结果。
-                if cosine(embedding, record.embedding or []) >= 0.92:
-                    record.text = text
-                    record.importance = max(record.importance, importance)
-                    record.last_access = datetime.now(UTC)
-                    await session.commit()
-                    return record.id
-            record = MemoryRecord(
-                id=str(uuid.uuid4()),
-                user_id=user_id,
-                kind=kind,
-                text=text,
-                embedding=embedding,
-                importance=importance,
-                metadata_json={**(metadata or {}), "tenant": tenant},
-            )
-            session.add(record)
-            await session.commit()
-            return record.id
+                return str(record["_id"])
+        memory_id = str(uuid.uuid4())
+        await collection.insert_one(
+            {
+                "_id": memory_id,
+                "user_id": user_id,
+                "kind": kind,
+                "text": text,
+                "embedding": embedding,
+                "importance": importance,
+                # metadata 里带上租户：多租户接入后仍可按租户隔离记忆
+                "metadata": {**(metadata or {}), "tenant": tenant},
+                "access_count": 0,
+                "created_at": now,
+                "last_access": now,
+            }
+        )
+        return memory_id
 
     async def retrieve(
         self, user_id: str, query: str, *, k: int = 5, token_budget: int = 900
     ) -> list[dict[str, Any]]:
         query_vector = self.embedder.embed(query)
-        now = time.time()
-        async with get_session_factory()() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(MemoryRecord).where(MemoryRecord.user_id == user_id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            scored: list[tuple[float, MemoryRecord]] = []
-            for record in rows:
-                similarity = cosine(query_vector, record.embedding or [])
-                age_days = max((now - record.created_at.timestamp()) / 86400, 0)
-                # 时间衰减尺度为 7 天：exp(-age/7)，越久权重越低。
-                recency = math.exp(-age_days / 7)
-                # 混合打分固定权重：相关性 0.6 / 重要性 0.25 / 新鲜度 0.15；
-                # 相关性仍是主导项，重要事实可跨越时间被召回，但不会压过查询意图。
-                score = 0.6 * similarity + 0.25 * record.importance + 0.15 * recency
-                scored.append((score, record))
-            scored.sort(key=lambda item: item[0], reverse=True)
+        now_ts = time.time()
+        await self._ensure_indexes()
+        rows = await self._collection().find({"user_id": user_id}).to_list(length=None)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for record in rows:
+            similarity = cosine(query_vector, record.get("embedding") or [])
+            created_at = record.get("created_at")
+            age_days = max((now_ts - created_at.timestamp()) / 86400, 0) if created_at else 0
+            # 时间衰减尺度为 7 天：exp(-age/7)，越久权重越低。
+            recency = math.exp(-age_days / 7)
+            # 混合打分固定权重：相关性 0.6 / 重要性 0.25 / 新鲜度 0.15；
+            # 相关性仍是主导项，重要事实可跨越时间被召回，但不会压过查询意图。
+            score = 0.6 * similarity + 0.25 * record.get("importance", 0.0) + 0.15 * recency
+            scored.append((score, record))
+        scored.sort(key=lambda item: item[0], reverse=True)
 
-            selected: list[dict[str, Any]] = []
-            used = 0
-            for score, record in scored:
-                # 按字符数粗估 token（中文约 2 字符/token）；装不下的条目跳过而非中断，
-                # 让后面的短记忆仍有机会占满预算。
-                cost = max(len(record.text) // 2, 1)
-                if used + cost > token_budget:
-                    continue
-                record.access_count += 1
-                record.last_access = datetime.now(UTC)
-                selected.append(
-                    {
-                        "id": record.id,
-                        "kind": record.kind,
-                        "text": record.text,
-                        "score": round(score, 4),
-                        "importance": record.importance,
-                    }
-                )
-                used += cost
-                if len(selected) >= k:
-                    break
-            await session.commit()
+        selected: list[dict[str, Any]] = []
+        touched: list[str] = []
+        used = 0
+        for score, record in scored:
+            # 按字符数粗估 token（中文约 2 字符/token）；装不下的条目跳过而非中断，
+            # 让后面的短记忆仍有机会占满预算。
+            cost = max(len(record.get("text", "")) // 2, 1)
+            if used + cost > token_budget:
+                continue
+            touched.append(record["_id"])
+            selected.append(
+                {
+                    "id": str(record["_id"]),
+                    "kind": record.get("kind"),
+                    "text": record.get("text"),
+                    "score": round(score, 4),
+                    "importance": record.get("importance"),
+                }
+            )
+            used += cost
+            if len(selected) >= k:
+                break
+        if touched:
+            # 批量回写访问统计，避免在一次召回里逐条 update。
+            await self._collection().update_many(
+                {"_id": {"$in": touched}},
+                {"$inc": {"access_count": 1}, "$set": {"last_access": datetime.now(UTC)}},
+            )
         return selected
 
     async def summarize_session(self, session_id: str, user_id: str, keep_turns: int = 4) -> str | None:
@@ -226,26 +227,21 @@ class MemoryManager:
         return summary
 
     async def list_records(self, user_id: str) -> list[dict[str, Any]]:
-        async with get_session_factory()() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(MemoryRecord)
-                        .where(MemoryRecord.user_id == user_id)
-                        .order_by(MemoryRecord.created_at.desc())
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            return [
-                {
-                    "id": row.id,
-                    "kind": row.kind,
-                    "text": row.text,
-                    "importance": row.importance,
-                    "created_at": row.created_at.isoformat(),
-                    "access_count": row.access_count,
-                }
-                for row in rows
-            ]
+        await self._ensure_indexes()
+        rows = (
+            await self._collection()
+            .find({"user_id": user_id})
+            .sort("created_at", -1)
+            .to_list(length=None)
+        )
+        return [
+            {
+                "id": str(row["_id"]),
+                "kind": row.get("kind"),
+                "text": row.get("text"),
+                "importance": row.get("importance"),
+                "created_at": row["created_at"].isoformat(),
+                "access_count": row.get("access_count", 0),
+            }
+            for row in rows
+        ]

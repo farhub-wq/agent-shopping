@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
-from shop_common.db import init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.logging import configure_logging, get_logger
+from shop_common.mongo import close_mongo
 
 from .core.llm import build_provider
 from .core.manifest import load_all, load_skill
@@ -42,7 +42,7 @@ sandbox = SandboxManager()
 async def lifespan(_: FastAPI):
     global redis, memory, runtime, mcp_server
     configure_logging("harness")
-    await init_models()
+    # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.redis_url)
     memory = MemoryManager(redis)
     # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
@@ -53,6 +53,7 @@ async def lifespan(_: FastAPI):
     logger.info("已加载 %s 个技能：%s", len(skills), ", ".join(skills))
     yield
     await redis.close()
+    await close_mongo()
 
 
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
@@ -193,10 +194,10 @@ async def approve_run(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
 
 @app.get("/runs/{run_id}/evidence")
 async def get_evidence(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
-    trace = load_trace(run_id)
+    trace = await load_trace(run_id)
     if not trace:
         raise ApiError("NOT_FOUND", "运行记录不存在")
-    # 证据接口只做投影，不重算：直接读 jsonl 里已落盘的事件，
+    # 证据接口只做投影，不重算：直接读 Mongo 里已落盘的事件，
     # 保证返回内容与当时 trace_digest 覆盖的内容一致。
     start = next((item for item in trace if item["type"] == "run.start"), {})
     # 证据包含工具入参与结果，可能带用户数据：只允许运行发起人或运营人员查看，

@@ -110,7 +110,7 @@ class AgentRuntime:
         pending: dict[str, Any] | None = None
         tool_errors = 0
 
-        ledger.append("run.start", skill=skill_name, trust=manifest.trust, user=ctx.user_id, message=user_message)
+        await ledger.append("run.start", skill=skill_name, trust=manifest.trust, user=ctx.user_id, message=user_message)
 
         for step in range(steps_limit):
             usage["steps"] = step + 1
@@ -118,7 +118,7 @@ class AgentRuntime:
             # 出问题时能还原模型在拿到什么信息后做了什么。
             decision = await self.provider.decide(system, messages, specs)
             usage["prompt_chars"] += len(json.dumps(messages, ensure_ascii=False))
-            ledger.append(
+            await ledger.append(
                 "agent.step",
                 step=step + 1,
                 kind=decision.kind,
@@ -130,9 +130,9 @@ class AgentRuntime:
                 break
 
             usage["tool_calls"] += 1
-            ledger.append("tool.call", tool=decision.tool, args=decision.args)
+            await ledger.append("tool.call", tool=decision.tool, args=decision.args)
             result = await self.registry.execute(decision.tool, decision.args, ctx, trust=manifest.trust)
-            ledger.append(
+            await ledger.append(
                 "tool.result",
                 tool=decision.tool,
                 status=result.status,
@@ -143,7 +143,7 @@ class AgentRuntime:
                 # 不可逆动作到此为止：不执行、不继续推理，转存待审批负载等人工处理。
                 status = "pending_approval"
                 pending = {"tool": decision.tool, "args": decision.args, "reason": result.message}
-                ledger.append("approval.requested", tool=decision.tool, args=decision.args)
+                await ledger.append("approval.requested", tool=decision.tool, args=decision.args)
                 break
             if result.status in {"error", "denied"}:
                 # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
@@ -208,8 +208,8 @@ class AgentRuntime:
             metadata={"skill": skill_name, "run_id": ledger.run_id, "status": status},
         )
         await self.memory.summarize_session(ctx.session_id, ctx.user_id)
-        ledger.append("memory.write", user=ctx.user_id, skill=skill_name)
-        ledger.append("run.end", status=status, answer=answer[:200])
+        await ledger.append("memory.write", user=ctx.user_id, skill=skill_name)
+        await ledger.append("run.end", status=status, answer=answer[:200])
 
         evidence = ledger.evidence_card(
             skill=skill_name,
@@ -258,8 +258,8 @@ class AgentRuntime:
         # 执行后立刻删除待审批 key，保证同一审批请求只能重放一次。
         await self.memory.redis.delete(f"shop:harness:pending:{run_id}")
         ledger = TraceLedger(run_id)
-        ledger.append("approval.granted", tool=payload["tool"], approver=ctx.user_id)
-        ledger.append("tool.result", tool=payload["tool"], status=result.status)
+        await ledger.append("approval.granted", tool=payload["tool"], approver=ctx.user_id)
+        await ledger.append("tool.result", tool=payload["tool"], status=result.status)
         return AgentRunResult(
             run_id=run_id,
             skill=payload.get("skill", ""),

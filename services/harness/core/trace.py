@@ -7,24 +7,39 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
-TRACE_ROOT = Path(".harness/traces")
+from shop_common.mongo import get_mongo_db
+
+# 一次 run 对应一个文档，事件按 seq 顺序放在 events 数组里：
+# 整段读取一条查询即可，$push 保证追加顺序，避免每条事件都写一个新文档。
+TRACE_COLLECTION = "agent_traces"
+
+_indexed = False
+
+
+def _collection():
+    return get_mongo_db()[TRACE_COLLECTION]
+
+
+async def _ensure_index() -> None:
+    global _indexed
+    if _indexed:
+        return
+    # run_id 唯一：同一 run 的轨迹只允许存在一个文档，重复写入被唯一索引兜底拒绝。
+    await _collection().create_index("run_id", unique=True)
+    _indexed = True
 
 
 class TraceLedger:
-    def __init__(self, run_id: str | None = None, root: Path = TRACE_ROOT) -> None:
+    def __init__(self, run_id: str | None = None) -> None:
         self.run_id = run_id or uuid.uuid4().hex
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.path = self.root / f"{self.run_id}.jsonl"
         self.events: list[dict[str, Any]] = []
         self._seq = 0
 
-    def append(self, event_type: str, **fields: Any) -> dict[str, Any]:
+    async def append(self, event_type: str, **fields: Any) -> dict[str, Any]:
         self._seq += 1
-        # seq 单调递增 + 追加写 jsonl：事件只增不改，任何删除或重排都会反映到 digest 上。
+        # seq 单调递增 + 仅追加数组元素：事件只增不改，任何删除或重排都会反映到 digest 上。
         event = {
             "seq": self._seq,
             "ts": datetime.now(UTC).isoformat(),
@@ -32,8 +47,17 @@ class TraceLedger:
             **fields,
         }
         self.events.append(event)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        await _ensure_index()
+        # upsert：run 的首个事件顺带建立文档，后续事件沿用同一文档追加。
+        await _collection().update_one(
+            {"run_id": self.run_id},
+            {
+                "$push": {"events": event},
+                "$set": {"updated_at": datetime.now(UTC)},
+                "$setOnInsert": {"run_id": self.run_id},
+            },
+            upsert=True,
+        )
         return event
 
     def digest(self) -> str:
@@ -73,16 +97,18 @@ class TraceLedger:
             "denied_calls": len(denied),
             "usage": usage,
             # digest 覆盖全部事件内容，作为证据卡的校验指纹；
-            # 外部核对时重算 jsonl 即可发现篡改。
+            # 外部核对时重算 events 即可发现篡改。
             "trace_digest": self.digest(),
-            "trace_path": str(self.path),
+            # 字段名沿用 trace_path，值改为 Mongo 集合内的文档定位，调用方不必改读法。
+            "trace_path": f"{TRACE_COLLECTION}/{self.run_id}",
             "generated_at": datetime.now(UTC).isoformat(),
         }
 
 
-def load_trace(run_id: str, root: Path = TRACE_ROOT) -> list[dict[str, Any]]:
-    path = root / f"{run_id}.jsonl"
-    if not path.exists():
+async def load_trace(run_id: str) -> list[dict[str, Any]]:
+    await _ensure_index()
+    # 只取 events 字段；读取保持数组顺序，不做排序或修补，保证 digest 可复算。
+    doc = await _collection().find_one({"run_id": run_id}, {"events": 1})
+    if not doc:
         return []
-    # 空行直接跳过；读取保持写入顺序，不做排序或修补，保证 digest 可复算。
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    return doc.get("events") or []
