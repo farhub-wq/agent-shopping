@@ -28,7 +28,8 @@ class Order(Base):
     # 支付单由 payment 服务创建；订单只持有引用与展示用收银台地址
     payment_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     pay_url: Mapped[str] = mapped_column(Text, default="")
-    payment_status: Mapped[str] = mapped_column(String(16), default="unpaid")
+    # 取值包含 partially_refunded（18 字符），列宽按最长状态留余量，避免 Postgres 截断写入失败
+    payment_status: Mapped[str] = mapped_column(String(32), default="unpaid")
     payment_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 退款进入 REFUNDING 前的状态快照：退款驳回/部分退款完成时据此回退到原状态。
     refund_previous: Mapped[str | None] = mapped_column(String(16), nullable=True)
