@@ -25,9 +25,16 @@ class Order(Base):
     items: Mapped[list] = mapped_column(JSON, default=list)
     address: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 退款进入 REFUNDING 前的状态快照：退款驳回时据此回退到原状态。
+    # 支付单由 payment 服务创建；订单只持有引用与展示用收银台地址
+    payment_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    pay_url: Mapped[str] = mapped_column(Text, default="")
+    payment_status: Mapped[str] = mapped_column(String(16), default="unpaid")
+    payment_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 退款进入 REFUNDING 前的状态快照：退款驳回/部分退款完成时据此回退到原状态。
     refund_previous: Mapped[str | None] = mapped_column(String(16), nullable=True)
     refund_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    # 已处理事件 ID：outbox 去重窗口只有 24h，业务侧再留一层，防止部分发货/部分退款被重复累加
+    processed_event_ids: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -46,6 +53,12 @@ class Order(Base):
             "items": self.items or [],
             "address": self.address or {},
             "cancel_reason": self.cancel_reason,
+            "payment_id": self.payment_id,
+            "pay_url": self.pay_url,
+            "payment_status": self.payment_status,
+            "payment_expires_at": (
+                self.payment_expires_at.isoformat() if self.payment_expires_at else None
+            ),
             "refund_amount_cents": self.refund_amount_cents,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),

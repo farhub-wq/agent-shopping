@@ -3,7 +3,7 @@ import contextlib
 import random
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, Query
@@ -20,6 +20,7 @@ from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from .models import Order, OrderEvent
 from .state_machine import STATE_LABELS, resolve_target
@@ -32,6 +33,7 @@ bus: EventBus | None = None
 idem: IdempotencyStore | None = None
 catalog = ServiceClient(settings.catalog_url)
 inventory = ServiceClient(settings.inventory_url)
+payment_svc = ServiceClient(settings.payment_url)
 
 
 def _r() -> Redis:
@@ -63,6 +65,53 @@ def _apply(
     order.status = target
     order.updated_at = datetime.now(UTC)
     return target
+
+
+def _record(
+    session: AsyncSession,
+    order: Order,
+    event: str,
+    *,
+    actor: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """非状态流转的审计轨迹：部分发货/部分签收不改变订单状态，但仍要留下记录。"""
+    session.add(
+        OrderEvent(
+            order_id=order.id,
+            from_status=order.status,
+            to_status=order.status,
+            event=event,
+            actor=actor,
+            detail=detail or {},
+        )
+    )
+    order.updated_at = datetime.now(UTC)
+
+
+def _item_of(order: Order, item_id: str) -> dict[str, Any] | None:
+    for item in order.items or []:
+        if item.get("item_id") == item_id:
+            return item
+    return None
+
+
+def _seen(order: Order, event_id: str | None) -> bool:
+    """事件级幂等：同一事件重复投递直接跳过，避免部分发货/退款数量被二次累加。"""
+    if not event_id:
+        return False
+    processed = list(order.processed_event_ids or [])
+    if event_id in processed:
+        return True
+    # 只保留最近 200 个事件 ID，长期运行的订单不无限膨胀 JSON
+    order.processed_event_ids = [*processed[-199:], event_id]
+    flag_modified(order, "processed_event_ids")
+    return False
+
+
+def _touch_items(order: Order) -> None:
+    # JSON 列是整体替换语义，原地修改后必须显式标记，否则 SQLAlchemy 不会写回
+    flag_modified(order, "items")
 
 
 async def _load(session: AsyncSession, order_id: str) -> Order:
@@ -121,42 +170,197 @@ async def _commit_inventory(order_id: str) -> None:
         )
 
 
+async def _create_payment(order: Order) -> dict[str, Any] | None:
+    """创建支付单；失败返回 None，由调用方取消订单并补偿库存。"""
+    try:
+        return await payment_svc.request(
+            "POST",
+            "/payments",
+            json={
+                "order_id": order.id,
+                "amount_cents": order.amount_cents,
+                "currency": order.currency,
+                "tenant": order.tenant,
+            },
+            headers=signed_identity_headers("system", "operator", order.tenant),
+        )
+    except ApiError:
+        logger.exception("创建支付单失败 order_id=%s", order.id)
+        return None
+
+
+async def expire_unpaid_orders() -> None:
+    """订单侧兜底关单：覆盖「库存已锁但支付单未建成」和支付事件丢失的窗口。"""
+    while True:
+        # 扫描周期比支付单 TTL 粗，保证正常支付回调总是先于兜底关单到达
+        await asyncio.sleep(60)
+        try:
+            now = datetime.now(UTC)
+            expired_ids: list[str] = []
+            async with get_session_factory()() as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(Order).where(
+                                Order.status.in_({"RESERVED", "PAYING"}),
+                                (
+                                    (Order.payment_expires_at.is_not(None) & (Order.payment_expires_at < now))
+                                    | (
+                                        Order.payment_id.is_(None)
+                                        & (
+                                            Order.created_at
+                                            < now - timedelta(seconds=settings.payment_ttl_seconds)
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for order in rows:
+                    order.payment_status = "expired"
+                    _cancel(order, session, "payment_timeout")
+                    enqueue(
+                        session,
+                        "order",
+                        "order.cancelled",
+                        {"order_id": order.id, "reason": "payment_timeout"},
+                        tenant=order.tenant,
+                    )
+                    expired_ids.append(order.id)
+                if expired_ids:
+                    await session.commit()
+            # 事务提交后再释放库存；释放失败可重试，不会把订单状态回滚
+            for order_id in expired_ids:
+                await _release_inventory(order_id, "payment_timeout")
+            if expired_ids:
+                logger.info("兜底关闭超时未支付订单 %s 笔", len(expired_ids))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("订单超时关单扫描失败")
+
+
 async def handle_event(event: dict[str, Any]) -> None:
-    # 消费入口按事件 type 过滤，未订阅的类型直接忽略；业务分支再校验当前状态，
+    # 消费入口按事件 type 过滤；业务分支再校验当前状态与事件 ID，
     # 使重复投递成为无操作，从而保证消费者幂等。
     topic = event["type"]
     payload = event["payload"]
+    event_id = event.get("id")
+    release_reason: str | None = None
+    commit_inventory = False
+    order_id = str(payload.get("order_id") or "")
     async with get_session_factory()() as session:
-        if topic == "fulfillment.shipped":
-            order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
-            if order and order.status == "PAID":
+        order = await session.scalar(select(Order).where(Order.id == order_id)) if order_id else None
+        if order is None:
+            return
+        if _seen(order, event_id):
+            return
+
+        if topic == "payment.succeeded":
+            # 支付成功是资金事实：RESERVED 直接支付时先补 pay_start，再进入 PAID
+            if order.status in {"RESERVED", "PAYING"}:
+                if order.status == "RESERVED":
+                    _apply(session, order, "pay_start", actor="payment")
+                _apply(session, order, "pay_success", actor="payment")
+                order.paid_at = datetime.now(UTC)
+                order.payment_status = "paid"
+                enqueue(
+                    session,
+                    "order",
+                    "order.paid",
+                    {"order_id": order.id, "amount_cents": order.amount_cents},
+                    tenant=order.tenant,
+                )
+                await session.commit()
+                commit_inventory = True
+        elif topic == "payment.failed":
+            # 支付失败允许顾客换渠道重试，退回 RESERVED，不取消订单、不动库存
+            if order.status == "PAYING":
+                _apply(session, order, "pay_fail", actor="payment")
+                order.payment_status = "failed"
+                await session.commit()
+        elif topic == "payment.expired":
+            # 超时未支付：取消订单并释放库存，支付单状态由 payment 服务维护
+            if order.status in {"RESERVED", "PAYING"}:
+                order.payment_status = "expired"
+                _cancel(order, session, "payment_expired")
+                enqueue(
+                    session,
+                    "order",
+                    "order.cancelled",
+                    {"order_id": order.id, "reason": "payment_expired"},
+                    tenant=order.tenant,
+                )
+                await session.commit()
+                release_reason = "payment_expired"
+        elif topic == "payment.refunded":
+            # 退款金额已由 payment 出款；订单只负责回写 item 可退余量与状态
+            amount = int(payload.get("amount_cents") or 0)
+            item_id = payload.get("order_item_id")
+            if item_id:
+                item = _item_of(order, str(item_id))
+                if item is None:
+                    raise ApiError("CONFLICT", "退款对应的订单行不存在")
+                item["refunded_qty"] = int(item.get("refunded_qty", 0)) + int(payload.get("quantity") or 0)
+                item["refunded_amount_cents"] = int(item.get("refunded_amount_cents", 0)) + amount
+                if payload.get("fully_refunded"):
+                    # 全额退款时以整行金额收口，避免四舍五入造成残留可退额
+                    item["refunded_qty"] = int(item.get("qty", 0))
+                    item["refunded_amount_cents"] = int(item.get("paid_amount_cents", 0))
+            else:
+                for item in order.items or []:
+                    item["refunded_qty"] = int(item.get("qty", 0))
+                    item["refunded_amount_cents"] = int(item.get("paid_amount_cents", 0))
+            _touch_items(order)
+            order.refund_amount_cents = int(order.refund_amount_cents or 0) + amount
+            order.payment_status = "refunded" if payload.get("fully_refunded") else "partially_refunded"
+            if order.status in {"PAID", "SHIPPED", "COMPLETED"}:
+                order.refund_previous = order.status
+                _apply(session, order, "refund_request", actor="payment")
+            if order.status == "REFUNDING":
+                if payload.get("fully_refunded"):
+                    _apply(session, order, "refund_complete", actor="payment")
+                else:
+                    # 部分退款完成后退回退款前状态，订单不因一笔行级退款整体变成 REFUNDED
+                    _apply(session, order, "refund_partial_complete", actor="payment")
+            await session.commit()
+        elif topic == "fulfillment.shipped":
+            items = payload.get("items") or []
+            for row in items:
+                item = _item_of(order, str(row.get("item_id", "")))
+                if item is None:
+                    continue
+                item["shipped_qty"] = int(item.get("shipped_qty", 0)) + int(row.get("qty") or 0)
+                # 防御性收口：发货总量不允许超过下单数量
+                item["shipped_qty"] = min(item["shipped_qty"], int(item.get("qty", 0)))
+            _touch_items(order)
+            if payload.get("all_shipped") and order.status == "PAID":
                 _apply(session, order, "ship", actor="fulfillment")
                 order.shipped_at = datetime.now(UTC)
-                await session.commit()
+            else:
+                _record(session, order, "partial_ship", actor="fulfillment", detail={"items": items})
+            await session.commit()
         elif topic == "fulfillment.delivered":
-            order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
-            if order and order.status == "SHIPPED":
+            if payload.get("all_delivered") and order.status == "SHIPPED":
                 _apply(session, order, "deliver", actor="fulfillment")
                 order.completed_at = datetime.now(UTC)
-                await session.commit()
-        elif topic == "after-sales.approved":
-            order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
-            if order and order.status in {"PAID", "SHIPPED", "COMPLETED"}:
-                # 退款可从多个状态进入 REFUNDING，先记下来源状态，驳回时才能回到原状态。
-                order.refund_previous = order.status
-                _apply(session, order, "refund_request", actor="aftersales")
-                order.refund_amount_cents = int(payload.get("amount_cents", order.amount_cents))
-                await session.commit()
+            else:
+                _record(session, order, "partial_delivery", actor="fulfillment")
+            await session.commit()
         elif topic == "after-sales.rejected":
-            order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
-            if order and order.status == "REFUNDING":
+            # 退款未出款即被驳回：把 REFUNDING 回退到退款前状态
+            if order.status == "REFUNDING":
                 _apply(session, order, "refund_reject", actor="aftersales")
                 await session.commit()
-        elif topic == "after-sales.refunded":
-            order = await session.scalar(select(Order).where(Order.id == payload["order_id"]))
-            if order and order.status == "REFUNDING":
-                _apply(session, order, "refund_complete", actor="aftersales")
-                await session.commit()
+
+    # 跨服务副作用放到事务提交之后，避免下游失败回滚已落库的状态
+    if commit_inventory:
+        await _commit_inventory(order_id)
+    if release_reason:
+        await _release_inventory(order_id, release_reason)
 
 
 async def _startup() -> list[asyncio.Task]:
@@ -171,6 +375,8 @@ async def _startup() -> list[asyncio.Task]:
         asyncio.create_task(relay.run_forever()),
         asyncio.create_task(bus.run_consumer("fulfillment", "order-svc", "order-1", handle_event)),
         asyncio.create_task(bus.run_consumer("aftersales", "order-svc", "order-2", handle_event)),
+        asyncio.create_task(bus.run_consumer("payment", "order-svc", "order-3", handle_event)),
+        asyncio.create_task(expire_unpaid_orders()),
     ]
     return tasks
 
@@ -213,11 +419,6 @@ class CreateOrderRequest(BaseModel):
     address: Address
 
 
-class PayRequest(BaseModel):
-    simulate_failure: bool = False
-    method: str = "mock"
-
-
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "order"}
@@ -249,11 +450,17 @@ async def create_order(
         product = await catalog.request("GET", f"/products/{item.sku}")
         items.append(
             {
+                # item_id 是后续部分发货与部分退款的稳定业务键，不能依赖 SKU（同款可能多行）
+                "item_id": uuid.uuid4().hex,
                 "sku": product["sku"],
                 "product_id": product["id"],
                 "title": product["title"],
                 "qty": item.qty,
                 "price_cents": product["price_cents"],
+                "paid_amount_cents": product["price_cents"] * item.qty,
+                "shipped_qty": 0,
+                "refunded_qty": 0,
+                "refunded_amount_cents": 0,
             }
         )
         amount += product["price_cents"] * item.qty
@@ -299,6 +506,41 @@ async def create_order(
         with contextlib.suppress(Exception):
             await idem.finish(scope, idempotency_key, result)
         raise ApiError("CONFLICT", "库存不足，订单已取消", details={"order": result, "reason": reason})
+
+    # 库存锁定后再创建支付单；支付不可用则取消订单并释放库存，避免长期占用库存。
+    payment_data = await _create_payment(order)
+    if payment_data is None:
+        async with get_session_factory()() as session:
+            order = await session.get(Order, order.id)
+            assert order is not None
+            order.payment_status = "failed"
+            _cancel(order, session, "payment_unavailable")
+            enqueue(
+                session,
+                "order",
+                "order.cancelled",
+                {"order_id": order.id, "reason": "payment_unavailable"},
+                tenant=principal.tenant,
+            )
+            await session.commit()
+            result = order.to_dict()
+        await _release_inventory(order.id, "payment_unavailable")
+        with contextlib.suppress(Exception):
+            await idem.finish(scope, idempotency_key, result)
+        raise ApiError("CONFLICT", "支付服务不可用，订单已取消", details={"order": result})
+
+    async with get_session_factory()() as session:
+        order = await session.get(Order, order.id)
+        assert order is not None
+        order.payment_id = payment_data["id"]
+        order.pay_url = payment_data["pay_url"]
+        order.payment_status = "pending"
+        order.payment_expires_at = datetime.fromisoformat(payment_data["expires_at"])
+        # 订单进入 PAYING 表示已下支付单；真正 PAID 由 payment.succeeded 事件驱动
+        _apply(session, order, "pay_start", actor="system")
+        enqueue(session, "order", "order.paying", {"order_id": order.id}, tenant=principal.tenant)
+        await session.commit()
+        result = order.to_dict()
 
     await idem.finish(scope, idempotency_key, result)
     return result
@@ -375,39 +617,6 @@ async def order_timeline(order_id: str, principal: PrincipalDep) -> dict[str, An
         }
 
 
-@app.post("/orders/{order_id}/pay")
-async def pay_order(order_id: str, payload: PayRequest, principal: PrincipalDep) -> dict[str, Any]:
-    """模拟支付网关。真实系统在此处接第三方支付并处理异步回调与对账。"""
-    assert bus is not None
-    async with get_session_factory()() as session:
-        order = await _load(session, order_id)
-        if not principal.is_staff() and order.user_id != principal.user_id:
-            raise ApiError("FORBIDDEN", "无权支付该订单")
-        if order.status == "PAID":
-            # 已支付直接返回，重复支付请求不会再次触发状态流转。
-            return {**order.to_dict(), "idempotent": True}
-        _apply(session, order, "pay_start", actor=principal.user_id, detail={"method": payload.method})
-        await session.commit()
-        # 先提交 PAYING 再重新加载，确保后续 pay_success/pay_fail 基于最新状态做合法流转。
-        await session.refresh(order)
-
-        if payload.simulate_failure:
-            _apply(session, order, "pay_fail", actor=principal.user_id, detail={"reason": "mock_decline"})
-            await session.commit()
-            raise ApiError("CONFLICT", "支付失败，请更换支付方式", details={"order": order.to_dict()})
-
-        _apply(session, order, "pay_success", actor=principal.user_id, detail={"method": payload.method})
-        order.paid_at = datetime.now(UTC)
-        # 支付成功事件与状态同事务入 outbox，下游（履约/通知）由 relay 异步投递。
-        enqueue(session, "order", "order.paid", {"order_id": order.id, "amount_cents": order.amount_cents})
-        await session.commit()
-        result = order.to_dict()
-
-    # 本地事务已提交后再提交库存；下游失败不回滚已支付的订单。
-    await _commit_inventory(order_id)
-    return result
-
-
 @app.post("/orders/{order_id}/cancel")
 async def cancel_order(order_id: str, principal: PrincipalDep, reason: str = "user_cancelled") -> dict[str, Any]:
     async with get_session_factory()() as session:
@@ -425,11 +634,14 @@ async def cancel_order(order_id: str, principal: PrincipalDep, reason: str = "us
 
 @app.post("/orders/{order_id}/ship")
 async def mark_shipped(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
-    # 发货/完成属于后台操作，必须 staff；状态合法性由 _apply 内的状态机保证。
+    # 人工整单发货：把订单行标记为全部发出，用于履约系统异常时的人工兜底
     principal.require_staff()
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
         _apply(session, order, "ship", actor=principal.user_id)
+        for item in order.items or []:
+            item["shipped_qty"] = int(item.get("qty", 0))
+        _touch_items(order)
         order.shipped_at = datetime.now(UTC)
         await session.commit()
         return order.to_dict()
@@ -446,33 +658,3 @@ async def mark_completed(order_id: str, principal: PrincipalDep) -> dict[str, An
         await session.commit()
         return order.to_dict()
 
-
-@app.post("/orders/{order_id}/refund")
-async def request_refund(order_id: str, principal: PrincipalDep, amount_cents: int | None = None) -> dict[str, Any]:
-    """售后审批通过后调用：进入退款处理中。"""
-    assert bus is not None
-    async with get_session_factory()() as session:
-        order = await _load(session, order_id)
-        # 重复进入退款中直接幂等返回，避免重复发布退款事件。
-        if order.status == "REFUNDING":
-            return order.to_dict()
-        # 记录退款前状态，供售后驳回时回退；部分退款也按整单状态流转处理。
-        order.refund_previous = order.status
-        _apply(session, order, "refund_request", actor=principal.user_id)
-        order.refund_amount_cents = amount_cents or order.amount_cents
-        await session.commit()
-        result = order.to_dict()
-    # 退款申请属于跨服务通知，走事件总线而非直接调用支付服务。
-    await bus.publish("order", "order.refunding", {"order_id": order_id})
-    return result
-
-
-@app.post("/orders/{order_id}/refund-complete")
-async def complete_refund(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
-    # 退款完成涉及资金，仅 staff 可触发；状态机只允许 REFUNDING → REFUNDED。
-    principal.require_staff()
-    async with get_session_factory()() as session:
-        order = await _load(session, order_id)
-        _apply(session, order, "refund_complete", actor=principal.user_id)
-        await session.commit()
-        return order.to_dict()

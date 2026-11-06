@@ -36,10 +36,10 @@ STATE_LABELS = {
 
 def resolve_target(current: str, event: str, *, refund_previous: str | None = None) -> str:
     # REFUNDING 是所有退款来源的汇聚态，TRANSITIONS 里无法表达「退回到原状态」，
-    # 因此驳回单独处理：必须带上退款前快照，否则拒绝流转。
-    if event == "refund_reject" and current == "REFUNDING":
+    # 因此驳回与部分退款完成单独处理：必须带上退款前快照，否则拒绝流转。
+    if event in {"refund_reject", "refund_partial_complete"} and current == "REFUNDING":
         if refund_previous not in TRANSITIONS:
-            raise ApiError("CONFLICT", "退款驳回缺少来源状态")
+            raise ApiError("CONFLICT", "退款回退缺少来源状态")
         return refund_previous
     allowed = TRANSITIONS.get(current, {})
     target = allowed.get(event)
