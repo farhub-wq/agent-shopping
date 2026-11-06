@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from shop_common.db import Base
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -33,6 +33,8 @@ class Order(Base):
     # 退款进入 REFUNDING 前的状态快照：退款驳回/部分退款完成时据此回退到原状态。
     refund_previous: Mapped[str | None] = mapped_column(String(16), nullable=True)
     refund_amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    # 库存是否已提交（预占转已售）：支付成功后由补偿扫单兜底重试，失败不再静默
+    inventory_committed: Mapped[bool] = mapped_column(Boolean, default=False)
     # 已处理事件 ID：outbox 去重窗口只有 24h，业务侧再留一层，防止部分发货/部分退款被重复累加
     processed_event_ids: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -60,6 +62,7 @@ class Order(Base):
                 self.payment_expires_at.isoformat() if self.payment_expires_at else None
             ),
             "refund_amount_cents": self.refund_amount_cents,
+            "inventory_committed": self.inventory_committed,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "paid_at": self.paid_at.isoformat() if self.paid_at else None,

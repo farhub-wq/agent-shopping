@@ -158,9 +158,9 @@ async def _release_inventory(order_id: str, reason: str) -> None:
         )
 
 
-async def _commit_inventory(order_id: str) -> None:
-    # 订单已支付后提交库存，失败同样只记录不阻断，提交接口本身支持幂等重试。
-    with contextlib.suppress(ApiError):
+async def _commit_inventory(order_id: str) -> bool:
+    """支付成功后把预占转为已售；失败返回 False，由补偿扫单持续重试（接口幂等）。"""
+    try:
         await inventory.request(
             "POST",
             "/inventory/commit",
@@ -168,6 +168,56 @@ async def _commit_inventory(order_id: str) -> None:
             # 与预占/释放一致：库存服务开启身份头信任后，未签名调用会被 401 拒绝
             headers=signed_identity_headers("system", "operator"),
         )
+        return True
+    except ApiError as exc:
+        # 不再静默吞掉：留下 ERROR 日志供告警，订单侧 inventory_committed 保持 False
+        logger.error("库存提交失败 order_id=%s code=%s message=%s", order_id, exc.code, exc.message)
+        return False
+
+
+async def _refund_late_payment(order_id: str, amount_cents: int) -> None:
+    """迟到支付自动全额原路退款；ticket_id 固定，payment 侧按 ticket 幂等，可安全重试。"""
+    try:
+        await payment_svc.request(
+            "POST",
+            "/payments/refunds",
+            json={
+                "order_id": order_id,
+                "ticket_id": f"latepay-{order_id}",
+                "amount_cents": amount_cents,
+            },
+            headers=signed_identity_headers("system", "operator"),
+        )
+    except ApiError as exc:
+        # 失败不向上抛：补偿扫单按「CANCELLED + payment_status=paid」持续重试
+        logger.error("迟到支付自动退款失败 order_id=%s code=%s", order_id, exc.code)
+
+
+def _restock_targets(items: list | None) -> list[dict[str, Any]]:
+    """未发货数量的回补目标（绝对值）；已发货部分需退货收货确认流程，不在此回补。"""
+    targets: list[dict[str, Any]] = []
+    for row in items or []:
+        target = min(
+            int(row.get("refunded_qty", 0)),
+            int(row.get("qty", 0)) - int(row.get("shipped_qty", 0)),
+        )
+        if target > 0:
+            targets.append({"sku": row["sku"], "qty": target})
+    return targets
+
+
+async def _restock_inventory(order_id: str, items: list[dict[str, Any]]) -> None:
+    """按目标值回补库存；inventory 按 (order_id, sku) 记录已回补量，重放幂等。"""
+    try:
+        await inventory.request(
+            "POST",
+            "/inventory/restock",
+            json={"order_id": order_id, "items": items},
+            headers=signed_identity_headers("system", "operator"),
+        )
+    except ApiError as exc:
+        # 失败由补偿扫单重放目标值，不阻断退款主流程
+        logger.error("库存回补失败 order_id=%s code=%s", order_id, exc.code)
 
 
 async def _create_payment(order: Order) -> dict[str, Any] | None:
@@ -243,6 +293,80 @@ async def expire_unpaid_orders() -> None:
             logger.exception("订单超时关单扫描失败")
 
 
+# 补偿扫单覆盖的三类失步窗口，所有补偿操作都幂等，可无限重放
+_LATE_REFUND_REASONS = {"payment_timeout", "payment_expired"}
+# 库存提交/回补只在「钱已收」的状态上做；CANCELLED 订单走预占释放，不在补偿范围内
+_COMMITTED_STATUSES = {"PAID", "SHIPPED", "COMPLETED", "REFUNDING", "REFUNDED"}
+
+
+async def _compensation_sweeper() -> None:
+    """周期性补偿：迟到支付退款重试、库存提交重试、库存回补重放。"""
+    while True:
+        # 与超时关单同周期；补偿操作全部幂等，重复执行无副作用
+        await asyncio.sleep(60)
+        try:
+            async with get_session_factory()() as session:
+                late = (
+                    (
+                        await session.execute(
+                            select(Order).where(
+                                Order.status == "CANCELLED",
+                                Order.payment_status == "paid",
+                                Order.cancel_reason.in_(_LATE_REFUND_REASONS),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                pending_commit = (
+                    (
+                        await session.execute(
+                            select(Order).where(
+                                Order.status.in_(_COMMITTED_STATUSES),
+                                Order.inventory_committed.is_(False),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                pending_restock = (
+                    (
+                        await session.execute(
+                            select(Order).where(
+                                Order.status.in_(_COMMITTED_STATUSES),
+                                Order.inventory_committed.is_(True),
+                                Order.refund_amount_cents > 0,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                late_refs = [(row.id, row.amount_cents) for row in late]
+                commit_ids = [row.id for row in pending_commit]
+                restock_refs = [(row.id, _restock_targets(row.items)) for row in pending_restock]
+            # 外部调用全部放在会话外，避免长事务占连接
+            for order_id, amount in late_refs:
+                await _refund_late_payment(order_id, amount)
+            for order_id in commit_ids:
+                # 永久失败（预占已被 TTL 释放）会持续返回 False 并打 ERROR 日志，按决策告警后人工处理
+                if await _commit_inventory(order_id):
+                    async with get_session_factory()() as session:
+                        row = await session.get(Order, order_id)
+                        if row is not None:
+                            row.inventory_committed = True
+                            await session.commit()
+            for order_id, targets in restock_refs:
+                if targets:
+                    await _restock_inventory(order_id, targets)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("订单补偿扫单失败")
+
+
 async def handle_event(event: dict[str, Any]) -> None:
     # 消费入口按事件 type 过滤；业务分支再校验当前状态与事件 ID，
     # 使重复投递成为无操作，从而保证消费者幂等。
@@ -251,6 +375,8 @@ async def handle_event(event: dict[str, Any]) -> None:
     event_id = event.get("id")
     release_reason: str | None = None
     commit_inventory = False
+    late_refund_amount: int | None = None
+    restock_items: list[dict[str, Any]] = []
     order_id = str(payload.get("order_id") or "")
     async with get_session_factory()() as session:
         order = await session.scalar(select(Order).where(Order.id == order_id)) if order_id else None
@@ -276,6 +402,16 @@ async def handle_event(event: dict[str, Any]) -> None:
                 )
                 await session.commit()
                 commit_inventory = True
+            elif (
+                order.status == "CANCELLED"
+                and order.cancel_reason in {"payment_timeout", "payment_expired"}
+                and order.payment_status not in {"paid", "refunded"}
+            ):
+                # 迟到支付：订单已超时关单但用户实际付款成功，落资金事实并自动全额退款
+                order.payment_status = "paid"
+                _record(session, order, "late_payment", actor="payment")
+                await session.commit()
+                late_refund_amount = order.amount_cents
         elif topic == "payment.failed":
             # 支付失败允许顾客换渠道重试，退回 RESERVED，不取消订单、不动库存
             if order.status == "PAYING":
@@ -326,6 +462,15 @@ async def handle_event(event: dict[str, Any]) -> None:
                 else:
                     # 部分退款完成后退回退款前状态，订单不因一笔行级退款整体变成 REFUNDED
                     _apply(session, order, "refund_partial_complete", actor="payment")
+            # 退款出款成功后回补未发货数量的库存；CANCELLED 订单的库存已由预占释放回补，跳过防双重回补
+            if order.inventory_committed and order.status in {
+                "PAID",
+                "SHIPPED",
+                "COMPLETED",
+                "REFUNDING",
+                "REFUNDED",
+            }:
+                restock_items = _restock_targets(order.items)
             await session.commit()
         elif topic == "fulfillment.shipped":
             items = payload.get("items") or []
@@ -357,10 +502,19 @@ async def handle_event(event: dict[str, Any]) -> None:
                 await session.commit()
 
     # 跨服务副作用放到事务提交之后，避免下游失败回滚已落库的状态
-    if commit_inventory:
-        await _commit_inventory(order_id)
+    if commit_inventory and await _commit_inventory(order_id):
+        async with get_session_factory()() as session:
+            # 提交成功立刻固化标志，补偿扫单据此跳过该订单
+            row = await session.get(Order, order_id)
+            if row is not None:
+                row.inventory_committed = True
+                await session.commit()
     if release_reason:
         await _release_inventory(order_id, release_reason)
+    if late_refund_amount is not None:
+        await _refund_late_payment(order_id, late_refund_amount)
+    if restock_items:
+        await _restock_inventory(order_id, restock_items)
 
 
 async def _startup() -> list[asyncio.Task]:
@@ -377,6 +531,7 @@ async def _startup() -> list[asyncio.Task]:
         asyncio.create_task(bus.run_consumer("aftersales", "order-svc", "order-2", handle_event)),
         asyncio.create_task(bus.run_consumer("payment", "order-svc", "order-3", handle_event)),
         asyncio.create_task(expire_unpaid_orders()),
+        asyncio.create_task(_compensation_sweeper()),
     ]
     return tasks
 
