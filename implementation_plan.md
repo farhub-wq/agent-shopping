@@ -6,11 +6,11 @@
 
 **架构：** 新增独立 `identity` 服务（`identity_db`），负责注册、登录、refresh 轮换与角色授予；网关改为调用 identity 并转发 Cookie，服务侧鉴权改为“JWT 优先 + 内网签名头兜底”。业务服务与订单状态机不改。
 
-**技术栈：** FastAPI · SQLAlchemy 2.0 async · PostgreSQL / SQLite（本地）· Redis · PyJWT · Argon2id（`argon2-cffi`）· React + TypeScript。
+**技术栈：** FastAPI · SQLAlchemy 2.0 async · MySQL 8（生产）/ SQLite（本地测试）· Redis · PyJWT · Argon2id（`argon2-cffi`）· React + TypeScript。
 
 **规格：** [system-design.md](docs/design/system-design.md) 第 4.1、5.1、8 节；需求 [requirements-shop-agent.md](docs/requirements/requirements-shop-agent.md) FR-01/02、NFR-05。
 
-> **生产基线说明**：本计划只覆盖 M1。M1 的验证仍在本地单机 Compose 完成；双主机 + LB + 托管 PostgreSQL/Redis、沙箱独立 runner、事件 DLQ、审计服务与灾备属于 M3，不在 M1 改造范围。设计基线（SLO、总账、部分履约）见设计文档第 1、11、12 节。
+> **生产基线说明**：本计划只覆盖 M1。M1 的验证仍在本地单机 Compose 完成；双主机 + LB + 托管 MySQL/Redis、沙箱独立 runner、事件 DLQ、审计服务与灾备属于 M3，不在 M1 改造范围。设计基线（SLO、总账、部分履约）见设计文档第 1、11、12 节。
 
 ## 全局约束
 

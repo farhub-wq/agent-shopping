@@ -78,13 +78,13 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 |---|---|
 | 规模 | 下单峰值 30 TPS、浏览 300 QPS、SKU 5 万、日订单 3 万 |
 | SLO | 单区域可用性 99.5%，下单 P95 <800ms |
-| 部署 | 双应用主机 + Compose + LB，托管 PostgreSQL/Redis，不引入 K8s |
-| 租户 / 仓 | 单租户（全表预留并强制过滤 `tenant_id`）；单仓（预留 `warehouse_id`） |
+| 部署 | 双应用主机 + Compose + LB，托管 MySQL/Redis（均须主从/HA），不引入 K8s |
+| 租户 / 仓 | 单租户（全表预留并强制过滤 `tenant_id`）；单仓（多仓时演进复合主键） |
 | 资金 | 聚合支付托管收银台（微信/支付宝），退款原路退回，拒付人工处理 |
 | 库存 | DB 为真相，Redis 为原子闸门；允许极短少卖，绝不超卖；故障 fail closed |
 | 订单 | 部分发货、部分退款、退货退款；换货/拒收放 Should |
-| 事件 | Outbox 同事务 + Redis Streams 消费组 + DLQ + 重放 + relay 锁 |
-| 安全 | PCI SAQ A、管理员 MFA、PII 字段加密、RBAC、审计 180 天 |
+| 事件 | Outbox 同事务 + Redis Streams 消费组 + DLQ 落库 + 重放 + relay 锁；消费幂等靠业务键 + DB 唯一索引 |
+| 安全 | PCI SAQ A、管理员 MFA（M3）、PII V1 明文 + 日志脱敏（字段级加密 Should）、RBAC、审计 180 天 |
 | 数据 | 订单/资金 5 年、日志 30 天、回调摘要 90 天、备份 30 天 |
 | 灾备 | RPO ≤15 分钟、RTO ≤4 小时，季度恢复演练并对账 |
 | Agent | 面向顾客只读 + 提议；不可逆动作人工审批；主备模型 + 熔断降级；PII 脱敏 |
@@ -95,7 +95,7 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | 阶段 | 内容 |
 |---|---|
 | M1 账号与权限 | identity 服务、注册/登录/refresh、网关改造、前端登录（见 [implementation_plan.md](implementation_plan.md)） |
-| M2 资金与订单 | payment 服务、复式总账、回调幂等、部分发货/退款、对账、超时关单（见 [implementation_plan_m2.md](implementation_plan_m2.md)） |
+| M2 资金与订单 | payment 服务、复式总账与分录模板、回调幂等与迟到支付退款、部分发货/退款、对账、超时关单与竞态协议、库存对账、入库/盘点（见 [implementation_plan_m2.md](implementation_plan_m2.md)） |
 | M3 生产加固 | 事件 DLQ/重放、audit、可观测与告警、沙箱 runner、双主机/托管 DB、Alembic、灾备 |
 | M4 上线准入 | 五场景压测与混沌、灰度、1 元真实支付验证、三方签字、范围冻结 |
 
