@@ -87,6 +87,24 @@ class Refund(Base):
         }
 
 
+class Chargeback(Base):
+    __tablename__ = "chargebacks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), default="default", index=True)
+    payment_id: Mapped[str] = mapped_column(String(36), index=True)
+    # 渠道争议单号唯一：重复拒付通知靠它识别，是拒付幂等的唯一键
+    provider_case_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY")
+    # opened → won（申诉成功，渠道退回资金）/ lost（败诉，损失确认）
+    status: Mapped[str] = mapped_column(String(16), default="opened", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    opened_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+
 class Settlement(Base):
     __tablename__ = "settlements"
     __table_args__ = (UniqueConstraint("provider", "biz_date", name="uq_settlement_provider_date"),)

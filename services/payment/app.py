@@ -17,12 +17,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import PAYMENT_CALLBACK_TOTAL, RECONCILIATION_DIFF, install_metrics
 from shop_common.outbox import OutboxRelay, enqueue
 from shop_common.tasks import run_task_loop
 from sqlalchemy import func, select
@@ -30,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 
 from . import models  # noqa: F401  # 注册到 Base.metadata，init_models 才能建表
 from .ledger import post_transaction
-from .models import LedgerEntry, Payment, ReconciliationDiff, Refund, Settlement
+from .models import Chargeback, LedgerEntry, Payment, ReconciliationDiff, Refund, Settlement
 from .provider import callback_signature, get_provider
 
 settings = get_settings()
@@ -111,6 +113,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="payment-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "payment")
+install_metrics(app, "payment")
 
 
 @app.get("/healthz")
@@ -174,6 +177,59 @@ async def create_payment(payload: CreatePaymentReq, principal: PrincipalDep) -> 
         return payment.to_dict()
 
 
+@app.get("/payments/chargebacks")
+async def list_chargebacks(
+    principal: PrincipalDep, status: str | None = None, page: int = 1, size: int = 20
+) -> dict[str, Any]:
+    """运营查询拒付列表：状态过滤 + 分页，附 order_id 便于关联订单。
+
+    必须注册在 /payments/{order_id} 之前，否则 chargebacks 会被当作订单号吞掉。
+    """
+    principal.require_staff()
+    page = max(1, page)
+    size = max(1, min(size, 100))
+    async with get_session_factory()() as session:
+        query = select(Chargeback)
+        count_query = select(func.count(Chargeback.id))
+        if status:
+            query = query.where(Chargeback.status == status)
+            count_query = count_query.where(Chargeback.status == status)
+        total = int((await session.scalar(count_query)) or 0)
+        rows = (
+            (
+                await session.execute(
+                    query.order_by(Chargeback.opened_at.desc()).offset((page - 1) * size).limit(size)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # 批量取支付单映射 order_id，避免循环内逐条查库
+        payment_ids = [row.payment_id for row in rows]
+        payments: dict[str, Payment] = {}
+        if payment_ids:
+            matched = (
+                (await session.execute(select(Payment).where(Payment.id.in_(payment_ids)))).scalars().all()
+            )
+            payments = {p.id: p for p in matched}
+        items = [
+            {
+                "id": row.id,
+                "payment_id": row.payment_id,
+                "order_id": payments[row.payment_id].order_id if row.payment_id in payments else "",
+                "provider_case_id": row.provider_case_id,
+                "amount_cents": row.amount_cents,
+                "currency": row.currency,
+                "status": row.status,
+                "reason": row.reason,
+                "opened_at": row.opened_at.isoformat(),
+                "closed_at": row.closed_at.isoformat() if row.closed_at else None,
+            }
+            for row in rows
+        ]
+    return {"items": items, "page": page, "size": size, "total": total}
+
+
 @app.get("/payments/{order_id}")
 async def get_payment(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
     principal.require_staff()
@@ -217,10 +273,15 @@ async def payment_callback(provider_name: str, request: Request) -> dict[str, An
         raise ApiError("NOT_FOUND", "未知支付渠道")
     raw_body = await request.body()
     headers = {key.lower(): value for key, value in request.headers.items()}
-    event = provider.verify_callback(
-        raw_body=raw_body, headers=headers, secret=settings.payment_webhook_secret
-    )
-    return await _apply_callback(event)
+    try:
+        event = provider.verify_callback(
+            raw_body=raw_body, headers=headers, secret=settings.payment_webhook_secret
+        )
+    except ApiError:
+        # 验签失败/报文非法是伪造回调的前置信号，计数后告警。
+        PAYMENT_CALLBACK_TOTAL.labels("verification_failed").inc()
+        raise
+    return await _apply_callback(event, request=request)
 
 
 def _event_int(event: dict[str, Any], key: str) -> int:
@@ -230,7 +291,7 @@ def _event_int(event: dict[str, Any], key: str) -> int:
         raise ApiError("BAD_REQUEST", f"回调缺少合法字段 {key}") from exc
 
 
-async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
+async def _apply_callback(event: dict[str, Any], *, request: Request | None = None) -> dict[str, Any]:
     """把渠道回调落到支付状态 + 总账 + outbox，重复调用只返回既有结果。"""
     txn_id = str(event.get("provider_txn_id") or "")
     order_id = str(event.get("order_id") or "")
@@ -247,14 +308,18 @@ async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
         if payment is None and order_id:
             payment = await session.scalar(select(Payment).where(Payment.order_id == order_id))
         if payment is None:
+            PAYMENT_CALLBACK_TOTAL.labels("not_found").inc()
             raise ApiError("NOT_FOUND", "支付单不存在")
         # 金额与币种必须与建单一致，伪造金额的回调不落账
         if payment.amount_cents != amount or payment.currency != currency:
+            PAYMENT_CALLBACK_TOTAL.labels("conflict").inc()
             raise ApiError("CONFLICT", "回调金额或币种与支付单不一致")
         if payment.provider_txn_id and payment.provider_txn_id != txn_id:
+            PAYMENT_CALLBACK_TOTAL.labels("conflict").inc()
             raise ApiError("CONFLICT", "支付单已被其他渠道流水号占用")
 
         if status == "failed":
+            PAYMENT_CALLBACK_TOTAL.labels("failed").inc()
             if payment.status == "pending":
                 payment.status = "failed"
                 enqueue(
@@ -264,11 +329,24 @@ async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
                     {"payment_id": payment.id, "order_id": payment.order_id},
                     tenant=payment.tenant_id,
                 )
+                enqueue_audit(
+                    session,
+                    actor_id="channel",
+                    actor_role="system",
+                    action="payment.callback",
+                    target_type="payment",
+                    target_id=payment.id,
+                    before={"status": "pending"},
+                    after={"status": "failed"},
+                    request=request,
+                    tenant=payment.tenant_id,
+                )
                 await session.commit()
             return {"status": payment.status, "idempotent": payment.status != "pending"}
 
         if payment.status == "paid":
             # 重复回调：不再写第二笔分录、不再发第二个事件
+            PAYMENT_CALLBACK_TOTAL.labels("paid").inc()
             return {"status": "paid", "idempotent": True}
         if payment.status in {"refunded"}:
             return {"status": payment.status, "idempotent": True}
@@ -276,6 +354,7 @@ async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
         payment.provider_txn_id = txn_id
         payment.status = "paid"
         payment.paid_at = datetime.now(UTC)
+        PAYMENT_CALLBACK_TOTAL.labels("paid").inc()
         # 渠道已收款：借记应收、贷记收入；结算时再从应收转入现金并记手续费
         post_transaction(
             session,
@@ -299,6 +378,18 @@ async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
                 "amount_cents": payment.amount_cents,
                 "provider_txn_id": txn_id,
             },
+            tenant=payment.tenant_id,
+        )
+        enqueue_audit(
+            session,
+            actor_id="channel",
+            actor_role="system",
+            action="payment.callback",
+            target_type="payment",
+            target_id=payment.id,
+            before={"status": "pending"},
+            after={"status": "paid", "amount_cents": payment.amount_cents},
+            request=request,
             tenant=payment.tenant_id,
         )
         try:
@@ -385,7 +476,7 @@ class RefundReq(BaseModel):
 
 
 @app.post("/payments/refunds", status_code=201)
-async def create_refund(payload: RefundReq, principal: PrincipalDep) -> dict[str, Any]:
+async def create_refund(payload: RefundReq, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     """售后审批通过后的出款入口；按 ticket_id 幂等，累计退款不得超过支付金额。"""
     principal.require_staff()
     async with get_session_factory()() as session:
@@ -458,6 +549,18 @@ async def create_refund(payload: RefundReq, principal: PrincipalDep) -> dict[str
             },
             tenant=payment.tenant_id,
         )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="payment.refund",
+            target_type="refund",
+            target_id=refund.id,
+            before={"refunded_cents": int(refunded)},
+            after={"amount_cents": refund.amount_cents, "fully_refunded": fully},
+            request=request,
+            tenant=payment.tenant_id,
+        )
         try:
             await session.commit()
         except IntegrityError:
@@ -468,6 +571,171 @@ async def create_refund(payload: RefundReq, principal: PrincipalDep) -> dict[str
                 raise
             return {**existing.to_dict(), "idempotent": True}
         return refund.to_dict()
+
+
+@app.post("/payments/chargebacks/callback/{provider_name}")
+async def chargeback_callback(provider_name: str, request: Request) -> dict[str, Any]:
+    """渠道拒付回调入口：验签与支付回调一致，字段按拒付语义解析。"""
+    if provider_name != settings.payment_provider:
+        raise ApiError("NOT_FOUND", "未知支付渠道")
+    raw_body = await request.body()
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    event = provider.verify_callback(
+        raw_body=raw_body, headers=headers, secret=settings.payment_webhook_secret
+    )
+    return await _apply_chargeback(event, request=request)
+
+
+async def _apply_chargeback(event: dict[str, Any], *, request: Request | None = None) -> dict[str, Any]:
+    """落拒付单 + 总账冲正 + 事件 + 审计；provider_case_id 唯一索引保证重复通知幂等。"""
+    case_id = str(event.get("provider_case_id") or "")
+    txn_id = str(event.get("provider_txn_id") or "")
+    payment_id = str(event.get("payment_id") or "")
+    amount = _event_int(event, "amount_cents")
+    reason = str(event.get("reason") or "")
+    if not case_id:
+        raise ApiError("BAD_REQUEST", "回调缺少渠道争议单号")
+    if not txn_id and not payment_id:
+        raise ApiError("BAD_REQUEST", "回调缺少定位支付单的字段")
+    if amount <= 0:
+        raise ApiError("BAD_REQUEST", "拒付金额必须大于 0")
+
+    async with get_session_factory()() as session:
+        existing = await session.scalar(select(Chargeback).where(Chargeback.provider_case_id == case_id))
+        if existing is not None:
+            return {"status": existing.status, "idempotent": True}
+
+        payment = (
+            await session.scalar(select(Payment).where(Payment.provider_txn_id == txn_id)) if txn_id else None
+        )
+        if payment is None and payment_id:
+            payment = await session.get(Payment, payment_id)
+        if payment is None:
+            raise ApiError("NOT_FOUND", "支付单不存在")
+        # 金额与币种必须与支付单一致；伪造金额的拒付通知不落账
+        if payment.amount_cents != amount or payment.currency != str(event.get("currency") or "CNY"):
+            raise ApiError("CONFLICT", "拒付金额或币种与支付单不一致")
+        if payment.status not in {"paid", "refunded"}:
+            raise ApiError("CONFLICT", "支付单未成功，不可拒付")
+        if amount > payment.amount_cents:
+            raise ApiError("CONFLICT", "拒付金额超过支付金额")
+
+        chargeback = Chargeback(
+            id=str(uuid.uuid4()),
+            tenant_id=payment.tenant_id,
+            payment_id=payment.id,
+            provider_case_id=case_id,
+            amount_cents=amount,
+            currency=payment.currency,
+            status="opened",
+            reason=reason,
+            opened_at=datetime.now(UTC),
+        )
+        session.add(chargeback)
+        # 拒付发生：借记拒付损失、贷记渠道应收，应收减少损失增加
+        post_transaction(
+            session,
+            txn_type="chargeback",
+            ref_type="chargeback",
+            ref_id=chargeback.id,
+            entries=[
+                ("CHARGEBACK", "debit", amount),
+                ("PROVIDER_RECEIVABLE", "credit", amount),
+            ],
+            currency=payment.currency,
+            tenant=payment.tenant_id,
+        )
+        enqueue(
+            session,
+            "payment",
+            "payment.chargeback_opened",
+            {
+                "chargeback_id": chargeback.id,
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "amount_cents": amount,
+                "provider_case_id": case_id,
+            },
+            tenant=payment.tenant_id,
+        )
+        enqueue_audit(
+            session,
+            actor_id="channel",
+            actor_role="system",
+            action="payment.chargeback_opened",
+            target_type="chargeback",
+            target_id=chargeback.id,
+            before={"status": "opened"},
+            after={"amount_cents": amount, "payment_id": payment.id},
+            request=request,
+            tenant=payment.tenant_id,
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # 并发重复通知撞 provider_case_id 唯一索引：回滚后按幂等返回
+            await session.rollback()
+            return {"status": "opened", "idempotent": True}
+        return {"status": "opened", "idempotent": False}
+
+
+class ResolveChargebackReq(BaseModel):
+    outcome: str = Field(pattern="^(won|lost)$")
+
+
+@app.post("/payments/chargebacks/{chargeback_id}/resolve")
+async def resolve_chargeback(
+    chargeback_id: str, payload: ResolveChargebackReq, principal: PrincipalDep, request: Request
+) -> dict[str, Any]:
+    """运营处置拒付：won 反向冲正（渠道退回资金），lost 保持损失不额外记账。"""
+    principal.require_staff()
+    async with get_session_factory()() as session:
+        chargeback = await session.get(Chargeback, chargeback_id)
+        if chargeback is None:
+            raise ApiError("NOT_FOUND", "拒付单不存在")
+        if chargeback.status != "opened":
+            return {"status": chargeback.status, "idempotent": True}
+        if payload.outcome == "won":
+            # 申诉成功：借记渠道应收、贷记拒付损失，反向冲正 opened 时的分录
+            post_transaction(
+                session,
+                txn_type="chargeback",
+                ref_type="chargeback",
+                ref_id=chargeback.id,
+                entries=[
+                    ("PROVIDER_RECEIVABLE", "debit", chargeback.amount_cents),
+                    ("CHARGEBACK", "credit", chargeback.amount_cents),
+                ],
+                currency=chargeback.currency,
+                tenant=chargeback.tenant_id,
+            )
+        chargeback.status = payload.outcome
+        chargeback.closed_at = datetime.now(UTC)
+        enqueue(
+            session,
+            "payment",
+            "payment.chargeback_resolved",
+            {
+                "chargeback_id": chargeback.id,
+                "payment_id": chargeback.payment_id,
+                "outcome": payload.outcome,
+            },
+            tenant=chargeback.tenant_id,
+        )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="payment.chargeback_resolved",
+            target_type="chargeback",
+            target_id=chargeback.id,
+            before={"status": "opened"},
+            after={"status": payload.outcome},
+            request=request,
+            tenant=chargeback.tenant_id,
+        )
+        await session.commit()
+    return {"status": payload.outcome, "idempotent": False}
 
 
 async def _local_records(session, biz_date: str) -> list[dict[str, Any]]:
@@ -595,6 +863,8 @@ async def reconcile(
         ledger_balanced = all(item["debit"] == item["credit"] for item in totals.values())
 
         await session.commit()
+        # 对账差异数是观测对账健康度的核心仪表：本轮检测到的开放差异量，供告警阈值参考。
+        RECONCILIATION_DIFF.labels("payment").set(len(diffs))
         return {
             "biz_date": target_date,
             "payments": len([row for row in local if row["kind"] == "payment"]),
