@@ -73,10 +73,12 @@ def get_engine():
                     # 与原 PostgreSQL 的 READ COMMITTED 语义保持一致，
                     # 避免 REPEATABLE READ 快照让 outbox 轮询读不到新事件。
                     "isolation_level": "READ COMMITTED",
+                    # 池满快速失败：拿不到连接的请求立即报错，不排队拖垮整个进程
+                    "pool_timeout": 5,
                 }
             )
         else:
-            kwargs.update({"pool_size": 10, "max_overflow": 20})
+            kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_timeout": 5})
         _engine = create_async_engine(url, **kwargs)
         # expire_on_commit=False：commit 后仍可读取 ORM 属性，避免响应组装时触发额外查询。
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)

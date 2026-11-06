@@ -9,15 +9,16 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from shop_common.tasks import run_task_loop
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from .models import Reservation, Restock, Stock
+from .models import Reservation, Restock, Stock, StockAdjustment
 from .scripts import COMMIT_ORDER, RELEASE_ORDER, RESERVE_MULTI, RESTOCK, SEC_KILL, SYNC_STOCK
 
 settings = get_settings()
@@ -211,6 +212,8 @@ async def lifespan(_: FastAPI):
             with suppress(asyncio.CancelledError):
                 await task
         await redis.close()
+        # 排空在途请求后释放连接池，避免停机时残留连接占住数据库
+        await dispose_engine()
 
 
 app = FastAPI(title="inventory-service", version="0.1.0", lifespan=lifespan)
@@ -232,9 +235,16 @@ class OrderRef(BaseModel):
     reason: str = "cancelled"
 
 
-class StockUpsert(BaseModel):
+class InboundRequest(BaseModel):
+    sku: str
+    qty: int = Field(gt=0, le=1_000_000)
+    reason: str = "manual"
+
+
+class StocktakeRequest(BaseModel):
     sku: str
     total: int = Field(ge=0)
+    reason: str = "stocktake"
 
 
 class SecKillRequest(BaseModel):
@@ -266,20 +276,82 @@ async def list_stocks(principal: PrincipalDep) -> dict[str, Any]:
         return {"items": items}
 
 
-@app.post("/inventory/stocks")
-async def upsert_stock(payload: StockUpsert, principal: PrincipalDep) -> dict[str, Any]:
+@app.post("/inventory/inbound", status_code=201)
+async def inbound(
+    payload: InboundRequest,
+    principal: PrincipalDep,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict[str, Any]:
+    """入库：按增量增加总量。入库是叠加操作，必须带幂等键，同一键重试只入一次。"""
+    principal.require_staff()
+    if not idempotency_key:
+        raise ApiError("BAD_REQUEST", "入库必须携带 Idempotency-Key")
+    async with get_session_factory()() as session:
+        existing = await session.scalar(
+            select(StockAdjustment).where(StockAdjustment.idempotency_key == idempotency_key)
+        )
+        if existing is not None:
+            return {"sku": existing.sku, "delta": existing.delta, "idempotent": True}
+        stock = await session.get(Stock, payload.sku)
+        if stock is None:
+            stock = Stock(sku=payload.sku, total=0, reserved=0)
+            session.add(stock)
+        stock.total += payload.qty
+        session.add(
+            StockAdjustment(
+                sku=payload.sku,
+                delta=payload.qty,
+                reason=payload.reason,
+                operator_id=principal.user_id,
+                idempotency_key=idempotency_key,
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # 并发重复提交撞幂等键唯一索引：回读既有记录幂等返回，不二次入库
+            await session.rollback()
+            existing = await session.scalar(
+                select(StockAdjustment).where(StockAdjustment.idempotency_key == idempotency_key)
+            )
+            if existing is None:
+                raise
+            return {"sku": existing.sku, "delta": existing.delta, "idempotent": True}
+    # DB 提交后再回填热点缓存：total 增加、reserved 不变，可用量同步增加
+    await _sync_script(keys=[stock_key(payload.sku)], args=[max(stock.total - stock.reserved, 0)])
+    return {"sku": payload.sku, "delta": payload.qty}
+
+
+@app.post("/inventory/stocktake")
+async def stocktake(payload: StocktakeRequest, principal: PrincipalDep) -> dict[str, Any]:
+    """盘点：以绝对值覆盖总量。天然幂等（重复盘点同值差为 0），每次写调整轨迹供审计。"""
     principal.require_staff()
     async with get_session_factory()() as session:
         stock = await session.get(Stock, payload.sku)
+        old_total = stock.total if stock else 0
+        reserved = stock.reserved if stock else 0
+        # 与预占的条件写一致：总量不得小于已预占，否则破坏 reserved <= total 的不变量
+        if payload.total < reserved:
+            raise ApiError("CONFLICT", f"盘点总量 {payload.total} 小于已预占 {reserved}")
+        delta = payload.total - old_total
         if stock is None:
             stock = Stock(sku=payload.sku, total=payload.total, reserved=0)
             session.add(stock)
         else:
             stock.total = payload.total
+        session.add(
+            StockAdjustment(
+                sku=payload.sku,
+                delta=delta,
+                reason=payload.reason,
+                operator_id=principal.user_id,
+            )
+        )
         await session.commit()
-    # DB 是真相源，先提交再回填 Redis；已预占部分不计入可用量。
-    await _sync_script(keys=[stock_key(payload.sku)], args=[max(payload.total - (stock.reserved or 0), 0)])
-    return {"sku": payload.sku, "total": payload.total, "reserved": stock.reserved}
+        new_total = payload.total
+    # 绝对值覆盖后同步热点缓存：可用量 = 总量 - 已预占
+    await _sync_script(keys=[stock_key(payload.sku)], args=[max(new_total - reserved, 0)])
+    return {"sku": payload.sku, "total": new_total, "delta": delta}
 
 
 @app.get("/inventory/{sku}")

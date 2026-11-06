@@ -180,7 +180,7 @@ export const api = {
   timeline: (orderId: string) => request(`/orders/${orderId}/timeline`),
   inventory: () => request("/inventory/stocks"),
   setStock: (sku: string, total: number) =>
-    request("/inventory/stocks", { method: "POST", body: JSON.stringify({ sku, total }) }),
+    request("/inventory/stocktake", { method: "POST", body: JSON.stringify({ sku, total }) }),
   shipments: (status?: string) => request(`/fulfillment/shipments${status ? `?status=${status}` : ""}`),
   ship: (shipmentId: string, items?: { order_item_id: string; qty: number }[]) =>
     request(`/fulfillment/shipments/${shipmentId}/ship`, {

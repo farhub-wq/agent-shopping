@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
@@ -106,6 +106,7 @@ async def lifespan(_: FastAPI):
                 await task
         if redis is not None:
             await redis.close()
+        await dispose_engine()
 
 
 app = FastAPI(title="payment-service", version="0.1.0", lifespan=lifespan)

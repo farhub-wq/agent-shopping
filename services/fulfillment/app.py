@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
@@ -134,6 +134,8 @@ async def lifespan(_: FastAPI):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await redis.close()
+        # 排空在途请求后释放连接池，避免停机时残留连接占住数据库
+        await dispose_engine()
 
 
 app = FastAPI(title="fulfillment-service", version="0.1.0", lifespan=lifespan)

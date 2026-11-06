@@ -7,7 +7,7 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
 from sqlalchemy import func, or_, select
@@ -68,7 +68,10 @@ async def lifespan(_: FastAPI):
     # 启动顺序固定：先建表再投种子数据，否则空库上写入种子会失败。
     await init_models()
     await seed_products()
-    yield
+    try:
+        yield
+    finally:
+        await dispose_engine()
 
 
 app = FastAPI(title="catalog-service", version="0.1.0", lifespan=lifespan)

@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from shop_common.auth import PrincipalDep, create_token
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
 from sqlalchemy import select
@@ -57,7 +57,10 @@ async def lifespan(_: FastAPI):
     configure_logging("identity")
     await init_models()
     await bootstrap_admin()
-    yield
+    try:
+        yield
+    finally:
+        await dispose_engine()
 
 
 app = FastAPI(title="identity", version="0.1.0", lifespan=lifespan)

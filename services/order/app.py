@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
-from shop_common.db import get_session_factory, init_models
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
@@ -254,32 +254,41 @@ async def _create_payment(order: Order) -> dict[str, Any] | None:
         return None
 
 
+# RESERVED 超过 5 分钟未推进到 PAYING，通常是「预占成功但支付单未建成」的失步窗口（如进程崩溃）
+RESERVED_STUCK_SECONDS = 300
+
+
 async def _expire_unpaid_once() -> None:
-    """单轮超时关单：覆盖「库存已锁但支付单未建成」和支付事件丢失的窗口。"""
+    """单轮超时关单：PAYING 超过支付窗口、RESERVED 超 5 分钟都按超时取消并释放库存。"""
     now = datetime.now(UTC)
     expired_ids: list[str] = []
     async with get_session_factory()() as session:
-        rows = (
+        paying = (
             (
                 await session.execute(
                     select(Order).where(
-                        Order.status.in_({"RESERVED", "PAYING"}),
-                        (
-                            (Order.payment_expires_at.is_not(None) & (Order.payment_expires_at < now))
-                            | (
-                                Order.payment_id.is_(None)
-                                & (
-                                    Order.created_at
-                                    < now - timedelta(seconds=settings.payment_ttl_seconds)
-                                )
-                            )
-                        ),
+                        Order.status == "PAYING",
+                        Order.payment_expires_at.is_not(None),
+                        Order.payment_expires_at < now,
                     )
                 )
             )
             .scalars()
             .all()
         )
+        stuck_reserved = (
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.status == "RESERVED",
+                        Order.created_at < now - timedelta(seconds=RESERVED_STUCK_SECONDS),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = [*paying, *stuck_reserved]
         for order in rows:
             _cancel(order, session, "payment_timeout")
             enqueue(
@@ -553,6 +562,8 @@ async def lifespan(_: FastAPI):
                 await task
         if redis is not None:
             await redis.close()
+        # 排空在途请求后释放连接池，避免停机时残留连接占住数据库
+        await dispose_engine()
 
 
 app = FastAPI(title="order-service", version="0.1.0", lifespan=lifespan)

@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 
 from shop_common.db import Base, UTCDateTime
@@ -41,6 +42,22 @@ class Reservation(Base):
     __table_args__ = (
         UniqueConstraint("order_id", "sku", name="uq_stock_reservation_order_sku"),
     )
+
+
+class StockAdjustment(Base):
+    __tablename__ = "stock_adjustments"
+    # 入库/盘点的人工调整轨迹：只增不改，idempotency_key 唯一兜住入库重试。
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_stock_adjustment_idempotency_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    sku: Mapped[str] = mapped_column(String(64), index=True)
+    # delta > 0 入库/回补，delta < 0 盘点调减；盘点按新旧总量差值写入
+    delta: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(String(64), default="manual")
+    operator_id: Mapped[str] = mapped_column(String(64), default="")
+    # 入库必须带幂等键；盘点天然幂等（绝对值），可为空
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 class Restock(Base):
