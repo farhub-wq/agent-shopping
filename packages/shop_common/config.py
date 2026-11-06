@@ -37,6 +37,9 @@ class ServiceSettings(BaseSettings):
     identity_url: str = "http://localhost:8007"
     # 本地演示用的自选角色换 token 接口：只在 env=dev 且显式开启时挂载，生产必须关闭
     auth_dev_mode: bool = False
+    # 管理员 TOTP 共享密钥的对称加密主密钥（Fernet，32 字节 urlsafe-base64）。
+    # 生产必须注入独立密钥，dev 默认值仅保证本地/单测可跑，明文密钥与 JWT_SECRET 同等级对待。
+    mfa_encryption_key: str = "0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU="
 
     catalog_url: str = "http://localhost:8001"
     inventory_url: str = "http://localhost:8002"
@@ -45,6 +48,7 @@ class ServiceSettings(BaseSettings):
     aftersales_url: str = "http://localhost:8005"
     harness_url: str = "http://localhost:8006"
     payment_url: str = "http://localhost:8008"
+    audit_url: str = "http://localhost:8009"
     # 浏览器可达的网关地址：mock 收银台 pay_url 必须指向这里，而不是容器内地址
     payment_public_base_url: str = "http://localhost:8080"
     gateway_url: str = "http://localhost:8080"

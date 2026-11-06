@@ -113,6 +113,11 @@ class Principal:
         if not self.is_staff():
             raise ApiError("FORBIDDEN", "该操作仅限运营人员")
 
+    def require_admin(self) -> None:
+        # 审计等敏感数据只对管理员开放，运营也不能越级读取
+        if self.role != "admin":
+            raise ApiError("FORBIDDEN", "该操作仅限管理员")
+
 
 async def get_principal(
     authorization: Annotated[str | None, Header()] = None,

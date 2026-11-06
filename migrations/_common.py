@@ -16,7 +16,7 @@ settings = get_settings()
 target_metadata = Base.metadata
 
 # 有数据库的服务白名单；gateway/harness 无关系库，不应走到迁移
-DB_SERVICES = {"catalog", "inventory", "order", "fulfillment", "aftersales", "identity", "payment"}
+DB_SERVICES = {"catalog", "inventory", "order", "fulfillment", "aftersales", "identity", "payment", "audit"}
 
 
 def _load_service_models() -> None:

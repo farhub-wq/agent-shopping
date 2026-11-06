@@ -14,12 +14,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
+from .config import get_settings
 from .db import Base, UTCDateTime
 from .events import EventBus
 from .logging import get_logger
+from .metrics import OUTBOX_LAG
 from .redis_lock import RedisLock
 
 logger = get_logger(__name__)
+
+
+def _service_name() -> str:
+    # 中继随服务进程运行，指标按各服务自身名称打标签
+    return get_settings().service_name
 
 
 class OutboxEvent(Base):
@@ -92,7 +99,11 @@ class OutboxRelay:
                 .all()
             )
             if not pending:
+                OUTBOX_LAG.labels(_service_name()).set(0)
                 return 0
+            # 延迟 = 最老未投递事件距今时长；事件堆积时该值持续走高，供告警阈值触发
+            lag = max(0.0, (datetime.now(UTC) - pending[0].created_at).total_seconds())
+            OUTBOX_LAG.labels(_service_name()).set(lag)
             # 快照取出，避免在并行投递任务里跨会话持有 ORM 实例。
             snapshot = [
                 {

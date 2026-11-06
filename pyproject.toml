@@ -17,6 +17,8 @@ dependencies = [
   "motor>=3.6.0",
   "redis>=5.0.8",
   "httpx>=0.27.0",
+  # Prometheus 指标：可观测模块各服务 /metrics 端点与业务埋点共用
+  "prometheus-client>=0.20.0",
   "pyyaml>=6.0.2",
   "pyjwt>=2.8.0",
   "numpy>=1.26.0",
@@ -34,7 +36,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["packages", "services"]
-include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*", "payment*"]
+include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*", "payment*", "audit*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

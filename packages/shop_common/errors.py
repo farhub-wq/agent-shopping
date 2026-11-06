@@ -10,6 +10,8 @@ class ApiError(Exception):
     status_by_code = {
         "BAD_REQUEST": 400,
         "UNAUTHORIZED": 401,
+        # MFA 二次验证未通过：与普通 401 同状态码，但错误码可被前端识别以弹出验证码输入
+        "MFA_REQUIRED": 401,
         "FORBIDDEN": 403,
         "NOT_FOUND": 404,
         "CONFLICT": 409,

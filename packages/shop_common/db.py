@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import get_settings
+from .metrics import DB_POOL_EXHAUSTED
 
 settings = get_settings()
 
@@ -88,7 +89,43 @@ def get_engine():
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     get_engine()
     assert _session_factory is not None
-    return _session_factory
+    return _CountedSessionFactory(_session_factory)
+
+
+class _CountedSessionFactory:
+    """薄包装 sessionmaker：把连接池耗尽折算成 db_pool_exhausted_total 计数。
+
+    调用方仍用 `get_session_factory()()` 拿到会话，对外用法与类型不变；
+    只多包一层 __aenter__，在 pool_timeout 超时抛出前计一次指标。
+    """
+
+    def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
+        self._factory = factory
+
+    def __call__(self) -> "_PoolGuardedSession":
+        return _PoolGuardedSession(self._factory())
+
+    def __getattr__(self, name: str):
+        return getattr(self._factory, name)
+
+
+class _PoolGuardedSession:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> AsyncSession:
+        try:
+            return await self._session.__aenter__()
+        except TimeoutError:
+            # asyncio.TimeoutError 在此只可能来自 pool_timeout 超时（池满快速失败）
+            DB_POOL_EXHAUSTED.labels(settings.service_name).inc()
+            raise
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self._session.__aexit__(*exc_info)
+
+    def __getattr__(self, name: str):
+        return getattr(self._session, name)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
