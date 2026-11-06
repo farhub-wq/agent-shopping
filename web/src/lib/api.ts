@@ -174,17 +174,18 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   orders: (status?: string) => request(`/storefront/orders${status ? `?status=${status}` : ""}`),
-  pay: (orderId: string) =>
-    request(`/storefront/orders/${orderId}/pay`, { method: "POST", body: JSON.stringify({ method: "mock" }) }),
+  // 支付由独立 payment 服务处理：前端只拿 payment_id 调 mock 收银台确认
+  pay: (paymentId: string) =>
+    request(`/storefront/payments/${paymentId}/pay`, { method: "POST" }),
   timeline: (orderId: string) => request(`/orders/${orderId}/timeline`),
   inventory: () => request("/inventory/stocks"),
   setStock: (sku: string, total: number) =>
     request("/inventory/stocks", { method: "POST", body: JSON.stringify({ sku, total }) }),
   shipments: (status?: string) => request(`/fulfillment/shipments${status ? `?status=${status}` : ""}`),
-  ship: (shipmentId: string) =>
+  ship: (shipmentId: string, items?: { order_item_id: string; qty: number }[]) =>
     request(`/fulfillment/shipments/${shipmentId}/ship`, {
       method: "POST",
-      body: JSON.stringify({ carrier: "SF" }),
+      body: JSON.stringify({ carrier: "SF", ...(items ? { items } : {}) }),
     }),
   deliver: (shipmentId: string) =>
     request(`/fulfillment/shipments/${shipmentId}/deliver`, { method: "POST", body: "{}" }),
@@ -195,8 +196,6 @@ export const api = {
     request(`/aftersales/tickets/${ticketId}/approve`, { method: "POST", body: JSON.stringify({ note: "人工审核通过" }) }),
   rejectTicket: (ticketId: string) =>
     request(`/aftersales/tickets/${ticketId}/reject`, { method: "POST", body: JSON.stringify({ note: "人工驳回" }) }),
-  refundTicket: (ticketId: string) =>
-    request(`/aftersales/tickets/${ticketId}/refund-complete`, { method: "POST", body: "{}" }),
   agents: () => request("/agents"),
   policies: () => request("/policies"),
   evidence: (runId: string) => request(`/agents/runs/${runId}/evidence`),

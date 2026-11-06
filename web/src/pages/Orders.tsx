@@ -23,6 +23,9 @@ const REASONS = [
   { value: "price_protection", label: "价保" },
 ];
 
+// 行级可退数量 = 下单数量 − 已退数量；负数按 0 收口，历史脏数据不导致 UI 出现可退 -1
+const refundableQty = (item: any): number => Math.max(0, item.qty - (item.refunded_qty || 0));
+
 export default function Orders() {
   const session = getSession();
   const [tab, setTab] = useState<"orders" | "tickets">("orders");
@@ -32,6 +35,9 @@ export default function Orders() {
   const [formOrder, setFormOrder] = useState<string | null>(null);
   const [reason, setReason] = useState("quality_issue");
   const [description, setDescription] = useState("");
+  // 行级售后选择：不选订单行即整单退款，选中后按数量计算可退金额
+  const [refundItemId, setRefundItemId] = useState("");
+  const [refundQty, setRefundQty] = useState<number | "">("");
   const [error, setError] = useState("");
 
   // 订单与售后单是两个独立列表，一次并发拉取减少往返。
@@ -61,10 +67,14 @@ export default function Orders() {
     );
   }
 
-  const pay = async (orderId: string) => {
+  const pay = async (paymentId: string | null) => {
+    if (!paymentId) {
+      setError("支付单尚未创建，请稍后重试");
+      return;
+    }
     try {
-      await api.pay(orderId);
-      // 支付会推进订单状态，必须重新拉列表而不是本地改字段。
+      await api.pay(paymentId);
+      // 支付会经 payment 事件推进订单状态，必须重新拉列表而不是本地改字段。
       await load();
     } catch (exc) {
       setError((exc as Error).message);
@@ -83,9 +93,25 @@ export default function Orders() {
   const submitTicket = async (orderId: string) => {
     try {
       // 顾客侧只发起「仅退款」申请，审批与退款由运营在后台完成。
-      await api.createTicket({ order_id: orderId, reason, description, type: "refund_only" });
+      const order = orders.find((row) => row.id === orderId);
+      const item = order?.items?.find((row: any) => row.item_id === refundItemId);
+      await api.createTicket({
+        order_id: orderId,
+        reason,
+        description,
+        type: "refund_only",
+        // 选中订单行时传数量；不传则由后端按整行剩余可退数量计算
+        ...(item
+          ? {
+              order_item_id: item.item_id,
+              quantity: refundQty || refundableQty(item),
+            }
+          : {}),
+      });
       setFormOrder(null);
       setDescription("");
+      setRefundItemId("");
+      setRefundQty("");
       await load();
       setTab("tickets");
     } catch (exc) {
@@ -103,7 +129,11 @@ export default function Orders() {
 
       {tab === "orders" && (
         <div className="list">
-          {orders.map((order) => (
+          {orders.map((order) => {
+            // 模板只做展示：可退数量与上限在渲染前算好，避免把业务算术塞进 JSX
+            const selectedItem = order.items?.find((row: any) => row.item_id === refundItemId);
+            const selectedMax = selectedItem ? Math.max(1, refundableQty(selectedItem)) : 1;
+            return (
             <article className="panel order" key={order.id}>
               <header>
                 <div>
@@ -114,17 +144,23 @@ export default function Orders() {
               </header>
               <ul className="items">
                 {order.items.map((item: any) => (
-                  <li key={item.sku}>
+                  <li key={item.item_id}>
                     <span>{item.title}</span>
                     <span className="muted">{item.sku} × {item.qty}</span>
                   </li>
                 ))}
               </ul>
               <div className="row-actions">
-                {/* 操作入口由订单状态驱动：仅 RESERVED 可支付，已支付之后才允许售后。 */}
-                {order.status === "RESERVED" && <button className="primary small" onClick={() => pay(order.id)}>去支付</button>}
+                {/* 操作入口由订单状态驱动：RESERVED/PAYING 可支付，已支付之后才允许售后。 */}
+                {(order.status === "RESERVED" || order.status === "PAYING") && (
+                  <button className="primary small" onClick={() => pay(order.payment_id)}>去支付</button>
+                )}
                 {(order.status === "PAID" || order.status === "SHIPPED" || order.status === "COMPLETED") && (
-                  <button className="ghost" onClick={() => setFormOrder(order.id)}>申请售后</button>
+                  <button className="ghost" onClick={() => {
+                    setFormOrder(order.id);
+                    setRefundItemId("");
+                    setRefundQty("");
+                  }}>申请售后</button>
                 )}
                 <button className="ghost" onClick={() => showTimeline(order.id)}>状态轨迹</button>
               </div>
@@ -133,6 +169,30 @@ export default function Orders() {
                   <select value={reason} onChange={(event) => setReason(event.target.value)}>
                     {REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   </select>
+                  {/* 不选订单行表示整单退款；选中后只退该行剩余数量，避免跨行超退 */}
+                  <select value={refundItemId} onChange={(event) => {
+                    setRefundItemId(event.target.value);
+                    setRefundQty("");
+                  }}>
+                    <option value="">整单退款</option>
+                    {order.items
+                      .filter((item: any) => refundableQty(item) > 0)
+                      .map((item: any) => (
+                        <option key={item.item_id} value={item.item_id}>
+                          {item.title}（可退 {refundableQty(item)} 件）
+                        </option>
+                      ))}
+                  </select>
+                  {refundItemId && (
+                    <input
+                      type="number"
+                      min={1}
+                      max={selectedMax}
+                      placeholder="退款数量（默认剩余全部）"
+                      value={refundQty}
+                      onChange={(event) => setRefundQty(event.target.value === "" ? "" : Number(event.target.value))}
+                    />
+                  )}
                   <textarea
                     placeholder="补充说明，例如「尺码偏小」「收到时外包装破损」"
                     value={description}
@@ -145,7 +205,8 @@ export default function Orders() {
                 </div>
               )}
             </article>
-          ))}
+            );
+          })}
           {!orders.length && <p className="muted center">还没有订单，去商城下单试试。</p>}
         </div>
       )}

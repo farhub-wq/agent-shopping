@@ -55,6 +55,21 @@ export default function Ops() {
     }
   };
 
+  // 部分发货：逐行询问本次发出数量，全部默认发满即等价于整单发货
+  const shipPartial = async (shipment: any) => {
+    const items: { order_item_id: string; qty: number }[] = [];
+    for (const item of shipment.items || []) {
+      const value = window.prompt(
+        `${item.sku} 本次发货数量（履约单数量 ${item.qty}）`,
+        String(item.qty),
+      );
+      if (value === null) return;
+      const qty = Number(value);
+      if (qty > 0) items.push({ order_item_id: item.order_item_id, qty });
+    }
+    if (items.length) await act(() => api.ship(shipment.id, items));
+  };
+
   return (
     <div>
       <div className="tabs">
@@ -138,10 +153,16 @@ export default function Ops() {
                 {shipment.sla_flagged && <span className="status cancelled">履约超时</span>}
               </header>
               <p className="muted">截止 {new Date(shipment.deadline_at).toLocaleString()} · 运单 {shipment.tracking_no || "-"}</p>
+              <p className="muted">
+                {shipment.items?.map((item: any) => `${item.sku}×${item.qty}`).join("，") || "无履约行"}
+              </p>
               <div className="row-actions">
-                {/* 履约动作按状态单向推进：pending 发货，shipped 后确认签收。 */}
+                {/* 履约动作按状态单向推进：pending 发货（可部分），shipped 后确认签收。 */}
                 {shipment.status === "pending" && (
-                  <button className="primary small" onClick={() => act(() => api.ship(shipment.id))}>发货</button>
+                  <>
+                    <button className="primary small" onClick={() => act(() => api.ship(shipment.id))}>整单发货</button>
+                    <button className="ghost" onClick={() => shipPartial(shipment)}>部分发货</button>
+                  </>
                 )}
                 {shipment.status === "shipped" && (
                   <button className="ghost" onClick={() => act(() => api.deliver(shipment.id))}>确认签收</button>
@@ -173,13 +194,9 @@ export default function Ops() {
                 </p>
               )}
               <div className="row-actions">
-                {/* 审批动作都由人工点击触发，Agent 结果不在这里自动执行。 */}
+                {/* 审批动作都由人工点击触发；通过后由 payment 服务同步出款，工单状态随事件回填。 */}
                 <button className="primary small" onClick={() => act(() => api.approveTicket(ticket.id))}>通过</button>
                 <button className="ghost" onClick={() => act(() => api.rejectTicket(ticket.id))}>驳回</button>
-                {/* 退款完成不可逆，只在 approved 后开放。 */}
-                {ticket.status === "approved" && (
-                  <button className="ghost" onClick={() => act(() => api.refundTicket(ticket.id))}>完成退款</button>
-                )}
               </div>
             </article>
           ))}
