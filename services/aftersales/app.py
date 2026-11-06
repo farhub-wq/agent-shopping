@@ -5,9 +5,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import Principal, PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
@@ -15,6 +16,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
 from shop_common.outbox import OutboxRelay
 from sqlalchemy import func, select
 
@@ -69,6 +71,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="aftersales-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "aftersales")
+install_metrics(app, "aftersales")
 
 
 class TicketCreate(BaseModel):
@@ -286,7 +289,7 @@ class Decision(BaseModel):
 
 
 @app.post("/aftersales/tickets/{ticket_id}/approve")
-async def approve(ticket_id: str, principal: PrincipalDep, payload: Decision | None = None) -> dict[str, Any]:
+async def approve(ticket_id: str, principal: PrincipalDep, request: Request, payload: Decision | None = None) -> dict[str, Any]:
     # 通过即意味着放款，属于不可逆资金动作，只允许员工人工触发
     principal.require_staff()
     note = payload.note if payload else ""
@@ -297,9 +300,22 @@ async def approve(ticket_id: str, principal: PrincipalDep, payload: Decision | N
         # 仅 pending 可首次通过；已 approved 允许补充复核，其余状态一律拒绝以免重复放款
         if ticket.status not in {"pending", "approved"}:
             raise ApiError("CONFLICT", f"售后单状态 {ticket.status} 不可通过")
+        before = {"status": ticket.status}
         await _approve(ticket)
         ticket.decided_by = principal.user_id
         ticket.decision_note = note or ticket.decision_note
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="aftersales.approve",
+            target_type="ticket",
+            target_id=ticket.id,
+            before=before,
+            after={"status": ticket.status, "amount_cents": ticket.amount_cents},
+            request=request,
+            tenant=principal.tenant,
+        )
         await session.commit()
         result = ticket.to_dict()
 
@@ -309,7 +325,7 @@ async def approve(ticket_id: str, principal: PrincipalDep, payload: Decision | N
 
 
 @app.post("/aftersales/tickets/{ticket_id}/reject")
-async def reject(ticket_id: str, principal: PrincipalDep, payload: Decision | None = None) -> dict[str, Any]:
+async def reject(ticket_id: str, principal: PrincipalDep, request: Request, payload: Decision | None = None) -> dict[str, Any]:
     principal.require_staff()
     note = payload.note if payload else ""
     async with get_session_factory()() as session:
@@ -323,6 +339,18 @@ async def reject(ticket_id: str, principal: PrincipalDep, payload: Decision | No
         ticket.decided_by = principal.user_id
         ticket.decision_note = note or "人工驳回"
         ticket.decided_at = datetime.now(UTC)
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="aftersales.reject",
+            target_type="ticket",
+            target_id=ticket.id,
+            before={"status": "pending"},
+            after={"status": "rejected", "amount_cents": ticket.amount_cents},
+            request=request,
+            tenant=principal.tenant,
+        )
         await session.commit()
         result = ticket.to_dict()
     # 状态提交后再通知订单侧；驳回发生在出款前，订单通常尚未进入 REFUNDING，事件为安全兜底

@@ -8,11 +8,13 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import publish_audit
 from shop_common.auth import PrincipalDep
 from shop_common.config import get_settings
 from shop_common.errors import ApiError, install_error_handlers
-from shop_common.events import create_redis
+from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
 from shop_common.mongo import close_mongo
 
 from .core.llm import build_provider
@@ -32,6 +34,7 @@ logger = get_logger(__name__)
 SKILL_ROOT = Path(__file__).parent / "skills"
 
 redis: Redis | None = None
+bus: EventBus | None = None
 memory: MemoryManager | None = None
 runtime: AgentRuntime | None = None
 mcp_server: MCPServer | None = None
@@ -40,10 +43,12 @@ sandbox = SandboxManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global redis, memory, runtime, mcp_server
+    global redis, bus, memory, runtime, mcp_server
     configure_logging("harness")
     # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.redis_url)
+    # harness 只发布审计事件不消费，无需会话工厂；session_factory 仅消费路径会用到
+    bus = EventBus(redis, namespace="shop", session_factory=None)
     memory = MemoryManager(redis)
     # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
     # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
@@ -58,6 +63,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "harness")
+install_metrics(app, "harness")
 
 
 class ChatRequest(BaseModel):
@@ -177,7 +183,7 @@ async def chat(
 
 
 @app.post("/runs/{run_id}/approve")
-async def approve_run(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
+async def approve_run(run_id: str, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     assert runtime is not None
     principal.require_staff()
     # 审批重放必须绑定原 run_id：待审批负载按 run_id 存在 Redis 里，
@@ -189,7 +195,23 @@ async def approve_run(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
         session_id=f"approve-{run_id}",
         run_id=run_id,
     )
-    return (await runtime.approve_and_replay(run_id, ctx)).to_dict()
+    result = (await runtime.approve_and_replay(run_id, ctx)).to_dict()
+    # harness 无关系库，审计直接投递 Redis Stream；失败不阻断审批结果返回
+    if bus is not None:
+        try:
+            await publish_audit(
+                bus,
+                actor_id=principal.user_id,
+                actor_role=principal.role,
+                action="agent.execute_approved",
+                target_type="run",
+                target_id=run_id,
+                request=request,
+                tenant=principal.tenant,
+            )
+        except Exception:
+            logger.exception("审计事件投递失败 run_id=%s", run_id)
+    return result
 
 
 @app.get("/runs/{run_id}/evidence")

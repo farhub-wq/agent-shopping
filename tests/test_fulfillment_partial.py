@@ -41,6 +41,7 @@ async def test_partial_ship_splits_remaining_quantity():
         shipment_id,
         ShipRequest(carrier="SF", items=[{"order_item_id": "item-a", "qty": 1}]),
         Principal("op", "operator", "default"),
+        None,
     )
     assert result["status"] == "shipped"
     assert [row["qty"] for row in result["items"]] == [1]
@@ -65,4 +66,5 @@ async def test_ship_rejects_quantity_over_shipment():
             shipment_id,
             ShipRequest(carrier="SF", items=[{"order_item_id": "item-a", "qty": 2}]),
             Principal("op", "operator", "default"),
+            None,
         )

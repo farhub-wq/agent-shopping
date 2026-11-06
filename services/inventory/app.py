@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
@@ -14,6 +15,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import INVENTORY_NEGATIVE, install_metrics
 from shop_common.tasks import run_task_loop
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -218,6 +220,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="inventory-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "inventory")
+install_metrics(app, "inventory")
 
 
 class ReserveItem(BaseModel):
@@ -280,6 +283,7 @@ async def list_stocks(principal: PrincipalDep) -> dict[str, Any]:
 async def inbound(
     payload: InboundRequest,
     principal: PrincipalDep,
+    request: Request,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> dict[str, Any]:
     """入库：按增量增加总量。入库是叠加操作，必须带幂等键，同一键重试只入一次。"""
@@ -296,6 +300,7 @@ async def inbound(
         if stock is None:
             stock = Stock(sku=payload.sku, total=0, reserved=0)
             session.add(stock)
+        before_total = stock.total
         stock.total += payload.qty
         session.add(
             StockAdjustment(
@@ -305,6 +310,18 @@ async def inbound(
                 operator_id=principal.user_id,
                 idempotency_key=idempotency_key,
             )
+        )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="inventory.adjust",
+            target_type="stock",
+            target_id=payload.sku,
+            before={"total": before_total},
+            after={"total": stock.total, "reason": payload.reason},
+            request=request,
+            tenant=principal.tenant,
         )
         try:
             await session.commit()
@@ -323,7 +340,7 @@ async def inbound(
 
 
 @app.post("/inventory/stocktake")
-async def stocktake(payload: StocktakeRequest, principal: PrincipalDep) -> dict[str, Any]:
+async def stocktake(payload: StocktakeRequest, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     """盘点：以绝对值覆盖总量。天然幂等（重复盘点同值差为 0），每次写调整轨迹供审计。"""
     principal.require_staff()
     async with get_session_factory()() as session:
@@ -346,6 +363,18 @@ async def stocktake(payload: StocktakeRequest, principal: PrincipalDep) -> dict[
                 reason=payload.reason,
                 operator_id=principal.user_id,
             )
+        )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="inventory.adjust",
+            target_type="stock",
+            target_id=payload.sku,
+            before={"total": old_total},
+            after={"total": payload.total, "reason": payload.reason},
+            request=request,
+            tenant=principal.tenant,
         )
         await session.commit()
         new_total = payload.total
@@ -402,6 +431,8 @@ async def reserve(
         if int(result[0]) != 1:
             failed_index = int(result[1])
             failed_sku = payload.items[max(failed_index - 1, 0)].sku
+            # 扣减不足是超卖/超买的前置信号，计数后告警；失败下标来自 Lua 返回值。
+            INVENTORY_NEGATIVE.labels("inventory").inc()
             raise ApiError(
                 "CONFLICT",
                 "库存不足，请调整购买数量",

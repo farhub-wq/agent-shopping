@@ -37,12 +37,12 @@ async def test_inbound_is_idempotent_by_key(monkeypatch):
     principal = Principal("op", "operator", "default")
     key = str(uuid.uuid4())
 
-    first = await inbound(InboundRequest(sku=sku, qty=5), principal, idempotency_key=key)
+    first = await inbound(InboundRequest(sku=sku, qty=5), principal, None, idempotency_key=key)
     assert first["delta"] == 5
     assert "idempotent" not in first
 
     # 同一幂等键重放：不再入库，返回既有调整
-    dup = await inbound(InboundRequest(sku=sku, qty=5), principal, idempotency_key=key)
+    dup = await inbound(InboundRequest(sku=sku, qty=5), principal, None, idempotency_key=key)
     assert dup["idempotent"] is True
     assert dup["delta"] == 5
 
@@ -62,7 +62,7 @@ async def test_inbound_is_idempotent_by_key(monkeypatch):
 async def test_inbound_requires_idempotency_key():
     principal = Principal("op", "operator", "default")
     with pytest.raises(ApiError):
-        await inbound(InboundRequest(sku="SKU-X", qty=1), principal, idempotency_key=None)
+        await inbound(InboundRequest(sku="SKU-X", qty=1), principal, None, idempotency_key=None)
 
 
 @pytest.mark.asyncio
@@ -73,7 +73,7 @@ async def test_stocktake_sets_absolute_and_records_delta(monkeypatch):
     await _seed_stock(sku, 10)
     principal = Principal("op", "operator", "default")
 
-    res = await stocktake(StocktakeRequest(sku=sku, total=3), principal)
+    res = await stocktake(StocktakeRequest(sku=sku, total=3), principal, None)
     assert res["total"] == 3
     assert res["delta"] == -7
 
@@ -101,5 +101,5 @@ async def test_stocktake_rejects_below_reserved(monkeypatch):
     principal = Principal("op", "operator", "default")
 
     with pytest.raises(ApiError):
-        await stocktake(StocktakeRequest(sku=sku, total=3), principal)
+        await stocktake(StocktakeRequest(sku=sku, total=3), principal, None)
     assert stub.calls == []

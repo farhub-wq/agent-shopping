@@ -5,9 +5,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
@@ -15,6 +16,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import install_metrics
 from shop_common.outbox import OutboxRelay, enqueue
 from shop_common.tasks import run_task_loop
 from sqlalchemy import select
@@ -140,6 +142,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="fulfillment-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "fulfillment")
+install_metrics(app, "fulfillment")
 
 
 class ShipItemInput(BaseModel):
@@ -220,7 +223,7 @@ async def shipment_by_order(order_id: str, principal: PrincipalDep) -> dict[str,
 
 
 @app.post("/shipments/{shipment_id}/ship")
-async def ship(shipment_id: str, payload: ShipRequest, principal: PrincipalDep) -> dict[str, Any]:
+async def ship(shipment_id: str, payload: ShipRequest, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     # 发货是不可逆的状态推进，只允许内部员工操作
     principal.require_staff()
     async with get_session_factory()() as session:
@@ -303,12 +306,24 @@ async def ship(shipment_id: str, payload: ShipRequest, principal: PrincipalDep) 
                 "all_shipped": not leftover,
             },
         )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="fulfillment.ship",
+            target_type="shipment",
+            target_id=shipment.id,
+            before={"status": "pending"},
+            after={"status": "shipped", "tracking_no": shipment.tracking_no, "items": shipped_items},
+            request=request,
+            tenant=principal.tenant,
+        )
         await session.commit()
         return shipment.to_dict(shipped_items)
 
 
 @app.post("/shipments/{shipment_id}/deliver")
-async def deliver(shipment_id: str, principal: PrincipalDep) -> dict[str, Any]:
+async def deliver(shipment_id: str, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     principal.require_staff()
     async with get_session_factory()() as session:
         shipment = await session.get(Shipment, shipment_id)
@@ -337,6 +352,18 @@ async def deliver(shipment_id: str, principal: PrincipalDep) -> dict[str, Any]:
                 "order_id": shipment.order_id,
                 "all_delivered": remaining is None,
             },
+        )
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="fulfillment.deliver",
+            target_type="shipment",
+            target_id=shipment.id,
+            before={"status": "shipped"},
+            after={"status": "delivered"},
+            request=request,
+            tenant=principal.tenant,
         )
         await session.commit()
         return shipment.to_dict()

@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, Query, Request
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
@@ -17,6 +18,7 @@ from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
 from shop_common.idempotency import IdempotencyStore
 from shop_common.logging import configure_logging, get_logger
+from shop_common.metrics import CHECKOUT_TOTAL, ORDER_STUCK, install_metrics
 from shop_common.outbox import OutboxRelay, enqueue
 from shop_common.tasks import run_task_loop
 from sqlalchemy import select
@@ -305,6 +307,8 @@ async def _expire_unpaid_once() -> None:
     # 事务提交后再释放库存；释放失败可重试，不会把订单状态回滚
     for order_id in expired_ids:
         await _release_inventory(order_id, "payment_timeout")
+    # 卡单量是下单→支付链路健康度的仪表：本轮检出的超时订单数，无卡单时归零。
+    ORDER_STUCK.labels("order").set(len(expired_ids))
     if expired_ids:
         logger.info("兜底关闭超时未支付订单 %s 笔", len(expired_ids))
 
@@ -569,6 +573,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="order-service", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "order")
+install_metrics(app, "order")
 
 
 class OrderItemInput(BaseModel):
@@ -675,6 +680,7 @@ async def create_order(
         # 库存不足也把已取消订单缓存为幂等结果，重复提交同一幂等键得到一致响应。
         with contextlib.suppress(Exception):
             await idem.finish(scope, idempotency_key, result)
+        CHECKOUT_TOTAL.labels("order", "insufficient_stock").inc()
         raise ApiError("CONFLICT", "库存不足，订单已取消", details={"order": result, "reason": reason})
 
     # 库存锁定后再创建支付单；支付不可用则取消订单并释放库存，避免长期占用库存。
@@ -696,6 +702,7 @@ async def create_order(
         await _release_inventory(order.id, "payment_unavailable", ensure_closed=False)
         with contextlib.suppress(Exception):
             await idem.finish(scope, idempotency_key, result)
+        CHECKOUT_TOTAL.labels("order", "payment_unavailable").inc()
         raise ApiError("CONFLICT", "支付服务不可用，订单已取消", details={"order": result})
 
     async with get_session_factory()() as session:
@@ -711,6 +718,7 @@ async def create_order(
         result = order.to_dict()
 
     await idem.finish(scope, idempotency_key, result)
+    CHECKOUT_TOTAL.labels("order", "success").inc()
     return result
 
 
@@ -786,13 +794,26 @@ async def order_timeline(order_id: str, principal: PrincipalDep) -> dict[str, An
 
 
 @app.post("/orders/{order_id}/cancel")
-async def cancel_order(order_id: str, principal: PrincipalDep, reason: str = "user_cancelled") -> dict[str, Any]:
+async def cancel_order(order_id: str, principal: PrincipalDep, request: Request, reason: str = "user_cancelled") -> dict[str, Any]:
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
         if not principal.is_staff() and order.user_id != principal.user_id:
             raise ApiError("FORBIDDEN", "无权取消该订单")
+        before = {"status": order.status}
         _cancel(order, session, reason)
         enqueue(session, "order", "order.cancelled", {"order_id": order.id, "reason": reason})
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="order.cancel",
+            target_type="order",
+            target_id=order.id,
+            before=before,
+            after={"status": order.status, "reason": reason},
+            request=request,
+            tenant=order.tenant,
+        )
         await session.commit()
         result = order.to_dict()
     # 取消落库成功后释放库存；释放接口幂等，重复取消不会二次回补。
@@ -801,28 +822,54 @@ async def cancel_order(order_id: str, principal: PrincipalDep, reason: str = "us
 
 
 @app.post("/orders/{order_id}/ship")
-async def mark_shipped(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
+async def mark_shipped(order_id: str, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     # 人工整单发货：把订单行标记为全部发出，用于履约系统异常时的人工兜底
     principal.require_staff()
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
+        before = {"status": order.status}
         _apply(session, order, "ship", actor=principal.user_id)
         for item in order.items or []:
             item["shipped_qty"] = int(item.get("qty", 0))
         _touch_items(order)
         order.shipped_at = datetime.now(UTC)
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="order.ship",
+            target_type="order",
+            target_id=order.id,
+            before=before,
+            after={"status": order.status},
+            request=request,
+            tenant=order.tenant,
+        )
         await session.commit()
         return order.to_dict()
 
 
 @app.post("/orders/{order_id}/complete")
-async def mark_completed(order_id: str, principal: PrincipalDep) -> dict[str, Any]:
+async def mark_completed(order_id: str, principal: PrincipalDep, request: Request) -> dict[str, Any]:
     # 完成订单属于后台操作，必须 staff；状态机只允许 SHIPPED → COMPLETED。
     principal.require_staff()
     async with get_session_factory()() as session:
         order = await _load(session, order_id)
+        before = {"status": order.status}
         _apply(session, order, "deliver", actor=principal.user_id)
         order.completed_at = datetime.now(UTC)
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="order.complete",
+            target_type="order",
+            target_id=order.id,
+            before=before,
+            after={"status": order.status},
+            request=request,
+            tenant=order.tenant,
+        )
         await session.commit()
         return order.to_dict()
 
