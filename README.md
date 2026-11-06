@@ -34,10 +34,11 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
     └── aftersales(8005) │     └─ 证据账本 TraceLedger
                          │
               Redis Streams（订单 / 履约 / 售后事件）
-              PostgreSQL 16（每服务独立 DB）
+              MySQL 8（每服务独立 DB）
+              MongoDB 7（Harness 记忆与运行轨迹）
 ```
 
-生产目标拓扑：两台应用主机跑 Compose 栈，LB 终止 TLS，PostgreSQL/Redis 托管；新增 `identity`（账号）、`payment`（支付/退款/总账/对账）、`audit`（审计）、`notify`（通知）四个服务，且只暴露 gateway 与 web。
+生产目标拓扑：两台应用主机跑 Compose 栈，LB 终止 TLS，MySQL/MongoDB/Redis 托管；新增 `identity`（账号）、`payment`（支付/退款/总账/对账）、`audit`（审计）、`notify`（通知）四个服务，且只暴露 gateway 与 web。
 
 | 服务 | 端口 | 职责 | 数据所有权 | 状态 |
 |---|---|---|---|---|
@@ -47,14 +48,14 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | order | 8003 | 订单状态机、支付编排、退款聚合、Saga 补偿 | order_db | 已实现 |
 | fulfillment | 8004 | 履约单、部分发货、SLA 超时扫描、发货/签收 | fulfillment_db | 已实现 |
 | aftersales | 8005 | 售后单、政策引擎、风险评分、行级退款审批 | aftersales_db | 已实现 |
-| harness | 8006 | 技能准入、工具权限、沙箱、MCP、记忆、Trace | harness_db | 已实现 |
+| harness | 8006 | 技能准入、工具权限、沙箱、MCP、记忆、Trace | MongoDB `shop_harness` | 已实现 |
 | identity | 8007 | 注册、登录、refresh 轮换、角色授予 | identity_db | 已实现（M1） |
 | payment | 8008 | 支付单、退款、复式总账、回调幂等、日终对账 | payment_db | 已实现（M2，Mock 渠道） |
 | audit | 8009 | 长期审计、查询、导出 | audit_db | 规划（M3） |
 | notify | 8010 | 发货/退款/审批通知 | notify_db | 规划（Should） |
 | web | 5173 | 商城前台 / 订单售后 / 运营后台 / Agent 对话 | — | 已实现 |
 
-技术栈：Python 3.11 · FastAPI · SQLAlchemy 2.0（async）· Pydantic v2 · PostgreSQL 16 · Redis 7（Lua + Streams）· React 18 · Vite · TypeScript · Docker Compose。
+技术栈：Python 3.11 · FastAPI · SQLAlchemy 2.0（async）· Pydantic v2 · MySQL 8 · MongoDB 7 · Redis 7（Lua + Streams）· React 18 · Vite · TypeScript · Docker Compose。
 
 ### 与常见 Demo 的差别
 
@@ -201,8 +202,8 @@ cd web && npm install && npm run build
 - **信任**：`community(T1) < reviewed(T2) < vendor(T3) < certified(T4)`。manifest 只能声明，不能提权；T1/T2 永远没有脚本执行权。
 - **审批**：不可逆动作返回 `needs_approval`，落 Redis `shop:harness:pending:{run_id}`，只由运营人员通过 `/runs/{id}/approve` 重放。
 - **MCP**：自研 JSON-RPC 2.0 协议层，支持 `initialize / ping / tools/list / tools/call`，HTTP 与 stdio 两种传输。
-- **记忆**：工作记忆（Redis 列表）、情节记忆（哈希 n-gram 向量）、语义事实（正则抽取）；召回分 = `0.6*相似度 + 0.25*重要性 + 0.15*时间衰减`。
-- **证据**：每次运行写 `.harness/traces/{run_id}.jsonl`，证据卡带 `sha256` 摘要，可回放、可核对。
+- **记忆**：工作记忆（Redis 列表）、情节/语义记忆（MongoDB `memory_records`，哈希 n-gram 向量）；召回分 = `0.6*相似度 + 0.25*重要性 + 0.15*时间衰减`。
+- **证据**：每次运行的轨迹写 MongoDB `agent_traces`（一次 run 一个文档），证据卡带 `sha256` 摘要，可回放、可核对。
 - **生产边界**：面向顾客只读 + 提议；主模型 + 降级模型（15s 超时、3 次失败熔断 5 分钟、熔断后固定话术 + 转人工）；单会话工具/token 预算；PII 脱敏；沙箱独立 runner。
 
 ---

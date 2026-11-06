@@ -4,7 +4,7 @@
 
 | 组件 | 版本 | 用途 |
 |---|---|---|
-| Docker + Compose | 24+ / v2+ | 一键起 PostgreSQL、Redis、八个业务服务与前端 |
+| Docker + Compose | 24+ / v2+ | 一键起 MySQL、MongoDB、Redis、八个业务服务与前端 |
 | Python | 3.11+ | 本地单测与离线冒烟 |
 | Node.js | 20+ | 前端构建 |
 
@@ -36,13 +36,18 @@ docker compose logs -f --tail=100 order               # 看日志
 docker compose down -v                                # 连数据库卷一起清掉
 ```
 
-`down -v` 会删除 `pgdata`，属于破坏性操作，执行前确认没有需要保留的数据。
+`down -v` 会删除 `mysqldata` 与 `mongodata`，属于破坏性操作，执行前确认没有需要保留的数据。
 
-已有 `pgdata` 卷时 `infra/postgres/init.sql` 不会重跑；M2 新增 `payment_db`，升级时需要手动建库：
+已有 `mysqldata` 卷时 `infra/mysql/init.sql` 不会重跑；新增库或补授权需要手动执行（`payment_db` 已写进 init.sql，老卷升级时按下面补齐）：
 
 ```bash
-docker compose exec postgres psql -U shop -c 'CREATE DATABASE payment_db;'
+docker compose exec mysql mysql -uroot -p -e \
+  'CREATE DATABASE IF NOT EXISTS payment_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;'
+docker compose exec mysql mysql -uroot -p -e \
+  "GRANT ALL PRIVILEGES ON payment_db.* TO 'shop'@'%';"
 ```
+
+MongoDB 的集合与索引由 `infra/mongo/init.js` 建好；服务首次写入时也会幂等补建，不需要迁移脚本。
 
 ## 3. 本地验证（不依赖 Docker）
 

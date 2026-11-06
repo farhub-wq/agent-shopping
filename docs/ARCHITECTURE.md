@@ -16,7 +16,7 @@
 数据面      catalog · inventory · order · fulfillment · aftersales
             每服务独立数据库，服务间只通过 HTTP 契约与事件通信
                  │
-基础设施    PostgreSQL 16 / Redis 7（库存原子脚本 + Streams + 幂等 + 工作记忆）
+基础设施    MySQL 8（每服务独立库）/ MongoDB 7（Harness 文档）/ Redis 7（库存原子脚本 + Streams + 幂等 + 工作记忆）
 ```
 
 ### 数据所有权
@@ -28,7 +28,7 @@
 | order | order_db | 订单、金额、状态轨迹、地址 | 库存、物流轨迹 |
 | fulfillment | fulfillment_db | 履约单、SLA、运单号 | 订单金额 |
 | aftersales | aftersales_db | 售后单、风险评分、审批结论 | 订单状态（只能发事件申请） |
-| harness | harness_db | 记忆（情节/语义） | 任何业务主数据 |
+| harness | MongoDB `shop_harness` | 记忆（情节/语义）、Agent 运行轨迹 | 任何业务主数据 |
 
 ## 2. 一次下单的时序
 
@@ -133,7 +133,7 @@ tool_calls ──> ToolRegistry.execute
 | 层 | 存储 | 写入时机 | 读取 |
 |---|---|---|---|
 | 工作记忆 | Redis list `shop:mem:work:{session}` | 每轮对话 | 最近 6–8 条注入 prompt |
-| 情节记忆 | harness_db `memory_records` | 每轮 + 显式 remember | 混合打分召回 top-k |
+| 情节记忆 | MongoDB `memory_records` | 每轮 + 显式 remember | 混合打分召回 top-k |
 | 语义事实 | 同上（`kind=semantic`） | 正则抽取（称呼/地址/偏好/过敏） | 重要性 0.85，长期保留 |
 
 召回分 `0.6*cosine + 0.25*importance + 0.15*recency`，相似度 ≥0.92 视为重复并更新，避免记忆膨胀。向量是确定性哈希 n-gram（每 gram 三次投影降碰撞），离线可用；接真实 embedding 时只替换 `HashingEmbedder`。

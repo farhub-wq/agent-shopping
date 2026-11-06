@@ -100,7 +100,7 @@
 
 | # | 事实 | 影响 |
 |---|---|---|
-| C1 | Python 3.11 + FastAPI + SQLAlchemy async；PostgreSQL 16 + Redis 7 | 技术栈不变，需求不能要求更换运行时 |
+| C1 | Python 3.11 + FastAPI + SQLAlchemy async；MySQL 8 + MongoDB 7 + Redis 7 | 技术栈不变，需求不能要求更换运行时 |
 | C2 | 五业务服务各自独立库，跨服务只走 HTTP / 事件 | 需求不得要求跨库 join |
 | C3 | 状态变更必须走 `resolve_target`，事件必须走 outbox | 新需求不得绕过 |
 | C4 | 库存扣减必须走 Lua 脚本 | 任何促销/秒杀需求都复用该路径 |

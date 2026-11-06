@@ -14,7 +14,7 @@
 | 生产标准 | 生产级非功能 + 真实交易闭环；功能守 V1 边界 |
 | 峰值 | 下单 30 TPS、浏览 300 QPS、SKU 5 万、日订单 3 万 |
 | 可用性 | 单区域 99.5%，下单 P95 <800ms |
-| 部署 | 两台应用主机跑 Compose，前置 LB，PostgreSQL/Redis 托管，不引入 K8s |
+| 部署 | 两台应用主机跑 Compose，前置 LB，MySQL/MongoDB/Redis 托管，不引入 K8s |
 | 租户 / 仓 | 单租户（全表预留并强制过滤 `tenant_id`）；单仓（预留 `warehouse_id`） |
 | 资金 | 独立 `payment` 服务；聚合支付托管收银台；内部复式总账 + 日终对账 |
 | 库存 | DB 为最终真相，Redis Lua 为原子闸门；允许极短少卖，绝不超卖 |
@@ -57,7 +57,7 @@ flowchart LR
       A --- Adb[(aftersales_db)]
     end
     subgraph 控制面
-      H --- Hdb[(harness_db)]
+      H --- Hdb[(MongoDB shop_harness)]
     end
     subgraph 生产新增
       ID --- IDdb[(identity_db)]
@@ -79,7 +79,7 @@ flowchart LR
 
 - 两台应用主机各跑一套 `docker compose -f docker-compose.yml -f docker-compose.prod.yml`；应用无状态，会话不落本机。
 - LB 终止 TLS，只转发到两台主机的 `gateway` 与 `web`；其余服务不映射宿主机端口，只在 `backend` 内网可达。
-- PostgreSQL/Redis 使用云托管实例（或至少独立主机）；`identity`、`payment`、`audit`、五个业务服务全部走内网。
+- MySQL/MongoDB/Redis 使用云托管实例（或至少独立主机）；`identity`、`payment`、`audit`、五个业务服务全部走内网。
 - 生产 overlay：`restart: unless-stopped`、CPU/内存上限、JSON 日志轮转（50MB × 5）、`healthcheck`、`ports: !reset []`（需 Compose v2.24+）。
 - 启动顺序：托管 DB/Redis → identity/payment/业务服务 → gateway → web；启动时校验默认密钥直接拒绝启动。
 - 单机 Compose 仅用于本地开发；生产双主机 + 托管 DB 才能承诺 99.5%。
@@ -364,4 +364,4 @@ sequenceDiagram
 | 沙箱 runner 逃逸 | 宿主被控 | 独立主机、无 socket、无网络、固定镜像、审计 |
 | 备份未演练 | 故障不可恢复 | 季度演练纳入上线检查单 |
 
-**仍需业务提供的事实**：聚合支付服务商与商户号、主/备模型供应商与预算、云厂商与托管 PG/Redis 规格、域名/备案/TLS、客服流程与退款审批人。
+**仍需业务提供的事实**：聚合支付服务商与商户号、主/备模型供应商与预算、云厂商与托管 MySQL/MongoDB/Redis 规格、域名/备案/TLS、客服流程与退款审批人。

@@ -120,5 +120,5 @@ docker compose -f docker-compose.yml config -q
 1. 在 GitHub 开启 `main` 分支保护与 required checks（见第 2 节）。
 2. 配置 `AI_REVIEW_API_KEY` 与 `AI_REVIEW_BASE_URL` / `AI_REVIEW_MODEL`。
 3. 为 GHCR 包设置可见性（默认私有；生产拉取需登录或改为 public）。
-4. 部署主机的 `.env` 注入 `JWT_SECRET`、数据库/Redis 地址等生产密钥，禁止使用默认值。
-5. 按设计文档完成双主机、LB、托管 PostgreSQL/Redis 与备份演练后，再启用自动部署。
+4. 部署主机的 `.env` 注入 `JWT_SECRET`、MySQL/MongoDB/Redis 地址等生产密钥，禁止使用默认值。
+5. 按设计文档完成双主机、LB、托管 MySQL/MongoDB/Redis 与备份演练后，再启用自动部署。
