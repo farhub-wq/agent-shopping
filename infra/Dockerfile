@@ -15,6 +15,7 @@ RUN apt-get update \
 COPY pyproject.toml ./
 COPY packages ./packages
 COPY services ./services
+COPY migrations ./migrations
 
 RUN pip install --upgrade pip && pip install -e .
 
@@ -23,4 +24,6 @@ ENV SERVICE_NAME=${SERVICE_NAME}
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn ${SERVICE_NAME}.app:app --host 0.0.0.0 --port 8000"]
+# 启动前执行数据库迁移：仅带关系库的服务有 migrations/<svc>/ 目录，
+# gateway/harness 无该目录时自动跳过，避免无库服务误跑 Alembic。
+CMD ["sh", "-c", "if [ -f migrations/${SERVICE_NAME}/alembic.ini ]; then alembic -c migrations/${SERVICE_NAME}/alembic.ini upgrade head; fi && uvicorn ${SERVICE_NAME}.app:app --host 0.0.0.0 --port 8000"]
