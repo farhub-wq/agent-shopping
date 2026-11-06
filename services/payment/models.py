@@ -20,6 +20,8 @@ class Payment(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(36), default="default", index=True)
+    # 支付单归属用户：mock 收银台与支付确认按此校验，防止跨用户代付/窥探他人支付单
+    user_id: Mapped[str] = mapped_column(String(36), default="", index=True)
     # 一单一个支付单：order_id 唯一索引同时承担业务约束与创建幂等兜底
     order_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     provider: Mapped[str] = mapped_column(String(32), default="mock")

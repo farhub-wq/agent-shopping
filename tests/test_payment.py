@@ -23,6 +23,11 @@ def _operator_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _customer_headers(user_id: str = "buyer-1") -> dict[str, str]:
+    token = create_token(user_id=user_id, role="customer")
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture(scope="module")
 def client():
     # 单测关闭中继/扫描任务，避免依赖 Redis 常驻进程
@@ -33,11 +38,11 @@ def client():
         yield test_client
 
 
-def _create_payment(client: TestClient, amount: int = 500) -> dict:
+def _create_payment(client: TestClient, amount: int = 500, user_id: str = "tester") -> dict:
     order_id = str(uuid.uuid4())
     response = client.post(
         "/payments",
-        json={"order_id": order_id, "amount_cents": amount, "currency": "CNY"},
+        json={"order_id": order_id, "amount_cents": amount, "currency": "CNY", "user_id": user_id},
         headers=_operator_headers(),
     )
     assert response.status_code == 201, response.text
@@ -49,6 +54,38 @@ def _signed_callback(payload: dict) -> tuple[bytes, dict[str, str]]:
     ts = str(int(time.time()))
     sig = callback_signature(settings.payment_webhook_secret, ts, raw)
     return raw, {"X-Payment-Timestamp": ts, "X-Payment-Signature": sig}
+
+
+def test_mock_pay_rejects_cross_user(client):
+    # 支付确认按归属隔离：他人支付单不可被代付
+    payment = _create_payment(client, 500, user_id="buyer-1")
+    assert (
+        client.post(f"/payments/cashier/{payment['id']}/pay", headers=_customer_headers("buyer-2")).status_code
+        == 403
+    )
+
+
+def test_mock_pay_allows_owner_and_staff(client):
+    payment = _create_payment(client, 500, user_id="buyer-1")
+    # 本人可支付
+    assert (
+        client.post(f"/payments/cashier/{payment['id']}/pay", headers=_customer_headers("buyer-1")).status_code
+        == 200
+    )
+    # 运营可代付
+    other = _create_payment(client, 300, user_id="buyer-2")
+    assert (
+        client.post(f"/payments/cashier/{other['id']}/pay", headers=_operator_headers()).status_code
+        == 200
+    )
+
+
+def test_mock_cashier_rejects_cross_user(client):
+    payment = _create_payment(client, 500, user_id="buyer-1")
+    assert (
+        client.get(f"/payments/cashier/{payment['id']}", headers=_customer_headers("buyer-2")).status_code
+        == 403
+    )
 
 
 def test_callback_is_signed_and_idempotent(client):

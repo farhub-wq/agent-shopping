@@ -246,6 +246,7 @@ async def _create_payment(order: Order) -> dict[str, Any] | None:
                 "amount_cents": order.amount_cents,
                 "currency": order.currency,
                 "tenant": order.tenant,
+                "user_id": order.user_id,
             },
             headers=signed_identity_headers("system", "operator", order.tenant),
         )

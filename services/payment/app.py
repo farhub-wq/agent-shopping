@@ -123,6 +123,7 @@ class CreatePaymentReq(BaseModel):
     amount_cents: int = Field(gt=0)
     currency: str = Field(default="CNY", max_length=8)
     tenant: str = Field(default="default", max_length=36)
+    user_id: str = Field(min_length=1, max_length=36)
 
 
 @app.post("/payments", status_code=201)
@@ -150,6 +151,7 @@ async def create_payment(payload: CreatePaymentReq, principal: PrincipalDep) -> 
         payment = Payment(
             id=payment_id,
             tenant_id=payload.tenant,
+            user_id=payload.user_id,
             order_id=payload.order_id,
             provider=provider.name,
             provider_txn_id=created.provider_txn_id,
@@ -309,7 +311,7 @@ async def _apply_callback(event: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.get("/payments/cashier/{payment_id}", response_class=HTMLResponse)
-async def mock_cashier(payment_id: str) -> HTMLResponse:
+async def mock_cashier(payment_id: str, principal: PrincipalDep) -> HTMLResponse:
     """本地 mock 收银台：真实渠道会跳转到服务商托管页面。"""
     if not _mock_enabled():
         raise ApiError("NOT_FOUND", "接口不存在")
@@ -317,6 +319,9 @@ async def mock_cashier(payment_id: str) -> HTMLResponse:
         payment = await session.get(Payment, payment_id)
         if payment is None:
             raise ApiError("NOT_FOUND", "支付单不存在")
+        # 收银台页面含他人订单号与金额，校验归属防止 IDOR
+        if not principal.is_staff() and payment.user_id != principal.user_id:
+            raise ApiError("FORBIDDEN", "无权查看该支付单")
     amount = f"{payment.amount_cents / 100:.2f}"
     if payment.status != "pending":
         body = f"<p>支付单状态：{payment.status}</p>"
@@ -334,7 +339,7 @@ async def mock_cashier(payment_id: str) -> HTMLResponse:
 
 
 @app.post("/payments/cashier/{payment_id}/pay")
-async def mock_pay(payment_id: str) -> dict[str, Any]:
+async def mock_pay(payment_id: str, principal: PrincipalDep) -> dict[str, Any]:
     """模拟用户在收银台完成支付：构造与真实渠道一致的回调报文并走完整验签流程。"""
     if not _mock_enabled():
         raise ApiError("NOT_FOUND", "接口不存在")
@@ -342,6 +347,9 @@ async def mock_pay(payment_id: str) -> dict[str, Any]:
         payment = await session.get(Payment, payment_id)
         if payment is None:
             raise ApiError("NOT_FOUND", "支付单不存在")
+        # 支付确认是用户动作：只允许本人或运营代付，防止拿到他人 payment_id 替别人完成支付
+        if not principal.is_staff() and payment.user_id != principal.user_id:
+            raise ApiError("FORBIDDEN", "无权支付该订单")
         if payment.status in {"paid", "refunded"}:
             return {"status": payment.status, "idempotent": True}
         if payment.status == "expired":
