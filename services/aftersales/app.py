@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 redis: Redis | None = None
 bus: EventBus | None = None
 order_client = ServiceClient(settings.order_url)
+payment_client = ServiceClient(settings.payment_url)
 
 
 def _forward(principal: Principal) -> dict[str, str]:
@@ -48,13 +49,19 @@ async def lifespan(_: FastAPI):
     redis = create_redis(settings.redis_url)
     bus = EventBus(redis, namespace="shop")
     relay = OutboxRelay(get_session_factory(), bus)
-    task = asyncio.create_task(relay.run_forever())
+    tasks = [
+        asyncio.create_task(relay.run_forever()),
+        # 退款结果由 payment 服务出款后回填，工单不主动轮询
+        asyncio.create_task(bus.run_consumer("payment", "aftersales-svc", "aftersales-1", handle_payment_event)),
+    ]
     try:
         yield
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await redis.close()
 
 
@@ -68,6 +75,9 @@ class TicketCreate(BaseModel):
     reason: str = Field(min_length=2)
     description: str = ""
     amount_cents: int | None = None
+    # 行级售后：指定订单行与数量；两者都不传表示整单退款
+    order_item_id: str | None = None
+    quantity: int | None = Field(default=None, gt=0)
 
 
 class Proposal(BaseModel):
@@ -82,15 +92,85 @@ async def _notify_order(ticket: AfterSaleTicket, event: str, extra: dict | None 
 
 
 async def _approve(ticket: AfterSaleTicket) -> None:
-    # 通过动作同时落状态、决策时间与事件；调用方负责 commit，保证三者在一个事务里
+    # 通过动作只落本地决策状态；出款由调用方在事务提交后请求 payment 服务
     ticket.status = "approved"
     ticket.decided_at = datetime.now(UTC)
-    await _notify_order(ticket, "after-sales.approved", {"amount_cents": ticket.amount_cents})
+
+
+async def _request_refund(ticket: AfterSaleTicket, principal: Principal) -> None:
+    """审批通过后请求 payment 出款；按 ticket_id 幂等，重复调用不会重复打款。"""
+    with contextlib.suppress(ApiError):
+        await payment_client.request(
+            "POST",
+            "/payments/refunds",
+            json={
+                "order_id": ticket.order_id,
+                "ticket_id": ticket.id,
+                "amount_cents": ticket.amount_cents,
+                "order_item_id": ticket.order_item_id,
+                "quantity": ticket.quantity,
+            },
+            headers=_operator_forward(principal),
+        )
+
+
+async def handle_payment_event(event: dict[str, Any]) -> None:
+    """payment.refunded 回填工单：退款以支付服务的出款结果为准，不靠人工点完成。"""
+    if event.get("type") != "payment.refunded":
+        return
+    payload = event["payload"]
+    ticket_id = payload.get("ticket_id")
+    if not ticket_id:
+        return
+    async with get_session_factory()() as session:
+        ticket = await session.get(AfterSaleTicket, str(ticket_id))
+        if ticket is None or ticket.status == "refunded":
+            return
+        ticket.status = "refunded"
+        ticket.refund_id = payload.get("refund_id")
+        ticket.refunded_at = datetime.now(UTC)
+        await session.commit()
 
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "aftersales"}
+
+
+def _resolve_refund(
+    order: dict[str, Any], payload: TicketCreate
+) -> tuple[int, str | None, int]:
+    """按订单行计算可退数量与金额；所有上限以订单快照为准，客户端金额只能下调不能突破。"""
+    items = order.get("items") or []
+    if payload.order_item_id:
+        item = next((row for row in items if row.get("item_id") == payload.order_item_id), None)
+        if item is None:
+            raise ApiError("BAD_REQUEST", "订单行不存在或不属于该订单")
+        available_qty = int(item.get("qty", 0)) - int(item.get("refunded_qty", 0))
+        if available_qty <= 0:
+            raise ApiError("CONFLICT", "该订单行已全部退款")
+        qty = payload.quantity or available_qty
+        if qty > available_qty:
+            raise ApiError("CONFLICT", f"该订单行最多还能退 {available_qty} 件")
+        paid = int(item.get("paid_amount_cents") or int(item.get("price_cents", 0)) * int(item.get("qty", 0)))
+        remaining = paid - int(item.get("refunded_amount_cents", 0))
+        # 退整行剩余数量时直接取剩余金额，避免单价取整导致几分的残留可退额
+        default_amount = remaining if qty == available_qty else int(item.get("price_cents", 0)) * qty
+        amount = payload.amount_cents or default_amount
+        if amount <= 0 or amount > remaining:
+            raise ApiError("CONFLICT", f"该订单行最多还能退 {remaining} 分")
+        return amount, payload.order_item_id, qty
+
+    if payload.quantity:
+        raise ApiError("BAD_REQUEST", "整单退款不能指定数量")
+    # 整单退款不落到具体行，无法拆分部分金额；为避免 item 余量与实际退款不一致，
+    # 只允许一次退完剩余全部金额，部分金额必须选择订单行
+    available = int(order["amount_cents"]) - int(order.get("refund_amount_cents", 0))
+    if payload.amount_cents is not None and payload.amount_cents != available:
+        raise ApiError("BAD_REQUEST", "整单退款必须退剩余全部金额，部分退款请选择订单行")
+    if available <= 0:
+        raise ApiError("CONFLICT", "该订单已无可退金额")
+    return available, None, 0
 
 
 @app.post("/aftersales/tickets", status_code=201)
@@ -100,8 +180,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
     if order["status"] not in {"PAID", "SHIPPED", "COMPLETED", "REFUNDING"}:
         raise ApiError("CONFLICT", "当前订单状态不支持发起售后")
     created_at = datetime.fromisoformat(order["created_at"])
-    # 未指定金额时默认全额退款，金额口径统一以订单金额为准
-    amount = payload.amount_cents or order["amount_cents"]
+    amount, order_item_id, quantity = _resolve_refund(order, payload)
 
     async with get_session_factory()() as session:
         # 只统计近 30 天本人工单数作为频次风控信号，时间窗口固定避免历史数据拖累判定
@@ -125,6 +204,8 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
             id=str(uuid.uuid4()),
             ticket_no=f"AS{datetime.now(UTC):%Y%m%d}{uuid.uuid4().hex[:6].upper()}",
             order_id=payload.order_id,
+            order_item_id=order_item_id,
+            quantity=quantity,
             user_id=principal.user_id,
             type=payload.type,
             reason=payload.reason,
@@ -149,15 +230,8 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
         ticket_dict = ticket.to_dict()
 
     if ticket.status == "approved":
-        # 自动通过后触发退款；退款失败不回滚工单结论，工单保持 approved 交由后续人工或补偿处理
-        with contextlib.suppress(ApiError):
-            await order_client.request(
-                "POST",
-                f"/orders/{ticket.order_id}/refund",
-                json={"amount_cents": ticket.amount_cents},
-                # 退款是内部资金动作，需以 operator 身份调用订单服务而非发起人的原始角色
-                headers=_operator_forward(principal),
-            )
+        # 自动通过后触发退款；退款失败不回滚工单结论，保持 approved 等待重试（payment 按 ticket_id 幂等）
+        await _request_refund(ticket, principal)
     return {**ticket_dict, "policy": result}
 
 
@@ -227,15 +301,8 @@ async def approve(ticket_id: str, principal: PrincipalDep, payload: Decision | N
         await session.commit()
         result = ticket.to_dict()
 
-    # 本地已落库后再请求订单侧退款；失败不阻断响应，避免工单状态与外部调用被强行绑死
-    with contextlib.suppress(ApiError):
-        await order_client.request(
-            "POST",
-            f"/orders/{ticket.order_id}/refund",
-            json={"amount_cents": ticket.amount_cents},
-            # 与自动通过一致，以 operator 身份发起资金动作
-            headers=_operator_forward(principal),
-        )
+    # 本地已落库后再请求 payment 出款；失败不阻断响应，重复审批会按 ticket_id 幂等
+    await _request_refund(ticket, principal)
     return result
 
 
@@ -256,35 +323,6 @@ async def reject(ticket_id: str, principal: PrincipalDep, payload: Decision | No
         ticket.decided_at = datetime.now(UTC)
         await session.commit()
         result = ticket.to_dict()
-    # 状态提交后再通知订单侧，驳回不涉及资金，无需与本地事务强绑定
+    # 状态提交后再通知订单侧；驳回发生在出款前，订单通常尚未进入 REFUNDING，事件为安全兜底
     await _notify_order(ticket, "after-sales.rejected")
-    return result
-
-
-@app.post("/aftersales/tickets/{ticket_id}/refund-complete")
-async def refund_complete(ticket_id: str, principal: PrincipalDep) -> dict[str, Any]:
-    # 完成退款是终态落定，命中权限校验防止非员工伪造资金流程结束
-    principal.require_staff()
-    async with get_session_factory()() as session:
-        ticket = await session.get(AfterSaleTicket, ticket_id)
-        if ticket is None:
-            raise ApiError("NOT_FOUND", "售后单不存在")
-        # 必须处于 approved 才能标记退款完成：未通过就完成等于绕过审批
-        if ticket.status != "approved":
-            raise ApiError("CONFLICT", "只有已通过的售后单可完成退款")
-        ticket.status = "refunded"
-        ticket.decided_at = datetime.now(UTC)
-        await session.commit()
-        result = ticket.to_dict()
-
-    # 先通知订单服务同步订单侧退款状态，再发售后事件；两处都不参与本地事务，失败不回滚工单
-    with contextlib.suppress(ApiError):
-        await order_client.request(
-            "POST",
-            f"/orders/{ticket.order_id}/refund-complete",
-            json={},
-            # 同样以 operator 身份推进订单侧资金状态
-            headers=_operator_forward(principal),
-        )
-    await _notify_order(ticket, "after-sales.refunded", {"amount_cents": ticket.amount_cents})
     return result

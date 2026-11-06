@@ -17,6 +17,9 @@ class AfterSaleTicket(Base):
     # 工单号对用户可见，唯一索引避免重复生成造成客服对不上号
     ticket_no: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     order_id: Mapped[str] = mapped_column(String(36), index=True)
+    # 行级售后：order_item_id + quantity 为空表示整单退款
+    order_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=0)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     type: Mapped[str] = mapped_column(String(24), default="refund_only")
     reason: Mapped[str] = mapped_column(String(64))
@@ -32,6 +35,9 @@ class AfterSaleTicket(Base):
     agent_recommendation: Mapped[dict] = mapped_column(JSON, default=dict)
     # 记录决策人：policy-engine 表示自动档，其余为人工操作者的用户 ID
     decided_by: Mapped[str] = mapped_column(String(64), default="")
+    # 支付服务的退款单号与完成时间，由 payment.refunded 事件回填
+    refund_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -41,6 +47,8 @@ class AfterSaleTicket(Base):
             "id": self.id,
             "ticket_no": self.ticket_no,
             "order_id": self.order_id,
+            "order_item_id": self.order_item_id,
+            "quantity": self.quantity,
             "user_id": self.user_id,
             "type": self.type,
             "reason": self.reason,
@@ -52,6 +60,8 @@ class AfterSaleTicket(Base):
             "decision_note": self.decision_note,
             "agent_recommendation": self.agent_recommendation or {},
             "decided_by": self.decided_by,
+            "refund_id": self.refund_id,
+            "refunded_at": self.refunded_at.isoformat() if self.refunded_at else None,
             "created_at": self.created_at.isoformat(),
             "decided_at": self.decided_at.isoformat() if self.decided_at else None,
         }
