@@ -3,6 +3,7 @@
 import time
 
 import gateway.app as gateway_app
+import pytest
 from shop_common.auth import Principal
 
 
@@ -16,3 +17,48 @@ def test_forward_carries_signature():
     headers = gateway_app._forward(p, request_id="r1")
     assert headers["X-Internal-Signature"].startswith(f"{int(time.time())}.")
     assert headers["X-User-Role"] == "operator"
+
+
+class _FakeRequest:
+    """my_orders 只用到 headers，用最小替身即可。"""
+
+    headers: dict[str, str] = {}
+
+
+class _FakeResponse:
+    def json(self) -> dict:
+        return {"items": []}
+
+
+class _FakeClient:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def __aenter__(self) -> "_FakeClient":
+        return self
+
+    async def __aexit__(self, *args) -> bool:
+        return False
+
+    async def get(self, url: str, params=None, headers=None) -> _FakeResponse:
+        self.url = url
+        self.params = params
+        self.headers = headers
+        return _FakeResponse()
+
+
+@pytest.mark.asyncio
+async def test_storefront_orders_scopes_to_current_user(monkeypatch):
+    # 店铺前台「我的订单」必须强制带 user_id，staff 身份也不能顺带看到他人订单
+    fake = _FakeClient()
+    monkeypatch.setattr(gateway_app.httpx, "AsyncClient", lambda *a, **kw: fake)
+    await gateway_app.my_orders(_FakeRequest(), Principal("u1", "operator", "default"))
+    assert fake.params == {"user_id": "u1"}
+
+
+@pytest.mark.asyncio
+async def test_storefront_orders_passes_status(monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(gateway_app.httpx, "AsyncClient", lambda *a, **kw: fake)
+    await gateway_app.my_orders(_FakeRequest(), Principal("u1", "operator", "default"), status="PAID")
+    assert fake.params == {"user_id": "u1", "status": "PAID"}

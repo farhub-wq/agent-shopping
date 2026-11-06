@@ -269,9 +269,13 @@ async def checkout(request: Request, principal: PrincipalDep) -> dict[str, Any]:
 @app.get("/api/storefront/orders")
 async def my_orders(request: Request, principal: PrincipalDep, status: str | None = None) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10) as client:
+        # 店铺前台只回当前用户订单：强制带 user_id，避免 staff 身份复用后台全量列表接口看到他人订单
+        params: dict[str, str] = {"user_id": principal.user_id}
+        if status:
+            params["status"] = status
         response = await client.get(
             f"{settings.order_url}/orders",
-            params={"status": status} if status else {},
+            params=params,
             headers=_forward(principal, _request_id(request)),
         )
     return response.json()
