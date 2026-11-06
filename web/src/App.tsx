@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes, useNavigate } from "react-router-dom";
-import { cartItems, getSession, login, logout, refreshSession, register, type Session } from "./lib/api";
+import { ApiError, cartItems, getSession, login, logout, refreshSession, register, type Session } from "./lib/api";
 import Home from "./pages/Home";
 import Product from "./pages/Product";
 import Cart from "./pages/Cart";
 import Orders from "./pages/Orders";
 import Ops from "./pages/Ops";
+import Audit from "./pages/Audit";
+import Mfa from "./pages/Mfa";
+import Chargebacks from "./pages/Chargebacks";
 import Agent from "./pages/Agent";
 
 const PHONE_PATTERN = /^1[3-9]\d{9}$/;
@@ -25,6 +28,9 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
   const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  // MFA 两步登录：密码通过但账号启用了动态码时，进入待验证状态，保留已输入的手机号与密码
+  const [mfaPending, setMfaPending] = useState(false);
+  const [otp, setOtp] = useState("");
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -49,7 +55,32 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
       const next = await login(phone.trim(), password);
       onSession(next);
       setShowLogin(false);
+      setMfaPending(false);
+      setOtp("");
       // 运营/管理员登录后直接进入后台，顾客仍留在商城流程；角色来自服务端返回值
+      if (next.role !== "customer") navigate("/ops");
+    } catch (err) {
+      // 账号启用了双因素认证：密码已通过，切到动态码输入而不是当作失败
+      if (err instanceof ApiError && err.code === "MFA_REQUIRED") {
+        setMfaPending(true);
+        return;
+      }
+      setError(err instanceof Error ? err.message : "操作失败");
+    }
+  };
+
+  const submitOtp = async () => {
+    setError("");
+    if (!/^\d{6}$/.test(otp)) {
+      setError("请输入 6 位动态验证码");
+      return;
+    }
+    try {
+      const next = await login(phone.trim(), password, otp);
+      onSession(next);
+      setShowLogin(false);
+      setMfaPending(false);
+      setOtp("");
       if (next.role !== "customer") navigate("/ops");
     } catch (err) {
       setError(err instanceof Error ? err.message : "操作失败");
@@ -71,6 +102,12 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
         <NavLink to="/agent">智能助手</NavLink>
         {/* 运营后台入口只对运营/管理员开放；顾客侧不显示，服务端仍会再校验。 */}
         {(session?.role === "operator" || session?.role === "admin") && <NavLink to="/ops">运营后台</NavLink>}
+        {/* 审计日志是更敏感的只读数据，仅管理员可见。 */}
+        {session?.role === "admin" && <NavLink to="/audit">审计日志</NavLink>}
+        {/* 管理员自己的双因素认证设置，仅管理员可见。 */}
+        {session?.role === "admin" && <NavLink to="/mfa">安全设置</NavLink>}
+        {/* 拒付处置是资金风险操作，运营与管理员都可见，服务端再校验。 */}
+        {(session?.role === "operator" || session?.role === "admin") && <NavLink to="/chargebacks">拒付处理</NavLink>}
       </nav>
       <div className="actions">
         <button className="ghost" onClick={() => navigate("/cart")}>
@@ -86,20 +123,40 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
       </div>
       {showLogin && (
         <div className="login-panel">
-          <label>
-            手机号
-            <input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="13800000000" />
-          </label>
-          <label>
-            密码
-            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-          </label>
-          <button className="primary" onClick={submit}>{mode === "login" ? "登录" : "注册并登录"}</button>
-          {/* 把账号规则前置展示，避免用户试错后才发现格式要求 */}
-          <p className="hint">手机号 11 位；密码 8-72 位</p>
-          <button className="ghost small" onClick={() => setMode(mode === "login" ? "register" : "login")}>
-            {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
-          </button>
+          {mfaPending ? (
+            <>
+              <p className="hint">该账号已启用双因素认证，请输入验证器中的 6 位动态验证码</p>
+              <label>
+                动态验证码
+                <input
+                  value={otp}
+                  onChange={(event) => setOtp(event.target.value)}
+                  placeholder="6 位数字"
+                  inputMode="numeric"
+                  maxLength={6}
+                />
+              </label>
+              <button className="primary" onClick={submitOtp}>验证并登录</button>
+              <button className="ghost small" onClick={() => { setMfaPending(false); setError(""); }}>返回</button>
+            </>
+          ) : (
+            <>
+              <label>
+                手机号
+                <input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="13800000000" />
+              </label>
+              <label>
+                密码
+                <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+              </label>
+              <button className="primary" onClick={submit}>{mode === "login" ? "登录" : "注册并登录"}</button>
+              {/* 把账号规则前置展示，避免用户试错后才发现格式要求 */}
+              <p className="hint">手机号 11 位；密码 8-72 位</p>
+              <button className="ghost small" onClick={() => setMode(mode === "login" ? "register" : "login")}>
+                {mode === "login" ? "没有账号？去注册" : "已有账号？去登录"}
+              </button>
+            </>
+          )}
           {error && <p className="form-error">{error}</p>}
         </div>
       )}
@@ -126,6 +183,9 @@ export default function App() {
           <Route path="/cart" element={<Cart />} />
           <Route path="/orders" element={<Orders />} />
           <Route path="/ops" element={<Ops />} />
+          <Route path="/audit" element={<Audit />} />
+          <Route path="/mfa" element={<Mfa />} />
+          <Route path="/chargebacks" element={<Chargebacks />} />
           <Route path="/agent" element={<Agent />} />
         </Routes>
       </main>

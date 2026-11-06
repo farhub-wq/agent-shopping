@@ -20,6 +20,51 @@ export interface CartItem {
   qty: number;
 }
 
+// 审计日志：与 audit 服务 /audit/logs 响应一致，before/after 为脱敏后的变更快照
+export interface AuditLog {
+  id: string;
+  occurred_at: string;
+  service: string;
+  actor_id: string;
+  actor_role: string;
+  tenant_id: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  request_id: string;
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown> | null;
+  ip_hash: string;
+}
+
+export interface AuditLogPage {
+  items: AuditLog[];
+  page: number;
+  size: number;
+  total: number;
+}
+
+// 拒付（chargeback）：payment 服务 /payments/chargebacks 响应；金额单位为分
+export interface Chargeback {
+  id: string;
+  payment_id: string;
+  order_id: string;
+  provider_case_id: string;
+  amount_cents: number;
+  currency: string;
+  status: "opened" | "won" | "lost";
+  reason: string;
+  opened_at: string;
+  closed_at: string | null;
+}
+
+export interface ChargebackPage {
+  items: Chargeback[];
+  page: number;
+  size: number;
+  total: number;
+}
+
 export function getSession(): Session | null {
   const raw = localStorage.getItem(SESSION_KEY);
   return raw ? (JSON.parse(raw) as Session) : null;
@@ -59,15 +104,27 @@ async function readError(response: Response): Promise<string> {
   return body.message || `请求失败 (${response.status})`;
 }
 
-// 登录只提交手机号与密码；角色永远由服务端按 DB 下发，前端不传角色
-export async function login(phone: string, password: string): Promise<Session> {
+// 后端错误体约定 { code, message }；code 用于区分 MFA_REQUIRED 等可恢复状态
+export class ApiError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
+// 登录只提交手机号与密码（MFA 时附带动态码）；角色永远由服务端按 DB 下发，前端不传角色
+export async function login(phone: string, password: string, otp?: string): Promise<Session> {
   const response = await fetch("/api/auth/login", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ phone, password }),
+    body: JSON.stringify({ phone, password, ...(otp ? { otp } : {}) }),
   });
-  if (!response.ok) throw new Error(await readError(response));
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { code?: string; message?: string };
+    throw new ApiError(body.code || "UNKNOWN", body.message || `登录失败 (${response.status})`);
+  }
   return applyAuth((await response.json()) as AuthPayload);
 }
 
@@ -79,6 +136,32 @@ export async function register(phone: string, password: string): Promise<void> {
     body: JSON.stringify({ phone, password }),
   });
   if (!response.ok) throw new Error(await readError(response));
+}
+
+export interface MfaStatus {
+  enabled: boolean;
+}
+
+export interface MfaEnroll {
+  otpauth_url: string;
+  secret: string;
+}
+
+// 管理员 MFA：绑定/确认/关闭/状态查询，均需 admin 身份，走统一 request 注入 Bearer token
+export function getMfaStatus(): Promise<MfaStatus> {
+  return request<MfaStatus>("/auth/mfa");
+}
+
+export function enrollMfa(): Promise<MfaEnroll> {
+  return request<MfaEnroll>("/auth/mfa/enroll", { method: "POST" });
+}
+
+export function confirmMfa(code: string): Promise<MfaStatus> {
+  return request<MfaStatus>("/auth/mfa/confirm", { method: "POST", body: JSON.stringify({ code }) });
+}
+
+export function disableMfa(password: string): Promise<MfaStatus> {
+  return request<MfaStatus>("/auth/mfa/disable", { method: "POST", body: JSON.stringify({ password }) });
 }
 
 // 双提交 CSRF：读非 HttpOnly 的 shop_csrf Cookie，刷新/登出时回放到 Header
@@ -206,6 +289,29 @@ export const api = {
   evidence: (runId: string) => request(`/agents/runs/${runId}/evidence`),
   opsOrders: (status?: string) => request(`/orders${status ? `?status=${status}` : ""}`),
   memory: (userId: string) => request(`/agents/memory/${userId}`),
+  // 审计日志只对 admin 开放，服务端再校验一次；筛选字段可空，空值不拼进查询串
+  listAuditLogs: (params: { action?: string; target_type?: string; target_id?: string; actor_id?: string; page?: number; size?: number } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => value !== undefined && value !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return request<AuditLogPage>(`/audit/logs${query ? `?${query}` : ""}`);
+  },
+  // 拒付列表：状态过滤 + 分页，空值不拼进查询串；处置按争议单号调 payment 服务
+  chargebacks: (params: { status?: string; page?: number; size?: number } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => value !== undefined && value !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return request<ChargebackPage>(`/payments/chargebacks${query ? `?${query}` : ""}`);
+  },
+  resolveChargeback: (chargebackId: string, outcome: "won" | "lost") =>
+    request(`/payments/chargebacks/${chargebackId}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ outcome }),
+    }),
 };
 
 export function cartItems(): CartItem[] {
