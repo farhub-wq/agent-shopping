@@ -16,6 +16,7 @@ from shop_common.events import EventBus, create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
+from shop_common.tasks import run_task_loop
 from sqlalchemy import select
 
 from .models import Shipment, ShipmentItem
@@ -79,45 +80,35 @@ async def handle_order_paid(event: dict[str, Any]) -> None:
         logger.info("已为订单 %s 创建履约单", order_id)
 
 
-async def sla_scanner() -> None:
-    """履约超时扫描：超时不是等用户投诉才发现，而是主动触发告警与升级。"""
-    while True:
-        # 固定 30 秒轮询：超时告警允许分钟级延迟，换取低频扫描，避免频繁压库
-        await asyncio.sleep(30)
-        try:
-            async with get_session_factory()() as session:
-                # 只扫「未发货 + 未标记 + 已过截止时间」的履约单；sla_flagged 作为去重标记，防止同一单反复告警
-                overdue = (
-                    (
-                        await session.execute(
-                            select(Shipment).where(
-                                Shipment.status == "pending",
-                                Shipment.sla_flagged.is_(False),
-                                Shipment.deadline_at < datetime.now(UTC),
-                            )
-                        )
+async def _sla_scan_once() -> None:
+    """单轮履约超时扫描：超时不是等用户投诉才发现，而是主动触发告警与升级。"""
+    async with get_session_factory()() as session:
+        # 只扫「未发货 + 未标记 + 已过截止时间」的履约单；sla_flagged 作为去重标记，防止同一单反复告警
+        overdue = (
+            (
+                await session.execute(
+                    select(Shipment).where(
+                        Shipment.status == "pending",
+                        Shipment.sla_flagged.is_(False),
+                        Shipment.deadline_at < datetime.now(UTC),
                     )
-                    .scalars()
-                    .all()
                 )
-                for shipment in overdue:
-                    shipment.sla_flagged = True
-                    # 超时事件与标记位在同一事务内入 outbox，保证「已告警」与「已发事件」不会各自丢失
-                    enqueue(
-                        session,
-                        "fulfillment",
-                        "fulfillment.sla_breached",
-                        {"shipment_id": shipment.id, "order_id": shipment.order_id},
-                    )
-                if overdue:
-                    await session.commit()
-                    logger.warning("检测到 %s 条履约超时", len(overdue))
-        except asyncio.CancelledError:
-            # 服务关闭时取消任务属于正常路径，向上抛出交由 lifespan 收敛
-            raise
-        except Exception:
-            # 单轮扫描失败不能杀死常驻任务，记录堆栈后继续下一轮
-            logger.exception("履约超时扫描失败")
+            )
+            .scalars()
+            .all()
+        )
+        for shipment in overdue:
+            shipment.sla_flagged = True
+            # 超时事件与标记位在同一事务内入 outbox，保证「已告警」与「已发事件」不会各自丢失
+            enqueue(
+                session,
+                "fulfillment",
+                "fulfillment.sla_breached",
+                {"shipment_id": shipment.id, "order_id": shipment.order_id},
+            )
+        if overdue:
+            await session.commit()
+            logger.warning("检测到 %s 条履约超时", len(overdue))
 
 
 @asynccontextmanager
@@ -126,13 +117,13 @@ async def lifespan(_: FastAPI):
     configure_logging("fulfillment")
     await init_models()
     redis = create_redis(settings.redis_url)
-    bus = EventBus(redis, namespace="shop")
+    bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     relay = OutboxRelay(get_session_factory(), bus)
     tasks = [
         # 三组长驻任务：outbox 投递、订单事件消费、SLA 扫描，随应用生命周期统一启动与取消
         asyncio.create_task(relay.run_forever()),
         asyncio.create_task(bus.run_consumer("order", "fulfillment-svc", "fulfillment-1", handle_order_paid)),
-        asyncio.create_task(sla_scanner()),
+        asyncio.create_task(run_task_loop("fulfillment-sla", redis, get_session_factory(), 30, _sla_scan_once)),
     ]
     try:
         yield

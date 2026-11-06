@@ -47,7 +47,7 @@ async def lifespan(_: FastAPI):
     configure_logging("aftersales")
     await init_models()
     redis = create_redis(settings.redis_url)
-    bus = EventBus(redis, namespace="shop")
+    bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     relay = OutboxRelay(get_session_factory(), bus)
     tasks = [
         asyncio.create_task(relay.run_forever()),

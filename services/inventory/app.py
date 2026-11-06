@@ -14,6 +14,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
+from shop_common.tasks import run_task_loop
 from sqlalchemy import select
 
 from .models import Reservation, Restock, Stock
@@ -84,56 +85,48 @@ async def seed_stocks() -> None:
     await sync_hot_stock()
 
 
-async def expire_stale_reservations() -> None:
-    """预占超时未支付必须回补库存，否则大促期间库存会被幽灵订单吃光。
+async def _expire_stale_once() -> None:
+    """单轮超时预占回补：预占超时未支付必须回补库存，否则大促期间库存会被幽灵订单吃光。
 
     释放前必须确认支付单已关闭（非 pending）：兜底扫描是最后防线，
     支付单仍 pending 或查询失败则 fail closed 等下一轮，宁少卖不超卖。
     """
-    while True:
-        await asyncio.sleep(30)
-        try:
-            now = datetime.now(UTC)
-            async with get_session_factory()() as session:
-                stale = (
-                    (
-                        await session.execute(
-                            select(Reservation).where(
-                                Reservation.status == "reserved", Reservation.expires_at < now
-                            )
-                        )
+    now = datetime.now(UTC)
+    async with get_session_factory()() as session:
+        stale = (
+            (
+                await session.execute(
+                    select(Reservation).where(
+                        Reservation.status == "reserved", Reservation.expires_at < now
                     )
-                    .scalars()
-                    .all()
                 )
-            by_order: dict[str, list[Reservation]] = {}
-            for row in stale:
-                by_order.setdefault(row.order_id, []).append(row)
-            for order_id in by_order:
-                if not await _payment_releasable(order_id):
-                    continue
-                async with get_session_factory()() as session:
-                    # 重新取当前仍为 reserved 的行，避免与并发提交/释放互相踩。
-                    rows = (
-                        (
-                            await session.execute(
-                                select(Reservation).where(
-                                    Reservation.order_id == order_id,
-                                    Reservation.status == "reserved",
-                                )
-                            )
+            )
+            .scalars()
+            .all()
+        )
+    by_order: dict[str, list[Reservation]] = {}
+    for row in stale:
+        by_order.setdefault(row.order_id, []).append(row)
+    for order_id in by_order:
+        if not await _payment_releasable(order_id):
+            continue
+        async with get_session_factory()() as session:
+            # 重新取当前仍为 reserved 的行，避免与并发提交/释放互相踩。
+            rows = (
+                (
+                    await session.execute(
+                        select(Reservation).where(
+                            Reservation.order_id == order_id,
+                            Reservation.status == "reserved",
                         )
-                        .scalars()
-                        .all()
                     )
-                    if rows:
-                        await _release_locked(session, rows, reason="expired")
-                        await session.commit()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # 单轮扫描失败只记日志，不能让它退出后台守护任务。
-            logger.exception("超时预占扫描失败")
+                )
+                .scalars()
+                .all()
+            )
+            if rows:
+                await _release_locked(session, rows, reason="expired")
+                await session.commit()
 
 
 async def _payment_releasable(order_id: str) -> bool:
@@ -159,28 +152,20 @@ async def _payment_releasable(order_id: str) -> bool:
     return False
 
 
-async def reconcile_stock() -> None:
-    """每 5 分钟比对 Redis 与 DB：DB 是真相源，差异以 DB 为准重建并告警。
+async def _reconcile_once() -> None:
+    """单轮对账：比对 Redis 与 DB，DB 是真相源，差异以 DB 为准重建并告警。
 
-    对账兜住 Redis 重启、Lua 与事务失败留下的漂移；当前单实例运行，
-    Unit C 引入 redis_lock 后改为多实例互斥。
+    对账兜住 Redis 重启、Lua 与事务失败留下的漂移；多实例下由 run_task_loop 的锁互斥。
     """
-    while True:
-        await asyncio.sleep(300)
-        try:
-            async with get_session_factory()() as session:
-                rows = (await session.execute(select(Stock))).scalars().all()
-            for row in rows:
-                expected = max(row.total - row.reserved, 0)
-                key = stock_key(row.sku)
-                current = await r().get(key)
-                if current is None or int(current) != expected:
-                    await _sync_script(keys=[key], args=[expected])
-                    logger.warning("库存对账重建 sku=%s redis=%s db=%s", row.sku, current, expected)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("库存对账任务失败")
+    async with get_session_factory()() as session:
+        rows = (await session.execute(select(Stock))).scalars().all()
+    for row in rows:
+        expected = max(row.total - row.reserved, 0)
+        key = stock_key(row.sku)
+        current = await r().get(key)
+        if current is None or int(current) != expected:
+            await _sync_script(keys=[key], args=[expected])
+            logger.warning("库存对账重建 sku=%s redis=%s db=%s", row.sku, current, expected)
 
 
 async def _release_locked(session, rows: list[Reservation], *, reason: str) -> None:
@@ -212,9 +197,10 @@ async def lifespan(_: FastAPI):
     _sync_script = redis.register_script(SYNC_STOCK)
     await seed_stocks()
     # 后台任务与 HTTP 服务同生命周期，关闭时统一取消并等待退出。
+    # 超时预占回补与对账都用 run_task_loop 加分布式锁，多实例下只有一个执行。
     tasks = [
-        asyncio.create_task(expire_stale_reservations()),
-        asyncio.create_task(reconcile_stock()),
+        asyncio.create_task(run_task_loop("inventory-expire-reservations", redis, get_session_factory(), 30, _expire_stale_once)),
+        asyncio.create_task(run_task_loop("inventory-reconcile", redis, get_session_factory(), 300, _reconcile_once)),
     ]
     try:
         yield

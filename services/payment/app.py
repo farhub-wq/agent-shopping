@@ -24,6 +24,7 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
+from shop_common.tasks import run_task_loop
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
@@ -50,42 +51,34 @@ def _mock_enabled() -> bool:
     return settings.env == "dev" and settings.payment_mock_mode
 
 
-async def expire_payments() -> None:
-    """超时未支付的支付单必须关闭并通知订单，否则库存会被幽灵订单长期占用。"""
-    while True:
-        # 30 秒轮询：过期关单允许分钟级延迟，换取更低扫描压力
-        await asyncio.sleep(30)
-        try:
-            now = datetime.now(UTC)
-            async with get_session_factory()() as session:
-                rows = (
-                    (
-                        await session.execute(
-                            select(Payment).where(
-                                Payment.status == "pending", Payment.expires_at < now
-                            )
-                        )
+async def _expire_payments_once() -> None:
+    """单轮超时关单：超时未支付的支付单必须关闭并通知订单，否则库存会被幽灵订单长期占用。"""
+    now = datetime.now(UTC)
+    async with get_session_factory()() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Payment).where(
+                        Payment.status == "pending", Payment.expires_at < now
                     )
-                    .scalars()
-                    .all()
                 )
-                for payment in rows:
-                    payment.status = "expired"
-                    # 状态与事件同事务入 outbox，避免「已关单但订单没收到」
-                    enqueue(
-                        session,
-                        "payment",
-                        "payment.expired",
-                        {"payment_id": payment.id, "order_id": payment.order_id},
-                        tenant=payment.tenant_id,
-                    )
-                if rows:
-                    await session.commit()
-                    logger.info("关闭超时支付单 %s 笔", len(rows))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("支付单超时扫描失败")
+            )
+            .scalars()
+            .all()
+        )
+        for payment in rows:
+            payment.status = "expired"
+            # 状态与事件同事务入 outbox，避免「已关单但订单没收到」
+            enqueue(
+                session,
+                "payment",
+                "payment.expired",
+                {"payment_id": payment.id, "order_id": payment.order_id},
+                tenant=payment.tenant_id,
+            )
+        if rows:
+            await session.commit()
+            logger.info("关闭超时支付单 %s 笔", len(rows))
 
 
 @asynccontextmanager
@@ -96,12 +89,12 @@ async def lifespan(_: FastAPI):
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
         redis = create_redis(settings.redis_url)
-        bus = EventBus(redis, namespace="shop")
+        bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         relay = OutboxRelay(get_session_factory(), bus)
         # outbox 投递与超时关单随应用生命周期统一启动
         tasks = [
             asyncio.create_task(relay.run_forever()),
-            asyncio.create_task(expire_payments()),
+            asyncio.create_task(run_task_loop("payment-expire", redis, get_session_factory(), 30, _expire_payments_once)),
         ]
     try:
         yield

@@ -18,6 +18,7 @@ from shop_common.http import ServiceClient
 from shop_common.idempotency import IdempotencyStore
 from shop_common.logging import configure_logging, get_logger
 from shop_common.outbox import OutboxRelay, enqueue
+from shop_common.tasks import run_task_loop
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -253,57 +254,49 @@ async def _create_payment(order: Order) -> dict[str, Any] | None:
         return None
 
 
-async def expire_unpaid_orders() -> None:
-    """订单侧兜底关单：覆盖「库存已锁但支付单未建成」和支付事件丢失的窗口。"""
-    while True:
-        # 扫描周期比支付单 TTL 粗，保证正常支付回调总是先于兜底关单到达
-        await asyncio.sleep(60)
-        try:
-            now = datetime.now(UTC)
-            expired_ids: list[str] = []
-            async with get_session_factory()() as session:
-                rows = (
-                    (
-                        await session.execute(
-                            select(Order).where(
-                                Order.status.in_({"RESERVED", "PAYING"}),
-                                (
-                                    (Order.payment_expires_at.is_not(None) & (Order.payment_expires_at < now))
-                                    | (
-                                        Order.payment_id.is_(None)
-                                        & (
-                                            Order.created_at
-                                            < now - timedelta(seconds=settings.payment_ttl_seconds)
-                                        )
-                                    )
-                                ),
+async def _expire_unpaid_once() -> None:
+    """单轮超时关单：覆盖「库存已锁但支付单未建成」和支付事件丢失的窗口。"""
+    now = datetime.now(UTC)
+    expired_ids: list[str] = []
+    async with get_session_factory()() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.status.in_({"RESERVED", "PAYING"}),
+                        (
+                            (Order.payment_expires_at.is_not(None) & (Order.payment_expires_at < now))
+                            | (
+                                Order.payment_id.is_(None)
+                                & (
+                                    Order.created_at
+                                    < now - timedelta(seconds=settings.payment_ttl_seconds)
+                                )
                             )
-                        )
+                        ),
                     )
-                    .scalars()
-                    .all()
                 )
-                for order in rows:
-                    _cancel(order, session, "payment_timeout")
-                    enqueue(
-                        session,
-                        "order",
-                        "order.cancelled",
-                        {"order_id": order.id, "reason": "payment_timeout"},
-                        tenant=order.tenant,
-                    )
-                    expired_ids.append(order.id)
-                if expired_ids:
-                    await session.commit()
-            # 事务提交后再释放库存；释放失败可重试，不会把订单状态回滚
-            for order_id in expired_ids:
-                await _release_inventory(order_id, "payment_timeout")
-            if expired_ids:
-                logger.info("兜底关闭超时未支付订单 %s 笔", len(expired_ids))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("订单超时关单扫描失败")
+            )
+            .scalars()
+            .all()
+        )
+        for order in rows:
+            _cancel(order, session, "payment_timeout")
+            enqueue(
+                session,
+                "order",
+                "order.cancelled",
+                {"order_id": order.id, "reason": "payment_timeout"},
+                tenant=order.tenant,
+            )
+            expired_ids.append(order.id)
+        if expired_ids:
+            await session.commit()
+    # 事务提交后再释放库存；释放失败可重试，不会把订单状态回滚
+    for order_id in expired_ids:
+        await _release_inventory(order_id, "payment_timeout")
+    if expired_ids:
+        logger.info("兜底关闭超时未支付订单 %s 笔", len(expired_ids))
 
 
 # 补偿扫单覆盖的三类失步窗口，所有补偿操作都幂等，可无限重放
@@ -312,72 +305,64 @@ _LATE_REFUND_REASONS = {"payment_timeout", "payment_expired"}
 _COMMITTED_STATUSES = {"PAID", "SHIPPING", "SHIPPED", "COMPLETED", "REFUNDING", "REFUNDED"}
 
 
-async def _compensation_sweeper() -> None:
-    """周期性补偿：迟到支付退款重试、库存提交重试、库存回补重放。"""
-    while True:
-        # 与超时关单同周期；补偿操作全部幂等，重复执行无副作用
-        await asyncio.sleep(60)
-        try:
+async def _compensation_once() -> None:
+    """单轮补偿：迟到支付退款重试、库存提交重试、库存回补重放。"""
+    async with get_session_factory()() as session:
+        late = (
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.status == "CANCELLED",
+                        Order.paid_at.is_not(None),
+                        Order.cancel_reason.in_(_LATE_REFUND_REASONS),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending_commit = (
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.status.in_(_COMMITTED_STATUSES),
+                        Order.inventory_committed.is_(False),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        pending_restock = (
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.status.in_(_COMMITTED_STATUSES),
+                        Order.inventory_committed.is_(True),
+                        Order.refund_amount_cents > 0,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        late_refs = [(row.id, row.amount_cents) for row in late]
+        commit_ids = [row.id for row in pending_commit]
+        restock_refs = [(row.id, _restock_targets(row.items)) for row in pending_restock]
+    # 外部调用全部放在会话外，避免长事务占连接
+    for order_id, amount in late_refs:
+        await _refund_late_payment(order_id, amount)
+    for order_id in commit_ids:
+        # 永久失败（预占已被 TTL 释放）会持续返回 False 并打 ERROR 日志，按决策告警后人工处理
+        if await _commit_inventory(order_id):
             async with get_session_factory()() as session:
-                late = (
-                    (
-                        await session.execute(
-                            select(Order).where(
-                                Order.status == "CANCELLED",
-                                Order.paid_at.is_not(None),
-                                Order.cancel_reason.in_(_LATE_REFUND_REASONS),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                pending_commit = (
-                    (
-                        await session.execute(
-                            select(Order).where(
-                                Order.status.in_(_COMMITTED_STATUSES),
-                                Order.inventory_committed.is_(False),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                pending_restock = (
-                    (
-                        await session.execute(
-                            select(Order).where(
-                                Order.status.in_(_COMMITTED_STATUSES),
-                                Order.inventory_committed.is_(True),
-                                Order.refund_amount_cents > 0,
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                late_refs = [(row.id, row.amount_cents) for row in late]
-                commit_ids = [row.id for row in pending_commit]
-                restock_refs = [(row.id, _restock_targets(row.items)) for row in pending_restock]
-            # 外部调用全部放在会话外，避免长事务占连接
-            for order_id, amount in late_refs:
-                await _refund_late_payment(order_id, amount)
-            for order_id in commit_ids:
-                # 永久失败（预占已被 TTL 释放）会持续返回 False 并打 ERROR 日志，按决策告警后人工处理
-                if await _commit_inventory(order_id):
-                    async with get_session_factory()() as session:
-                        row = await session.get(Order, order_id)
-                        if row is not None:
-                            row.inventory_committed = True
-                            await session.commit()
-            for order_id, targets in restock_refs:
-                if targets:
-                    await _restock_inventory(order_id, targets)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("订单补偿扫单失败")
+                row = await session.get(Order, order_id)
+                if row is not None:
+                    row.inventory_committed = True
+                    await session.commit()
+    for order_id, targets in restock_refs:
+        if targets:
+            await _restock_inventory(order_id, targets)
 
 
 async def handle_event(event: dict[str, Any]) -> None:
@@ -538,17 +523,18 @@ async def _startup() -> list[asyncio.Task]:
     global redis, bus, idem
     await init_models()
     redis = create_redis(settings.redis_url)
-    bus = EventBus(redis, namespace="shop")
+    bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     idem = IdempotencyStore(redis, namespace="shop")
     relay = OutboxRelay(get_session_factory(), bus)
-    # 同进程内并行跑 outbox 投递和两个消费组；消费组各自的游标保证不重复消费同一条消息。
+    # 同进程内并行跑 outbox 投递和三个消费组；消费组各自的游标保证不重复消费同一条消息。
+    # 两个补偿/兜底扫描用 run_task_loop 加分布式锁，多实例下只有一个会执行。
     tasks = [
         asyncio.create_task(relay.run_forever()),
         asyncio.create_task(bus.run_consumer("fulfillment", "order-svc", "order-1", handle_event)),
         asyncio.create_task(bus.run_consumer("aftersales", "order-svc", "order-2", handle_event)),
         asyncio.create_task(bus.run_consumer("payment", "order-svc", "order-3", handle_event)),
-        asyncio.create_task(expire_unpaid_orders()),
-        asyncio.create_task(_compensation_sweeper()),
+        asyncio.create_task(run_task_loop("order-expire-unpaid", redis, get_session_factory(), 60, _expire_unpaid_once)),
+        asyncio.create_task(run_task_loop("order-compensation", redis, get_session_factory(), 60, _compensation_once)),
     ]
     return tasks
 

@@ -7,14 +7,20 @@ Redis 已在库存热点路径上，少一个中间件就少一类部署故障�
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .logging import get_logger
+from .tables import DeadEvent, ProcessedEvent
 
 logger = get_logger(__name__)
 
@@ -27,28 +33,25 @@ class EventBus:
         redis: Redis,
         namespace: str = "shop",
         *,
+        session_factory: async_sessionmaker[AsyncSession],
         reclaim_idle_ms: int = 30_000,
         max_deliveries: int = 5,
         reclaim_batch: int = 10,
     ) -> None:
         self.redis = redis
         self.namespace = namespace
+        # 去重与死信都落在服务自己的库里，消费幂等靠 DB 唯一索引兜底。
+        self.session_factory = session_factory
         # pending 回收参数：消费失败或进程崩溃的事件不会被 XREADGROUP ">" 读到，
         # 必须按空闲时长认领重投；超过最大投递次数转入死信，避免无限重试拖住消费组。
         self.reclaim_idle_ms = reclaim_idle_ms
         self.max_deliveries = max_deliveries
         self.reclaim_batch = reclaim_batch
+        self._last_purge = time.monotonic()
 
     def _stream(self, topic: str) -> str:
         # key 统一带命名空间，方便同一 Redis 实例上多个环境/应用互不干扰。
         return f"{self.namespace}:events:{topic}"
-
-    def _dead_stream(self, topic: str) -> str:
-        return f"{self.namespace}:events:{topic}:dead"
-
-    def _dedupe_key(self, topic: str, group: str, event_id: str) -> str:
-        # 去重键按 topic + 消费组 + 事件 ID 隔离，不同消费组各自消费同一事件不会被互相吞掉。
-        return f"{self.namespace}:dedupe:{topic}:{group}:{event_id}"
 
     async def publish(
         self,
@@ -119,13 +122,12 @@ class EventBus:
     ) -> bool:
         """处理单条事件；返回是否真正执行了 handler（重复事件 ack 跳过返回 False）。"""
         event_id = fields.get("id", message_id)
-        dedupe = self._dedupe_key(topic, group, event_id)
         if redelivered:
             # 原消费者可能在写占位后崩溃，残留的占位会让重投的同一事件被当成重复直接 ack，
             # 因此重投递前先清掉占位（handler 侧仍需幂等，认领存在短暂的并发窗口）。
-            await self.redis.delete(dedupe)
-        # SET NX 占位做消费去重：已处理的事件直接 ack 跳过，占位 24 小时后自动过期。
-        if not await self.redis.set(dedupe, "1", nx=True, ex=86400):
+            await self._clear_processed(topic, group, event_id)
+        # 写去重记录抢占处理权：已处理的事件直接 ack 跳过。
+        if not await self._claim_processed(topic, group, event_id):
             await self.redis.xack(self._stream(topic), group, message_id)
             return False
         event = {
@@ -138,11 +140,68 @@ class EventBus:
             await handler(event)
         except Exception:
             # 处理失败时删除占位且不 ack，事件留在 pending，由 _retry_pending 重投。
-            await self.redis.delete(dedupe)
+            await self._clear_processed(topic, group, event_id)
             logger.exception("事件处理失败 topic=%s group=%s id=%s", topic, group, event_id)
             return False
         await self.redis.xack(self._stream(topic), group, message_id)
         return True
+
+    async def _claim_processed(self, topic: str, group: str, event_id: str) -> bool:
+        """写入去重记录抢占处理权；已存在（并发重复）返回 False。
+
+        DB 唯一索引是最终兜底：即使两个实例同时插入，也只有一个能提交成功。
+        """
+        try:
+            async with self.session_factory() as session:
+                session.add(ProcessedEvent(topic=topic, consumer_group=group, event_id=event_id))
+                await session.commit()
+            return True
+        except IntegrityError:
+            return False
+
+    async def _clear_processed(self, topic: str, group: str, event_id: str) -> None:
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(ProcessedEvent).where(
+                    ProcessedEvent.topic == topic,
+                    ProcessedEvent.consumer_group == group,
+                    ProcessedEvent.event_id == event_id,
+                )
+            )
+            await session.commit()
+
+    async def purge_processed_events(self, *, retention_days: int = 7) -> int:
+        """清理超过保留期的去重记录，防止 processed_events 无限膨胀。"""
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        async with self.session_factory() as session:
+            result = await session.execute(delete(ProcessedEvent).where(ProcessedEvent.created_at < cutoff))
+            await session.commit()
+            return int(result.rowcount or 0)
+
+    async def replay_dead(
+        self,
+        *,
+        topic: str | None = None,
+        before: datetime | None = None,
+        event_id: str | None = None,
+    ) -> int:
+        """把死信事件重新投递回原流；成功重放后从 dead_events 删除，避免重复重放。"""
+        async with self.session_factory() as session:
+            stmt = select(DeadEvent)
+            if topic:
+                stmt = stmt.where(DeadEvent.topic == topic)
+            if event_id:
+                stmt = stmt.where(DeadEvent.event_id == event_id)
+            if before:
+                stmt = stmt.where(DeadEvent.created_at < before)
+            rows = (await session.execute(stmt)).scalars().all()
+            for row in rows:
+                await self.publish(
+                    row.topic, row.event_type, row.payload, event_id=row.event_id, tenant=row.tenant
+                )
+                await session.delete(row)
+            await session.commit()
+            return len(rows)
 
     async def _retry_pending(
         self, topic: str, group: str, consumer: str, handler: Handler
@@ -194,22 +253,24 @@ class EventBus:
         fields: dict[str, Any],
         deliveries: int,
     ) -> None:
-        await self.redis.xadd(
-            self._dead_stream(topic),
-            {
-                "id": fields.get("id", message_id),
-                "type": fields.get("type", ""),
-                "tenant": fields.get("tenant", "default"),
-                "payload": fields.get("payload", "{}"),
-                "source_message_id": message_id,
-                "group": group,
-                "deliveries": str(deliveries),
-            },
-            maxlen=1000,
-            approximate=True,
-        )
+        # 死信落库（替换 Redis 死信流）：保留原始事件供 replay 重放，避免事件不可追溯。
+        async with self.session_factory() as session:
+            session.add(
+                DeadEvent(
+                    topic=topic,
+                    consumer_group=group,
+                    event_id=fields.get("id", message_id),
+                    event_type=fields.get("type", ""),
+                    tenant=fields.get("tenant", "default"),
+                    payload=json.loads(fields.get("payload", "{}")),
+                    source_message_id=message_id,
+                    deliveries=deliveries,
+                    reason=f"超过最大投递次数 {deliveries}",
+                )
+            )
+            await session.commit()
         # 死信后允许人工重放：清掉占位，否则重放会被去重逻辑吞掉。
-        await self.redis.delete(self._dedupe_key(topic, group, fields.get("id", message_id)))
+        await self._clear_processed(topic, group, fields.get("id", message_id))
 
     async def run_consumer(
         self,
@@ -223,6 +284,13 @@ class EventBus:
         while True:
             try:
                 await self.poll(topic, group, consumer, handler)
+                # 每小时清一次过期去重记录，避免 processed_events 无限增长
+                if time.monotonic() - self._last_purge > 3600:
+                    try:
+                        await self.purge_processed_events()
+                    except Exception:
+                        logger.exception("去重记录清理失败 topic=%s", topic)
+                    self._last_purge = time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception:
