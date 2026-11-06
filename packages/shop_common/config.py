@@ -39,7 +39,20 @@ class ServiceSettings(BaseSettings):
     fulfillment_url: str = "http://localhost:8004"
     aftersales_url: str = "http://localhost:8005"
     harness_url: str = "http://localhost:8006"
+    payment_url: str = "http://localhost:8008"
+    # 浏览器可达的网关地址：mock 收银台 pay_url 必须指向这里，而不是容器内地址
+    payment_public_base_url: str = "http://localhost:8080"
     gateway_url: str = "http://localhost:8080"
+
+    # 支付渠道：本轮用 mock 沙箱，真实聚合支付只需替换 provider 实现
+    payment_provider: str = "mock"
+    payment_webhook_secret: str = "dev-payment-webhook-secret"
+    payment_ttl_seconds: int = 900
+    payment_fee_bps: int = 60
+    # 本地 mock 收银台只在 dev 且显式开启时可用，生产必须关闭
+    payment_mock_mode: bool = False
+    # 后台中继/扫描任务开关：单测关闭，避免测试依赖 Redis 与常驻任务
+    background_tasks: bool = True
 
     # 业务参数
     flash_sale_stock: int = 20

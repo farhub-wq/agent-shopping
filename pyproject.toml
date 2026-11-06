@@ -30,13 +30,13 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["packages", "services"]
-include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*"]
+include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*", "payment*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "packages", "services"]
 
 [tool.ruff]
 line-length = 100
