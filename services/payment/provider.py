@@ -74,8 +74,9 @@ class MockProvider:
         )
 
     def refund(self, *, payment_id: str, refund_id: str, amount_cents: int) -> str:
-        # Mock 渠道同步成功；真实渠道通常是异步回调，届时 refund 只返回受理号
-        return f"mockrefund_{refund_id[:8]}"
+        # Mock 渠道同步成功；真实渠道通常是异步回调，届时 refund 只返回受理号。
+        # 退款号必须全局唯一：迟到支付票据都是 latepay- 前缀，截断前 8 位会跨订单撞唯一索引。
+        return f"mockrefund_{refund_id}"
 
     def verify_callback(
         self, *, raw_body: bytes, headers: Mapping[str, str], secret: str

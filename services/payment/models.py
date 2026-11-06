@@ -57,8 +57,9 @@ class Refund(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     payment_id: Mapped[str] = mapped_column(String(36), index=True)
     order_id: Mapped[str] = mapped_column(String(36), index=True)
-    # 售后工单号唯一：同一工单重复审批不会重复出款
-    ticket_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    # 售后工单号唯一：同一工单重复审批不会重复出款。
+    # 除售后工单 UUID 外，迟到支付用 latepay-<order_id>（44 字符），列宽需覆盖两种来源。
+    ticket_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     order_item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     quantity: Mapped[int] = mapped_column(Integer, default=0)
     amount_cents: Mapped[int] = mapped_column(BigInteger)
