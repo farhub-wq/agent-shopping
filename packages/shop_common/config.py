@@ -73,6 +73,11 @@ class ServiceSettings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
     embedding_dim: int = 256
+    # 嵌入模型：base_url 与 api_key 齐备才启用真实语义向量，否则回退哈希
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
+    embedding_timeout_seconds: float = 15.0
     # 降级模型：留空则降级到内置离线确定性规划器
     llm_fallback_base_url: str = ""
     llm_fallback_api_key: str = ""

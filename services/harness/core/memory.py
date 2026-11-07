@@ -16,8 +16,10 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 from redis.asyncio import Redis
 from shop_common.config import get_settings
+from shop_common.errors import ApiError
 from shop_common.mongo import get_mongo_db
 
 settings = get_settings()
@@ -67,6 +69,41 @@ def cosine(left: list[float], right: list[float]) -> float:
     if not left or not right:
         return 0.0
     return sum(a * b for a, b in zip(left, right))
+
+
+class OpenAIEmbedder(Embedder):
+    """OpenAI 兼容 /embeddings 端点的真实语义向量；transport 仅用于单测注入 MockTransport。"""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 15.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.transport = transport
+        self.name = f"openai:{model}"
+
+    async def embed(self, text: str) -> list[float]:
+        payload = {"model": self.model, "input": text}
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
+            response = await client.post(
+                f"{self.base_url}/embeddings",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            response.raise_for_status()
+            body = response.json()
+        data = body.get("data") or []
+        # 端点缺向量属坏响应：抛 ApiError 让调用方感知，而不是静默存空向量污染记忆。
+        if not data or not isinstance(data[0].get("embedding"), list):
+            raise ApiError("EMBEDDING_FAILED", "嵌入端点返回缺少 embedding 向量")
+        return data[0]["embedding"]
 
 
 SEMANTIC_PATTERNS = [
@@ -258,3 +295,19 @@ class MemoryManager:
             }
             for row in rows
         ]
+
+
+def build_embedder() -> Embedder:
+    """按配置选择嵌入器：base_url 与 api_key 齐备才启用真实嵌入，否则退回离线哈希。
+
+    与 build_provider 同一策略——缺任一配置都不依赖外部网络，本地演示与 CI 可离线跑。
+    """
+    settings = get_settings()
+    if not (settings.embedding_base_url and settings.embedding_api_key):
+        return HashingEmbedder(settings.embedding_dim)
+    return OpenAIEmbedder(
+        settings.embedding_base_url,
+        settings.embedding_api_key,
+        settings.embedding_model,
+        timeout=settings.embedding_timeout_seconds,
+    )

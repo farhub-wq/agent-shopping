@@ -35,6 +35,7 @@ LEDGER_IMBALANCE = Counter("ledger_imbalance_total", "总账借贷不平次数",
 AGENT_TOOL_DENIED = Counter("agent_tool_denied_total", "Agent 工具被策略拒绝次数", ["service"])
 LLM_FALLBACK = Counter("llm_fallback_total", "模型降级次数", ["service"])
 LLM_CIRCUIT_OPEN = Counter("llm_circuit_open_total", "模型熔断拦截次数", ["service"])
+EMBEDDING_FALLBACK = Counter("embedding_fallback_total", "嵌入降级次数", ["service"])
 RECONCILIATION_DIFF = Gauge("reconciliation_diff_total", "对账开放差异数", ["service"])
 
 # 抓取与健康检查本身不计入 RED，避免 self-scrape 噪声
