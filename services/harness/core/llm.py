@@ -394,15 +394,15 @@ class FailoverProvider(LLMProvider):
     async def decide(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> Decision:
-        if self.breaker.allow_request():
+        if await self.breaker.allow_request():
             try:
                 decision = await self.primary.decide(system, messages, tools)
             except Exception as exc:
                 # 主模型失败：记录失败并降级；日志保留原始异常，便于区分网络故障与代码缺陷。
-                self.breaker.record_failure()
+                await self.breaker.record_failure()
                 logger.warning("主模型调用失败，降级到备用模型：%s", exc)
             else:
-                self.breaker.record_success()
+                await self.breaker.record_success()
                 decision.model = self.primary.name
                 return decision
         else:
@@ -423,21 +423,21 @@ class FailoverProvider(LLMProvider):
     ) -> AsyncIterator[Decision]:
         # 流式降级只能在「首 token 前」：已流出内容无法撤回，中途失败只能收尾，
         # 不能再叠降级模型的输出，否则前端会看到两段拼在一起的答案。
-        if self.breaker.allow_request():
+        if await self.breaker.allow_request():
             emitted = False
             try:
                 async for frame in self.primary.decide_stream(system, messages, tools):
                     emitted = True
                     yield frame
             except Exception as exc:
-                self.breaker.record_failure()
+                await self.breaker.record_failure()
                 logger.warning("主模型流式调用失败：%s", exc)
                 if emitted:
                     # 收尾帧：让前端结束 busy，不回退降级模型。
                     yield Decision(kind="final", content="", model="unavailable")
                     return
             else:
-                self.breaker.record_success()
+                await self.breaker.record_success()
                 return
         else:
             # 熔断中：不碰主模型，直接走降级模型的流。
@@ -452,7 +452,7 @@ class FailoverProvider(LLMProvider):
             yield Decision(kind="final", content=self.canned_message, model="unavailable")
 
 
-def build_provider() -> LLMProvider:
+def build_provider(redis: Any) -> LLMProvider:
     settings = get_settings()
     # 主模型两者齐备才启用；缺任一配置都退回离线规划器，
     # 保证本地演示、CI 与回归测试不依赖外部网络和 API Key。
@@ -478,7 +478,11 @@ def build_provider() -> LLMProvider:
     else:
         fallback = CannedProvider()
 
+    # 熔断状态跨 worker 共享（Redis）：主模型宕机时全集群一起开路，
+    # 不再各 worker 各自失败满阈值才熔断。
     breaker = CircuitBreaker(
+        redis,
+        "primary",
         failure_threshold=settings.llm_failure_threshold,
         cooldown_seconds=settings.llm_cooldown_seconds,
     )

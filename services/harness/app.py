@@ -54,7 +54,7 @@ async def lifespan(_: FastAPI):
     # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
     # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
     skills = {item.name: item for item in load_all(SKILL_ROOT)}
-    runtime = AgentRuntime(registry, build_provider(), skills, memory)
+    runtime = AgentRuntime(registry, build_provider(redis), skills, memory)
     # 启动时发现并注册远端 MCP 工具；放在 MCPServer 之前，让 /mcp、/tools 清单与工具网关一致。
     mcp_hub = build_mcp_hub(settings.mcp_http_servers)
     discovered = await discover_and_register(registry, mcp_hub)

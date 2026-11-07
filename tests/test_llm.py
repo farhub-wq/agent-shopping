@@ -26,6 +26,33 @@ TOOLS = [
 ]
 
 
+class _FakeRedis:
+    """熔断器依赖的最小 Redis 替身（get/set/delete/incrby/expire）。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = str(value)
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+    async def incrby(self, key, amount):
+        self.store[key] = str(int(self.store.get(key) or 0) + amount)
+        return int(self.store[key])
+
+    async def expire(self, key, seconds):
+        return None
+
+
+def _breaker(**kwargs):
+    return CircuitBreaker(_FakeRedis(), "test", **kwargs)
+
+
 def test_parse_decision_no_tool_calls_is_final():
     decision = parse_decision({"content": "你好"}, TOOLS)
     assert decision.kind == "final"
@@ -219,7 +246,7 @@ def test_build_provider_returns_failover_when_configured(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "k")
     get_settings.cache_clear()
     try:
-        assert isinstance(build_provider(), FailoverProvider)
+        assert isinstance(build_provider(_FakeRedis()), FailoverProvider)
     finally:
         get_settings.cache_clear()
 
@@ -233,7 +260,7 @@ def test_build_provider_returns_planner_without_config(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "")
     get_settings.cache_clear()
     try:
-        assert isinstance(build_provider(), DeterministicPlanner)
+        assert isinstance(build_provider(_FakeRedis()), DeterministicPlanner)
     finally:
         get_settings.cache_clear()
 
@@ -249,7 +276,7 @@ def test_build_provider_uses_canned_without_fallback_endpoint(monkeypatch):
     monkeypatch.setenv("LLM_FALLBACK_API_KEY", "")
     get_settings.cache_clear()
     try:
-        provider = build_provider()
+        provider = build_provider(_FakeRedis())
         assert isinstance(provider, FailoverProvider)
         assert isinstance(provider.fallback, CannedProvider)
     finally:
@@ -266,7 +293,7 @@ def test_build_provider_uses_openai_fallback_when_configured(monkeypatch):
     monkeypatch.setenv("LLM_FALLBACK_API_KEY", "k2")
     get_settings.cache_clear()
     try:
-        provider = build_provider()
+        provider = build_provider(_FakeRedis())
         assert isinstance(provider, FailoverProvider)
         assert isinstance(provider.fallback, OpenAICompatibleProvider)
     finally:
@@ -319,7 +346,7 @@ class _RaisingProvider(LLMProvider):
 @pytest.mark.asyncio
 async def test_failover_uses_primary_when_healthy():
     primary, fallback = _EchoProvider("A"), _EchoProvider("B")
-    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    provider = FailoverProvider(primary, fallback, _breaker())
     decision = await provider.decide("s", [], [])
     assert decision.content == "A"
     assert decision.model == "echo"
@@ -329,7 +356,7 @@ async def test_failover_uses_primary_when_healthy():
 @pytest.mark.asyncio
 async def test_failover_switches_on_primary_exception():
     fallback = _EchoProvider("B")
-    provider = FailoverProvider(_RaisingProvider(), fallback, CircuitBreaker())
+    provider = FailoverProvider(_RaisingProvider(), fallback, _breaker())
     decision = await provider.decide("s", [], [])
     assert decision.content == "B"
     assert decision.model == "echo"
@@ -337,8 +364,8 @@ async def test_failover_switches_on_primary_exception():
 
 @pytest.mark.asyncio
 async def test_failover_skips_primary_when_circuit_open():
-    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=60)
-    breaker.record_failure()  # 预置为熔断态
+    breaker = _breaker(failure_threshold=1, cooldown_seconds=60)
+    await breaker.record_failure()  # 预置为熔断态
     primary, fallback = _RaisingProvider(), _EchoProvider("B")
     provider = FailoverProvider(primary, fallback, breaker)
     decision = await provider.decide("s", [], [])
@@ -348,7 +375,7 @@ async def test_failover_skips_primary_when_circuit_open():
 
 @pytest.mark.asyncio
 async def test_failover_canned_when_both_fail():
-    provider = FailoverProvider(_RaisingProvider(), _RaisingProvider(), CircuitBreaker())
+    provider = FailoverProvider(_RaisingProvider(), _RaisingProvider(), _breaker())
     decision = await provider.decide("s", [], [])
     assert decision.kind == "final"
     assert decision.model == "unavailable"
@@ -380,7 +407,7 @@ async def test_failover_stream_relays_primary():
         [Decision(kind="delta", content="a"), Decision(kind="final", content="ab", model="stream")]
     )
     fallback = _EchoProvider("B")
-    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    provider = FailoverProvider(primary, fallback, _breaker())
     frames = [item async for item in provider.decide_stream("s", [], [])]
     assert [f.kind for f in frames] == ["delta", "final"]
     assert fallback.called is False
@@ -390,7 +417,7 @@ async def test_failover_stream_relays_primary():
 async def test_failover_stream_falls_back_before_first_token():
     primary = _StreamProvider([], fail_after=0)  # 首帧前即失败
     fallback = _EchoProvider("B")
-    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    provider = FailoverProvider(primary, fallback, _breaker())
     frames = [item async for item in provider.decide_stream("s", [], [])]
     assert frames[-1].kind == "final"
     assert frames[-1].content == "B"
@@ -400,7 +427,7 @@ async def test_failover_stream_falls_back_before_first_token():
 async def test_failover_stream_no_fallback_after_first_token():
     primary = _StreamProvider([Decision(kind="delta", content="a")], fail_after=1)
     fallback = _EchoProvider("B")
-    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    provider = FailoverProvider(primary, fallback, _breaker())
     frames = [item async for item in provider.decide_stream("s", [], [])]
     assert frames[0].kind == "delta"
     assert frames[-1].kind == "final"
