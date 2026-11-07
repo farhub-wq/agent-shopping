@@ -38,6 +38,7 @@ LLM_CIRCUIT_OPEN = Counter("llm_circuit_open_total", "模型熔断拦截次数",
 EMBEDDING_FALLBACK = Counter("embedding_fallback_total", "嵌入降级次数", ["service"])
 # kind=run 单次运行超预算；kind=user 用户当日配额耗尽
 AGENT_BUDGET_EXCEEDED = Counter("agent_budget_exceeded_total", "Agent 成本预算拦截次数", ["service", "kind"])
+AGENT_INJECTION_BLOCKED = Counter("agent_injection_blocked_total", "提示注入拦截次数", ["service"])
 RECONCILIATION_DIFF = Gauge("reconciliation_diff_total", "对账开放差异数", ["service"])
 
 # 抓取与健康检查本身不计入 RED，避免 self-scrape 噪声

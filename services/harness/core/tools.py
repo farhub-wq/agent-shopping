@@ -13,6 +13,7 @@ from shop_common.errors import ApiError
 from shop_common.logging import get_logger
 from shop_common.metrics import AGENT_TOOL_DENIED
 
+from .injection import neutralize_data
 from .policy import ToolPolicy, enforce
 
 logger = get_logger(__name__)
@@ -166,9 +167,10 @@ class ToolRegistry:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
-        # 第 4 步：输出脱敏。结构化结果递归下钻（订单收货信息就藏在 dict 里），
-        # trace 预览与 messages 回填都在本步之后，单点脱敏全覆盖。
-        data = redact_data(data)
+        # 第 4 步：输出净化 = 脱敏 + 注入中和。结构化结果递归下钻
+        # （订单收货信息、商品描述里的攻击性文本都藏在 dict 里），
+        # trace 预览与 messages 回填都在本步之后，单点净化全覆盖。
+        data = neutralize_data(redact_data(data))
         return ToolResult("ok", data=data, duration_ms=int((time.perf_counter() - started) * 1000))
 
 
