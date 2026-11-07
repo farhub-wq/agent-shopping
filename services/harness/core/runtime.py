@@ -13,7 +13,7 @@ from typing import Any
 from shop_common.errors import ApiError
 from shop_common.logging import get_logger
 
-from .llm import LLMProvider
+from .llm import Decision, LLMProvider
 from .manifest import SkillManifest
 from .memory import MemoryManager
 from .tools import ToolContext, ToolRegistry
@@ -89,14 +89,20 @@ class AgentRuntime:
         messages = [*working, {"role": "user", "content": user_message}]
         return manifest, system, messages
 
-    async def run(
+    async def _run_events(
         self,
         skill_name: str,
         user_message: str,
         ctx: ToolContext,
         *,
         max_steps: int | None = None,
-    ) -> AgentRunResult:
+        stream: bool,
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """共享 ReAct 循环：run() 排空取结果，run_stream() 映射成 SSE 事件。
+
+        产出三类元组：("trace", event) 关键工具事件（仅 stream 时）、
+        ("delta", text) 答案分片（仅 stream 时）、("done", AgentRunResult) 收尾。
+        """
         ledger = TraceLedger(ctx.run_id)
         manifest, system, messages = await self._prepare(skill_name, user_message, ctx)
         # 工具白名单取 manifest 声明与注册表的交集：
@@ -116,38 +122,54 @@ class AgentRuntime:
 
         for step in range(steps_limit):
             usage["steps"] = step + 1
-            # 每步都先落 agent.step 再执行动作：trace 顺序即真实决策顺序，
-            # 出问题时能还原模型在拿到什么信息后做了什么。
-            decision = await self.provider.decide(system, messages, specs)
+            # 流式读模型决策：delta 帧是答案分片（仅 stream 时外抛），
+            # terminal 帧才是本步实际决策；契约是 0..n 个 delta + 恰好一帧 terminal。
+            decision: Decision | None = None
+            async for frame in self.provider.decide_stream(system, messages, specs):
+                if frame.kind == "delta":
+                    if stream:
+                        yield ("delta", frame.content)
+                    continue
+                decision = frame
+                break
+            assert decision is not None  # decide_stream 契约：必产一帧 terminal
             if decision.model:
                 model_used = decision.model
             usage["prompt_chars"] += len(json.dumps(messages, ensure_ascii=False))
-            await ledger.append(
+            step_event = await ledger.append(
                 "agent.step",
                 step=step + 1,
                 kind=decision.kind,
                 tool=decision.tool or None,
                 content=(decision.content or "")[:200],
             )
+            if stream:
+                yield ("trace", step_event)
             if decision.kind == "final":
                 answer = decision.content
                 break
 
             usage["tool_calls"] += 1
-            await ledger.append("tool.call", tool=decision.tool, args=decision.args)
+            call_event = await ledger.append("tool.call", tool=decision.tool, args=decision.args)
+            if stream:
+                yield ("trace", call_event)
             result = await self.registry.execute(decision.tool, decision.args, ctx, trust=manifest.trust)
-            await ledger.append(
+            result_event = await ledger.append(
                 "tool.result",
                 tool=decision.tool,
                 status=result.status,
                 duration_ms=result.duration_ms,
                 preview=str(result.data)[:200],
             )
+            if stream:
+                yield ("trace", result_event)
             if result.status == "needs_approval":
                 # 不可逆动作到此为止：不执行、不继续推理，转存待审批负载等人工处理。
                 status = "pending_approval"
                 pending = {"tool": decision.tool, "args": decision.args, "reason": result.message}
-                await ledger.append("approval.requested", tool=decision.tool, args=decision.args)
+                approval_event = await ledger.append("approval.requested", tool=decision.tool, args=decision.args)
+                if stream:
+                    yield ("trace", approval_event)
                 break
             if result.status in {"error", "denied"}:
                 # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
@@ -223,31 +245,51 @@ class AgentRuntime:
             usage=usage,
             final_status=status,
         )
-        return AgentRunResult(
-            run_id=ledger.run_id,
-            skill=skill_name,
-            answer=answer,
-            status=status,
-            evidence=evidence,
-            trace=ledger.events,
-            pending=pending,
+        yield (
+            "done",
+            AgentRunResult(
+                run_id=ledger.run_id,
+                skill=skill_name,
+                answer=answer,
+                status=status,
+                evidence=evidence,
+                trace=ledger.events,
+                pending=pending,
+            ),
         )
+
+    async def run(
+        self,
+        skill_name: str,
+        user_message: str,
+        ctx: ToolContext,
+        *,
+        max_steps: int | None = None,
+    ) -> AgentRunResult:
+        # 非流式路径：排空共享生成器，忽略 delta/trace，只取收尾结果。
+        async for kind, payload in self._run_events(
+            skill_name, user_message, ctx, max_steps=max_steps, stream=False
+        ):
+            if kind == "done":
+                return payload
+        raise AssertionError("unreachable: _run_events 总以 done 收尾")
 
     async def run_stream(
         self, skill_name: str, user_message: str, ctx: ToolContext
     ) -> AsyncIterator[dict[str, Any]]:
-        """SSE 友好：先推步骤事件，最后推完整结果。"""
+        """SSE 友好：start 后工具轨迹实时推送、答案逐 delta 流出，final 收尾。"""
         manifest = self.skills.get(skill_name)
         if manifest is None:
             yield {"type": "error", "message": f"技能 {skill_name} 不存在"}
             return
         yield {"type": "start", "skill": skill_name, "trust": manifest.trust}
-        result = await self.run(skill_name, user_message, ctx)
-        # 只推关键事件给前端：run.start/run.end 已在 final 结果里，避免流式输出冗余。
-        for event in result.trace:
-            if event["type"] in {"agent.step", "tool.call", "tool.result", "approval.requested"}:
-                yield {"type": "trace", "event": event}
-        yield {"type": "final", "result": result.to_dict()}
+        async for kind, payload in self._run_events(skill_name, user_message, ctx, stream=True):
+            if kind == "trace":
+                yield {"type": "trace", "event": payload}
+            elif kind == "delta":
+                yield {"type": "delta", "text": payload}
+            elif kind == "done":
+                yield {"type": "final", "result": payload.to_dict()}
 
     async def approve_and_replay(self, run_id: str, ctx: ToolContext) -> AgentRunResult:
         assert self.memory.redis is not None
