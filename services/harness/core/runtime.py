@@ -109,6 +109,8 @@ class AgentRuntime:
         answer = ""
         pending: dict[str, Any] | None = None
         tool_errors = 0
+        # 记录最终答案由哪个模型产出（降级/熔断后可能是备用模型），供证据卡审计。
+        model_used = self.provider.name
 
         await ledger.append("run.start", skill=skill_name, trust=manifest.trust, user=ctx.user_id, message=user_message)
 
@@ -117,6 +119,8 @@ class AgentRuntime:
             # 每步都先落 agent.step 再执行动作：trace 顺序即真实决策顺序，
             # 出问题时能还原模型在拿到什么信息后做了什么。
             decision = await self.provider.decide(system, messages, specs)
+            if decision.model:
+                model_used = decision.model
             usage["prompt_chars"] += len(json.dumps(messages, ensure_ascii=False))
             await ledger.append(
                 "agent.step",
@@ -215,7 +219,7 @@ class AgentRuntime:
             skill=skill_name,
             skill_hash=manifest.content_hash,
             trust=manifest.trust,
-            model=self.provider.name,
+            model=model_used,
             usage=usage,
             final_status=status,
         )

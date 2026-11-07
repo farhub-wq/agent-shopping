@@ -73,6 +73,14 @@ class ServiceSettings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
     embedding_dim: int = 256
+    # 降级模型：留空则降级到内置离线确定性规划器
+    llm_fallback_base_url: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_model: str = ""
+    # 模型熔断：超时秒数 / 连续失败阈值 / 冷却秒数
+    llm_timeout_seconds: float = 15.0
+    llm_failure_threshold: int = 3
+    llm_cooldown_seconds: int = 300
 
     # 沙箱
     sandbox_enabled: bool = False

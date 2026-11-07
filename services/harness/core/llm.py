@@ -12,6 +12,9 @@ from typing import Any
 import httpx
 from shop_common.config import get_settings
 from shop_common.logging import get_logger
+from shop_common.metrics import LLM_CIRCUIT_OPEN, LLM_FALLBACK
+
+from .circuit import CircuitBreaker
 
 logger = get_logger(__name__)
 
@@ -25,6 +28,7 @@ class Decision:
     tool: str = ""
     args: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
+    model: str = ""  # 产出该决策的模型名，供证据卡审计降级/熔断来源
 
 
 class LLMProvider:
@@ -145,10 +149,11 @@ class DeterministicPlanner(LLMProvider):
 class OpenAICompatibleProvider(LLMProvider):
     name = "openai-compatible"
 
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 15.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.timeout = timeout
 
     async def decide(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -171,7 +176,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "tool_choice": "auto",
             "temperature": 0.2,
         }
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
@@ -194,12 +199,86 @@ class OpenAICompatibleProvider(LLMProvider):
         return Decision(kind="final", content=message.get("content") or "", usage=usage)
 
 
+# 双模型都不可用时的兜底话术：明确引导转人工，且必须是 final 决策，避免循环里反复试模型。
+FALLBACK_MESSAGE = "抱歉，智能客服暂时不可用，请稍后重试或联系人工客服。"
+
+
+class FailoverProvider(LLMProvider):
+    """主模型优先，失败或熔断时降级到备用模型，双模型都失败时返回固定话术。
+
+    主/降级模型调用属网络边界，异常在此被捕获并打点降级，而不是抛成 5xx 阻断客服。
+    """
+
+    name = "failover"
+
+    def __init__(
+        self,
+        primary: LLMProvider,
+        fallback: LLMProvider,
+        breaker: CircuitBreaker,
+        canned_message: str = FALLBACK_MESSAGE,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.breaker = breaker
+        self.canned_message = canned_message
+
+    async def decide(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Decision:
+        if self.breaker.allow_request():
+            try:
+                decision = await self.primary.decide(system, messages, tools)
+            except Exception as exc:
+                # 主模型失败：记录失败并降级；日志保留原始异常，便于区分网络故障与代码缺陷。
+                self.breaker.record_failure()
+                logger.warning("主模型调用失败，降级到备用模型：%s", exc)
+            else:
+                self.breaker.record_success()
+                decision.model = self.primary.name
+                return decision
+        else:
+            # 熔断中：不再对主模型发起请求，直接降级，避免 15s 超时白等。
+            LLM_CIRCUIT_OPEN.labels("harness").inc()
+
+        LLM_FALLBACK.labels("harness").inc()
+        try:
+            decision = await self.fallback.decide(system, messages, tools)
+        except Exception as exc:
+            logger.error("备用模型也调用失败，返回固定话术：%s", exc)
+            return Decision(kind="final", content=self.canned_message, model="unavailable")
+        decision.model = self.fallback.name
+        return decision
+
+
 def build_provider() -> LLMProvider:
     settings = get_settings()
-    # 两者齐备才切到真实模型；缺任一配置都退回离线规划器，
+    # 主模型两者齐备才启用；缺任一配置都退回离线规划器，
     # 保证本地演示、CI 与回归测试不依赖外部网络和 API Key。
-    if settings.llm_base_url and settings.llm_api_key:
-        logger.info("使用 OpenAI 兼容模型 %s", settings.llm_model)
-        return OpenAICompatibleProvider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
-    logger.info("未配置模型端点，使用离线确定性规划器")
-    return DeterministicPlanner()
+    if not (settings.llm_base_url and settings.llm_api_key):
+        logger.info("未配置模型端点，使用离线确定性规划器")
+        return DeterministicPlanner()
+
+    primary = OpenAICompatibleProvider(
+        settings.llm_base_url,
+        settings.llm_api_key,
+        settings.llm_model,
+        timeout=settings.llm_timeout_seconds,
+    )
+    # 降级模型：配置了就用第二个 OpenAI 兼容端点，否则退回离线确定性规划器兜底。
+    if settings.llm_fallback_base_url and settings.llm_fallback_api_key:
+        fallback: LLMProvider = OpenAICompatibleProvider(
+            settings.llm_fallback_base_url,
+            settings.llm_fallback_api_key,
+            settings.llm_fallback_model or settings.llm_model,
+            timeout=settings.llm_timeout_seconds,
+        )
+    else:
+        fallback = DeterministicPlanner()
+
+    breaker = CircuitBreaker(
+        failure_threshold=settings.llm_failure_threshold,
+        cooldown_seconds=settings.llm_cooldown_seconds,
+    )
+    logger.info("主模型 %s + 降级模型 %s", settings.llm_model, fallback.name)
+    return FailoverProvider(primary, fallback, breaker)
