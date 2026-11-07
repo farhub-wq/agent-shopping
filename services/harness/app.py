@@ -19,7 +19,7 @@ from shop_common.mongo import close_mongo
 
 from .core.llm import build_provider
 from .core.manifest import load_all, load_skill
-from .core.mcp import MCPServer
+from .core.mcp import MCPHub, MCPServer, build_mcp_hub, discover_and_register
 from .core.memory import MemoryManager
 from .core.policy import summarize
 from .core.runtime import AgentRuntime
@@ -38,12 +38,13 @@ bus: EventBus | None = None
 memory: MemoryManager | None = None
 runtime: AgentRuntime | None = None
 mcp_server: MCPServer | None = None
+mcp_hub: MCPHub | None = None
 sandbox = SandboxManager()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global redis, bus, memory, runtime, mcp_server
+    global redis, bus, memory, runtime, mcp_server, mcp_hub
     configure_logging("harness")
     # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.redis_url)
@@ -54,6 +55,10 @@ async def lifespan(_: FastAPI):
     # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
     skills = {item.name: item for item in load_all(SKILL_ROOT)}
     runtime = AgentRuntime(registry, build_provider(), skills, memory)
+    # 启动时发现并注册远端 MCP 工具；放在 MCPServer 之前，让 /mcp、/tools 清单与工具网关一致。
+    mcp_hub = build_mcp_hub(settings.mcp_http_servers)
+    discovered = await discover_and_register(registry, mcp_hub)
+    logger.info("已从 %d 个 MCP 源注册 %d 个工具", len(mcp_hub.clients), len(discovered))
     mcp_server = MCPServer("shop-agent-harness", registry)
     logger.info("已加载 %s 个技能：%s", len(skills), ", ".join(skills))
     yield
@@ -105,6 +110,7 @@ async def healthz() -> dict[str, Any]:
         "service": "harness",
         "skills": len(runtime.skills) if runtime else 0,
         "tools": len(registry.names()),
+        "mcp_sources": len(mcp_hub.clients) if mcp_hub else 0,
         "sandbox_enabled": settings.sandbox_enabled,
     }
 

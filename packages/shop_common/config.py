@@ -82,6 +82,9 @@ class ServiceSettings(BaseSettings):
     llm_failure_threshold: int = 3
     llm_cooldown_seconds: int = 300
 
+    # MCP：逗号分隔的 name=endpoint 列表，留空则不接远端 MCP Server
+    mcp_http_servers: str = ""
+
     # 沙箱
     sandbox_enabled: bool = False
     sandbox_image: str = "shop-agent-sandbox:latest"

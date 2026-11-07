@@ -235,3 +235,34 @@ def register_mcp_tools(registry: ToolRegistry, hub: MCPHub, discovered: list[dic
                 policy=ToolPolicy(name=name, permission="read", risk="low", data_class="public"),
             )
         )
+
+
+def parse_mcp_servers(raw: str) -> list[tuple[str, str]]:
+    """解析逗号分隔的 ``name=endpoint`` 列表；空串/空段跳过，格式错误记日志并跳过该段。"""
+    servers: list[tuple[str, str]] = []
+    for segment in raw.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        name, sep, endpoint = segment.partition("=")
+        name, endpoint = name.strip(), endpoint.strip()
+        if not sep or not name or not endpoint:
+            logger.warning("忽略格式错误的 MCP Server 配置段: %r", segment)
+            continue
+        servers.append((name, endpoint))
+    return servers
+
+
+def build_mcp_hub(raw: str) -> MCPHub:
+    """按配置构建 MCPHub；未配置或全部非法时返回空 hub，启动不因此失败。"""
+    hub = MCPHub()
+    for name, endpoint in parse_mcp_servers(raw):
+        hub.register(name, HTTPMCPClient(endpoint))
+    return hub
+
+
+async def discover_and_register(registry: ToolRegistry, hub: MCPHub) -> list[dict[str, Any]]:
+    """发现远端 MCP 工具并注册进本地工具网关；单 server 失败已在 refresh 内降级。"""
+    discovered = await hub.refresh()
+    register_mcp_tools(registry, hub, discovered)
+    return discovered
