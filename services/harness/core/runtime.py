@@ -8,10 +8,13 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
+from shop_common.config import get_settings
 from shop_common.errors import ApiError
 from shop_common.logging import get_logger
+from shop_common.metrics import AGENT_BUDGET_EXCEEDED
 
 from .llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from .manifest import SkillManifest
@@ -20,6 +23,25 @@ from .tools import ToolContext, ToolRegistry
 from .trace import TraceLedger
 
 logger = get_logger(__name__)
+
+settings = get_settings()
+
+# 成本护栏话术：明确告知原因与出路，不伪装成模型产出
+QUOTA_EXCEEDED_MESSAGE = "今日使用额度已用完，请明天再来或联系人工客服。"
+RUN_BUDGET_EXCEEDED_MESSAGE = "本次对话超出单次运行的成本预算，请缩小问题范围或开启新会话。"
+
+# 配额「查余量 + 扣预留」原子脚本：与库存扣减同理，check-and-set 必须落在
+# Redis 单脚本内，否则并发 run 会在 check 与 charge 之间互相超支。
+# 返回 -1 表示余量不足；否则返回预留后的账本值并刷新 TTL。
+_QUOTA_ACQUIRE_LUA = """
+local spent = tonumber(redis.call('GET', KEYS[1]) or '0')
+if spent + tonumber(ARGV[2]) > tonumber(ARGV[1]) then
+  return -1
+end
+local new_spent = redis.call('INCRBY', KEYS[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], 172800)
+return new_spent
+"""
 
 
 @dataclass
@@ -104,6 +126,39 @@ class AgentRuntime:
         ("delta", text) 答案分片（仅 stream 时）、("done", AgentRunResult) 收尾。
         """
         ledger = TraceLedger(ctx.run_id)
+        manifest = self.skills.get(skill_name)
+        if manifest is None:
+            raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
+        # 用户级每日配额：原子「查余量 + 扣预留」置于任何模型/嵌入调用之前，
+        # 拿不到预留的运行零花费，优雅收尾（话术 + trace + 证据卡）而非 SSE 中段抛异常。
+        quota_key = f"shop:harness:quota:{ctx.user_id}:{datetime.now(UTC):%Y%m%d}"
+        reserve = settings.agent_run_token_budget
+        acquired = await self.memory.redis.eval(
+            _QUOTA_ACQUIRE_LUA, 1, quota_key, settings.agent_user_daily_token_quota, reserve
+        )
+        if acquired == -1:
+            AGENT_BUDGET_EXCEEDED.labels("harness", "user").inc()
+            await ledger.append("run.quota_exceeded", skill=skill_name, user=ctx.user_id)
+            await ledger.append("run.end", status="quota_exceeded", answer=QUOTA_EXCEEDED_MESSAGE[:200])
+            yield (
+                "done",
+                AgentRunResult(
+                    run_id=ledger.run_id,
+                    skill=skill_name,
+                    answer=QUOTA_EXCEEDED_MESSAGE,
+                    status="quota_exceeded",
+                    evidence=ledger.evidence_card(
+                        skill=skill_name,
+                        skill_hash=manifest.content_hash,
+                        trust=manifest.trust,
+                        model="none",  # 未发生任何模型调用
+                        usage={"estimated_tokens": 0},
+                        final_status="quota_exceeded",
+                    ),
+                    trace=ledger.events,
+                ),
+            )
+            return
         manifest, system, messages = await self._prepare(skill_name, user_message, ctx)
         # 工具白名单取 manifest 声明与注册表的交集：
         # 声明了但没注册的忽略，注册了但没声明的不会暴露给模型。
@@ -147,6 +202,17 @@ class AgentRuntime:
                 yield ("trace", step_event)
             if decision.kind == "final":
                 answer = decision.content
+                break
+
+            # 单次运行预算：本步模型调用已发生，下一步会超支就停在这里；
+            # 不执行本步工具——执行了也没预算让模型消化结果，反而留下半截动作。
+            if usage["prompt_chars"] // 3 > settings.agent_run_token_budget:
+                status = "budget_exceeded"
+                answer = RUN_BUDGET_EXCEEDED_MESSAGE
+                AGENT_BUDGET_EXCEEDED.labels("harness", "run").inc()
+                budget_event = await ledger.append("run.budget_exceeded", prompt_chars=usage["prompt_chars"])
+                if stream:
+                    yield ("trace", budget_event)
                 break
 
             # 把「单工具」与「计划」归一成有序步骤列表：plan 超出上限截断并记 trace，
@@ -241,6 +307,10 @@ class AgentRuntime:
             answer = f"注意：本次执行中有 {tool_errors} 次工具调用失败，以下结论可能不完整。\n{answer}"
 
         usage["estimated_tokens"] = usage["prompt_chars"] // 3
+        # 结算：按「实际 - 预留」补扣/回补，单条 INCRBY 原子完成（负值即回补）。
+        # 进程崩溃时预留量泄漏，随配额键 TTL 过期自愈——有界泄漏，护栏口径可接受。
+        delta = usage["estimated_tokens"] - reserve
+        usage["user_spent_today"] = await self.memory.redis.incrby(quota_key, delta) if delta else acquired
 
         # 会话结束统一落三处记忆：工作记忆保留原文、情节记忆保留结论、
         # 语义事实在 _prepare 阶段已抽取。失败状态给更高重要性，便于后续复盘。

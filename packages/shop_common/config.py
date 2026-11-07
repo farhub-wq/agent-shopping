@@ -78,7 +78,7 @@ class ServiceSettings(BaseSettings):
     embedding_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
     embedding_timeout_seconds: float = 15.0
-    # 降级模型：留空则降级到内置离线确定性规划器
+    # 降级模型：留空则降级到固定话术（CannedProvider），不冒充模型产出
     llm_fallback_base_url: str = ""
     llm_fallback_api_key: str = ""
     llm_fallback_model: str = ""
@@ -86,6 +86,10 @@ class ServiceSettings(BaseSettings):
     llm_timeout_seconds: float = 15.0
     llm_failure_threshold: int = 3
     llm_cooldown_seconds: int = 300
+    # Agent 成本预算：单次运行估算 token 上限 / 单用户每日估算 token 配额
+    # （口径为 字符数//3 粗估，是护栏而非计费）
+    agent_run_token_budget: int = 20000
+    agent_user_daily_token_quota: int = 200000
 
     # MCP：逗号分隔的 name=endpoint 列表，留空则不接远端 MCP Server
     mcp_http_servers: str = ""

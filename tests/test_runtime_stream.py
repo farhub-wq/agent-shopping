@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
 import pytest
 from harness.core.llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from harness.core.manifest import SkillManifest
@@ -7,9 +10,10 @@ from harness.core.tools import Tool, ToolContext, ToolRegistry
 
 
 class _FakeRedis:
-    # 待审批负载重放依赖 redis 的 set/get/delete，仅保留运行时用到的三个方法。
+    # 运行时依赖：待审批负载的 set/get/delete + 成本配额的 incrby/expire。
     def __init__(self):
         self.store: dict[str, str] = {}
+        self.expires: dict[str, int] = {}
 
     async def set(self, key, value, ex=None):
         self.store[key] = value
@@ -19,6 +23,23 @@ class _FakeRedis:
 
     async def delete(self, key):
         self.store.pop(key, None)
+
+    async def incrby(self, key, amount):
+        self.store[key] = int(self.store.get(key) or 0) + amount
+        return self.store[key]
+
+    async def expire(self, key, seconds):
+        self.expires[key] = seconds
+
+    async def eval(self, script, numkeys, *args):
+        # 只服务于配额预留脚本：按 Lua 语义模拟「查余量 + 扣预留」原子操作。
+        key, quota, reserve = args[0], int(args[1]), int(args[2])
+        spent = int(self.store.get(key) or 0)
+        if spent + reserve > quota:
+            return -1
+        self.store[key] = spent + reserve
+        self.expires[key] = 172800
+        return self.store[key]
 
 
 class _FakeMemory:
@@ -197,3 +218,103 @@ async def test_plan_truncates_beyond_max(monkeypatch):
     runtime = _runtime(provider)
     result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
     assert result.evidence["usage"]["tool_calls"] == MAX_PLAN_STEPS
+
+
+@pytest.mark.asyncio
+async def test_user_quota_exceeded_makes_zero_model_calls(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider([[Decision(kind="final", content="答案", model="fake")]])
+    runtime = _runtime(provider)
+    # 预置今日账本已远超配额：接下来的运行应一次模型调用都不发生。
+    quota_key = f"shop:harness:quota:u1:{datetime.now(UTC):%Y%m%d}"
+    runtime.memory.redis.store[quota_key] = 10**9
+
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    assert result.status == "quota_exceeded"
+    assert "额度" in result.answer
+    assert len(provider.steps) == 1  # 一步都未消费：零模型调用、零嵌入调用
+    assert result.evidence["usage"]["estimated_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_budget_exceeded_skips_tool_execution(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    # 运行预算压到 0：第一步模型调用发生后就必须截断，且不得执行本步工具。
+    monkeypatch.setattr(
+        rt, "settings", SimpleNamespace(agent_run_token_budget=0, agent_user_daily_token_quota=10**9)
+    )
+    provider = _StepProvider([[Decision(kind="tool", tool="echo", args={"text": "a"}, model="fake")]])
+    runtime = _runtime(provider)
+
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    assert result.status == "budget_exceeded"
+    assert "预算" in result.answer
+    # 若误执行了 echo，循环会继续向 provider 要下一步（steps 弹空即 IndexError），
+    # 能正常收尾即证明工具未执行；trace 里也只应有 budget 事件，没有 tool.call。
+    assert any(e["type"] == "run.budget_exceeded" for e in result.trace)
+    assert not any(e["type"] == "tool.call" for e in result.trace)
+
+
+@pytest.mark.asyncio
+async def test_quota_charged_after_run(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider([[Decision(kind="final", content="答案", model="fake")]])
+    runtime = _runtime(provider)
+
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    quota_key = f"shop:harness:quota:u1:{datetime.now(UTC):%Y%m%d}"
+    charged = runtime.memory.redis.store.get(quota_key)
+    assert isinstance(charged, int) and charged > 0
+    assert runtime.memory.redis.expires[quota_key] == 172800  # 首写记账即设过期
+    assert result.evidence["usage"]["user_spent_today"] == charged
+
+
+@pytest.mark.asyncio
+async def test_quota_reservation_denies_when_remaining_below_run_budget(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    monkeypatch.setattr(
+        rt, "settings", SimpleNamespace(agent_run_token_budget=20000, agent_user_daily_token_quota=200000)
+    )
+    provider = _StepProvider([[Decision(kind="final", content="答案", model="fake")]])
+    runtime = _runtime(provider)
+    # 余量 4999 < 预留 20000：原子预留必须拒绝，不能让这次 run 挤进配额。
+    quota_key = f"shop:harness:quota:u1:{datetime.now(UTC):%Y%m%d}"
+    runtime.memory.redis.store[quota_key] = 195001
+
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    assert result.status == "quota_exceeded"
+    assert len(provider.steps) == 1  # 零模型调用
+    assert runtime.memory.redis.store[quota_key] == 195001  # 账本未被预留污染
+
+
+@pytest.mark.asyncio
+async def test_quota_reservation_allows_exact_boundary_and_settles(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    monkeypatch.setattr(
+        rt, "settings", SimpleNamespace(agent_run_token_budget=20000, agent_user_daily_token_quota=200000)
+    )
+    provider = _StepProvider([[Decision(kind="final", content="答案", model="fake")]])
+    runtime = _runtime(provider)
+    quota_key = f"shop:harness:quota:u1:{datetime.now(UTC):%Y%m%d}"
+    # 已用 180000 + 预留 20000 == 配额 200000：边界恰好够，必须放行。
+    runtime.memory.redis.store[quota_key] = 180000
+
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    assert result.status == "completed"
+    # 最终账本 = 预留前的已用量 + 本次实际估算用量（预留与回补相互抵消）。
+    assert runtime.memory.redis.store[quota_key] == 180000 + result.evidence["usage"]["estimated_tokens"]
