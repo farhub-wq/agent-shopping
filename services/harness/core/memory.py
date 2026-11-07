@@ -26,13 +26,26 @@ settings = get_settings()
 MEMORY_COLLECTION = "memory_records"
 
 
-class HashingEmbedder:
+class Embedder:
+    """嵌入器统一接口：name 标识产出的向量空间，embed 为异步接口（真实模型走网络）。"""
+
+    name: str = "base"
+
+    async def embed(self, text: str) -> list[float]:
+        raise NotImplementedError
+
+
+class HashingEmbedder(Embedder):
     """字符 n-gram 哈希向量：稳定、无外部依赖，足以做同义句去重与召回演示。"""
 
     def __init__(self, dim: int = 256) -> None:
         self.dim = dim
+        self.name = f"hashing-{dim}"
 
-    def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str) -> list[float]:
+        return self._embed_sync(text)
+
+    def _embed_sync(self, text: str) -> list[float]:
         vector = [0.0] * self.dim
         cleaned = re.sub(r"\s+", " ", text.lower().strip())
         for size in (1, 2, 3):
@@ -122,7 +135,7 @@ class MemoryManager:
         tenant: str = "default",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        embedding = self.embedder.embed(text)
+        embedding = await self.embedder.embed(text)
         await self._ensure_indexes()
         now = datetime.now(UTC)
         collection = self._collection()
@@ -163,7 +176,7 @@ class MemoryManager:
     async def retrieve(
         self, user_id: str, query: str, *, k: int = 5, token_budget: int = 900
     ) -> list[dict[str, Any]]:
-        query_vector = self.embedder.embed(query)
+        query_vector = await self.embedder.embed(query)
         now_ts = time.time()
         await self._ensure_indexes()
         rows = await self._collection().find({"user_id": user_id}).to_list(length=None)
