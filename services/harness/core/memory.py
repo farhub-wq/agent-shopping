@@ -15,6 +15,7 @@ import math
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -133,6 +134,28 @@ SEMANTIC_PATTERNS = [
     (re.compile(r"(?:我对)([^。]{1,10})(?:过敏)"), "过敏"),
 ]
 
+# LLM 抽取的系统提示：只收用户明确陈述的稳定事实，限定输出契约便于严格解析。
+_EXTRACT_SYSTEM = (
+    "你是事实抽取器。从用户的话里抽取值得长期记住的稳定事实"
+    "（称呼、偏好、尺码、联系方式、地址、过敏史等），只抽取用户明确说出的，禁止推测。\n"
+    '只输出 JSON 数组，每项形如 {"slot": "类别", "text": "事实陈述"}；'
+    "没有可抽取的事实就输出 []。不要输出任何其他文字。\n"
+    "slot 用简短中文类别名；text 用简洁陈述；最多 3 条。"
+)
+# 从模型产出里定位 JSON 数组：模型可能在前后包一层废话，取第一个 [...] 块。
+_FACT_JSON = re.compile(r"\[.*\]", re.DOTALL)
+_LLM_FACT_LIMIT = 3
+_FACT_TEXT_LIMIT = 80
+_FACT_SLOT_LIMIT = 16
+
+
+@dataclass(frozen=True)
+class _Fact:
+    """一条待存语义事实：slot 为归一化类别（空串表示无类别，走去重路径）。"""
+
+    slot: str
+    text: str
+
 
 def _compatible(query: list[float], stored: list[float] | None) -> bool:
     # 换 embedder 后新旧向量维度不同，cosine 用 zip 截断会得到伪相似度；
@@ -192,16 +215,80 @@ class MemoryManager:
         raw = await self.redis.lrange(self._work_key(session_id), 0, limit - 1)
         return [json.loads(item) for item in reversed(raw)]
 
-    async def extract_semantic(self, user_id: str, text: str, tenant: str = "default") -> list[str]:
-        facts = []
+    async def extract_semantic(
+        self, user_id: str, text: str, tenant: str = "default", provider: Any = None
+    ) -> list[str]:
+        """双路抽取：正则（免费高精度）+ 可选 LLM（覆盖非模板表述）。
+
+        事实带 slot 落库：同槽位旧事实整条替换（冲突检测），无槽位走去重路径。
+        返回存储的事实文本列表。
+        """
+        facts: list[_Fact] = []
         for pattern, label in SEMANTIC_PATTERNS:
             match = pattern.search(text)
             if match:
-                fact = f"{label}：{match.group(1).strip()}"
-                facts.append(fact)
-                # 语义事实高权重入库（0.85），保证称呼/地址/偏好这类信息优先被召回。
-                await self.remember(user_id, fact, kind="semantic", importance=0.85, tenant=tenant)
+                facts.append(_Fact(slot=label, text=f"{label}：{match.group(1).strip()}"))
+        if provider is not None:
+            seen = {fact.text.strip().lower() for fact in facts}
+            for fact in await self._llm_extract(provider, text):
+                if fact.text.strip().lower() not in seen:
+                    facts.append(fact)
+        stored: list[str] = []
+        for fact in facts:
+            await self._store_fact(user_id, fact, tenant)
+            stored.append(fact.text)
+        return stored
+
+    async def _llm_extract(self, provider: Any, text: str) -> list[_Fact]:
+        """LLM 抽取并严格解析：任何失败（含模型降级话术）都退回空列表，正则结果兜底。"""
+        try:
+            decision = await provider.decide(
+                _EXTRACT_SYSTEM, [{"role": "user", "content": text[:500]}], []
+            )
+            match = _FACT_JSON.search(decision.content or "")
+            payload = json.loads(match.group(0)) if match else []
+        except Exception as exc:
+            logger.warning("LLM 语义抽取失败，退回纯正则结果：%s", exc)
+            return []
+        facts: list[_Fact] = []
+        if isinstance(payload, list):
+            for item in payload[:_LLM_FACT_LIMIT]:
+                if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+                    slot = item.get("slot") if isinstance(item.get("slot"), str) else ""
+                    facts.append(
+                        _Fact(slot=slot.strip()[:_FACT_SLOT_LIMIT], text=item["text"].strip()[:_FACT_TEXT_LIMIT])
+                    )
         return facts
+
+    async def _store_fact(self, user_id: str, fact: _Fact, tenant: str) -> None:
+        """落库一条事实：语义事实高权重（0.85），保证称呼/地址/偏好优先被召回。"""
+        if not fact.slot:
+            await self.remember(user_id, fact.text, kind="semantic", importance=0.85, tenant=tenant)
+            return
+        # 同槽位即冲突：旧事实整条作废后写新事实（delete+insert 非原子，
+        # 崩溃最坏丢一条下轮可再抽取的事实，不会产生双事实并存）。
+        embedding, embedder_name = await self._embed(fact.text)
+        await self._ensure_indexes()
+        collection = self._collection()
+        await collection.delete_many(
+            {"user_id": user_id, "kind": "semantic", "metadata.slot": fact.slot}
+        )
+        now = datetime.now(UTC)
+        await collection.insert_one(
+            {
+                "_id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "kind": "semantic",
+                "text": fact.text,
+                "embedding": embedding,
+                "embedder": embedder_name,
+                "importance": 0.85,
+                "metadata": {"tenant": tenant, "slot": fact.slot},
+                "access_count": 0,
+                "created_at": now,
+                "last_access": now,
+            }
+        )
 
     async def remember(
         self,

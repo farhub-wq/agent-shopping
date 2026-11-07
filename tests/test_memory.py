@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import harness.core.memory as mem
 import httpx
 import pytest
+from harness.core.llm import Decision
 from harness.core.memory import (
     CANDIDATE_LIMIT,
     DEDUP_SCAN_LIMIT,
@@ -173,6 +174,15 @@ class _FakeCursor:
         return list(self._rows)
 
 
+def _row_match(row, key, value):
+    # 支持 "metadata.slot" 点键：语义事实的槽位查询依赖嵌套字段过滤。
+    if "." in key:
+        top, sub = key.split(".", 1)
+        nested = row.get(top)
+        return isinstance(nested, dict) and nested.get(sub) == value
+    return row.get(key) == value
+
+
 class _FakeCollection:
     """Mongo 集合的内存替身：只实现等值过滤，记录 find/limit 形态供有界性断言。"""
 
@@ -187,13 +197,14 @@ class _FakeCollection:
 
     def find(self, filter=None, *args, **kwargs):
         self.find_filters.append(filter or {})
-        matched = [
-            row for row in self.rows if all(row.get(key) == value for key, value in (filter or {}).items())
-        ]
+        matched = [row for row in self.rows if all(_row_match(row, k, v) for k, v in (filter or {}).items())]
         return _FakeCursor(matched, self.limits)
 
     async def insert_one(self, doc):
         self.rows.append(doc)
+
+    async def delete_many(self, filter):
+        self.rows = [row for row in self.rows if not all(_row_match(row, k, v) for k, v in (filter or {}).items())]
 
     async def update_one(self, filter, update, **kwargs):
         self.updated.append((filter, update))
@@ -302,3 +313,71 @@ async def test_remember_dedup_hits_recent_duplicate(monkeypatch):
     assert record_id == "r0"
     assert len(collection.rows) == 1
     assert collection.updated[0][0] == {"_id": "r0"}
+
+
+class _ExtractProvider:
+    """LLM 抽取的 provider 替身：decide 固定返回指定 content。"""
+
+    name = "fake-extractor"
+
+    def __init__(self, content):
+        self._content = content
+
+    async def decide(self, system, messages, tools):
+        return Decision(kind="final", content=self._content, model="fake")
+
+
+@pytest.mark.asyncio
+async def test_extract_semantic_regex_only_without_provider(monkeypatch):
+    collection = _FakeCollection()
+    manager = _manager_with_collection(collection, monkeypatch)
+
+    facts = await manager.extract_semantic("u1", "我叫小王，我住在上海浦东")
+
+    assert facts == ["称呼：小王", "地址：上海浦东"]
+    slots = {row["metadata"].get("slot") for row in collection.rows if row["kind"] == "semantic"}
+    assert slots == {"称呼", "地址"}
+
+
+@pytest.mark.asyncio
+async def test_llm_extraction_merges_and_stores_slot_facts(monkeypatch):
+    collection = _FakeCollection()
+    manager = _manager_with_collection(collection, monkeypatch)
+    provider = _ExtractProvider('[{"slot": "收货时间", "text": "周末不方便收货"}, {"text": "偏好顺丰快递"}]')
+
+    facts = await manager.extract_semantic("u1", "我一般周末不方便收货，发顺丰吧", provider=provider)
+
+    assert "周末不方便收货" in facts
+    assert "偏好顺丰快递" in facts
+    slot_row = next(row for row in collection.rows if row["metadata"].get("slot") == "收货时间")
+    assert slot_row["importance"] == 0.85
+    # 无 slot 事实走 remember 路径，同样入库。
+    assert any(row["text"] == "偏好顺丰快递" for row in collection.rows)
+
+
+@pytest.mark.asyncio
+async def test_llm_extraction_falls_back_to_regex_on_unparseable_output(monkeypatch):
+    collection = _FakeCollection()
+    manager = _manager_with_collection(collection, monkeypatch)
+    # 模拟模型降级话术/自由文本：解析失败必须静默退回纯正则，不劣于纯规则方案。
+    provider = _ExtractProvider("当前咨询量较大，暂时无法处理。")
+
+    facts = await manager.extract_semantic("u1", "我叫小李", provider=provider)
+
+    assert facts == ["称呼：小李"]
+
+
+@pytest.mark.asyncio
+async def test_slot_conflict_replaces_old_fact(monkeypatch):
+    collection = _FakeCollection()
+    manager = _manager_with_collection(collection, monkeypatch)
+
+    await manager.extract_semantic("u1", "我喜欢吃辣")
+    await manager.extract_semantic("u1", "我喜欢清淡饮食")
+
+    semantic = [
+        row for row in collection.rows if row["kind"] == "semantic" and row["metadata"].get("slot") == "偏好"
+    ]
+    # 同槽位冲突替换：库里只剩新事实，不再新旧并存。
+    assert len(semantic) == 1
+    assert semantic[0]["text"] == "偏好：清淡饮食"
