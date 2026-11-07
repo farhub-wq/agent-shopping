@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 from shop_common.config import get_settings
+from shop_common.errors import ApiError
 from shop_common.logging import get_logger
 from shop_common.metrics import LLM_CIRCUIT_OPEN, LLM_FALLBACK
 
@@ -21,15 +22,48 @@ logger = get_logger(__name__)
 
 SKU_PATTERN = re.compile(r"SKU-\d{4}")
 
+# 单次 plan 的步骤上限：超出截断，避免一次决策无限执行工具（NFR-10 工具调用有上限）。
+MAX_PLAN_STEPS = 6
+
 
 @dataclass
 class Decision:
-    kind: str  # final | tool | delta（delta 为 final 答案的 token 分片）
+    kind: str  # final | tool | delta | plan（delta 为 final 答案的 token 分片）
     content: str = ""
     tool: str = ""
     args: dict[str, Any] = field(default_factory=dict)
+    steps: list[dict[str, Any]] = field(default_factory=list)  # plan 的有序工具步骤 [{tool, args}]
     usage: dict[str, Any] = field(default_factory=dict)
     model: str = ""  # 产出该决策的模型名，供证据卡审计降级/熔断来源
+
+
+def parse_decision(message: dict[str, Any], tools: list[dict[str, Any]]) -> Decision:
+    """把 OpenAI 响应 message 校验成决策：0 个 tool_calls → final，1 个 → tool，≥2 个 → plan。
+
+    校验工具名在 tools 白名单内、arguments 是合法 JSON 对象；不合法抛 ApiError，
+    让坏输出在降级层被捕获而不是静默变成空决策。
+    """
+    allowed = {item["name"] for item in tools}
+    calls = message.get("tool_calls") or []
+    if not calls:
+        return Decision(kind="final", content=message.get("content") or "")
+    steps: list[dict[str, Any]] = []
+    for call in calls:
+        function = call.get("function") or {}
+        name = function.get("name") or ""
+        if name not in allowed:
+            raise ApiError("BAD_DECISION", f"模型返回了未知工具 {name}")
+        raw_args = function.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args)
+        except ValueError as exc:
+            raise ApiError("BAD_DECISION", f"工具 {name} 的参数不是合法 JSON") from exc
+        if not isinstance(args, dict):
+            raise ApiError("BAD_DECISION", f"工具 {name} 的参数必须是 JSON 对象")
+        steps.append({"tool": name, "args": args})
+    if len(steps) == 1:
+        return Decision(kind="tool", tool=steps[0]["tool"], args=steps[0]["args"])
+    return Decision(kind="plan", steps=steps)
 
 
 class LLMProvider:

@@ -9,6 +9,7 @@ from harness.core.llm import (
     FailoverProvider,
     LLMProvider,
     OpenAICompatibleProvider,
+    parse_decision,
 )
 
 SPECS = [
@@ -17,6 +18,54 @@ SPECS = [
     {"name": "order_lookup"},
     {"name": "after_sales_draft"},
 ]
+
+TOOLS = [
+    {"name": "inventory_check", "input_schema": {"type": "object"}},
+    {"name": "catalog_validate", "input_schema": {"type": "object"}},
+]
+
+
+def test_parse_decision_no_tool_calls_is_final():
+    decision = parse_decision({"content": "你好"}, TOOLS)
+    assert decision.kind == "final"
+    assert decision.content == "你好"
+
+
+def test_parse_decision_single_tool_call():
+    decision = parse_decision(
+        {"tool_calls": [{"function": {"name": "inventory_check", "arguments": "{\"sku\": \"SKU-1001\"}"}}]},
+        TOOLS,
+    )
+    assert decision.kind == "tool"
+    assert decision.tool == "inventory_check"
+    assert decision.args["sku"] == "SKU-1001"
+
+
+def test_parse_decision_multiple_tool_calls_becomes_plan():
+    calls = [
+        {"function": {"name": "inventory_check", "arguments": "{}"}},
+        {"function": {"name": "catalog_validate", "arguments": "{}"}},
+    ]
+    decision = parse_decision({"tool_calls": calls}, TOOLS)
+    assert decision.kind == "plan"
+    assert [step["tool"] for step in decision.steps] == ["inventory_check", "catalog_validate"]
+
+
+def test_parse_decision_rejects_unknown_tool():
+    from shop_common.errors import ApiError
+
+    with pytest.raises(ApiError):
+        parse_decision({"tool_calls": [{"function": {"name": "nope", "arguments": "{}"}}]}, TOOLS)
+
+
+def test_parse_decision_rejects_bad_arguments_json():
+    from shop_common.errors import ApiError
+
+    with pytest.raises(ApiError):
+        parse_decision(
+            {"tool_calls": [{"function": {"name": "inventory_check", "arguments": "not json"}}]},
+            TOOLS,
+        )
 
 
 @pytest.mark.asyncio
