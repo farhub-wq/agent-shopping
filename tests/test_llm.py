@@ -113,6 +113,20 @@ async def test_planner_does_not_invent_when_no_tool_matches():
     assert "库存" in decision.content
 
 
+@pytest.mark.asyncio
+async def test_planner_multi_intent_produces_plan():
+    planner = DeterministicPlanner()
+    tools = [
+        {"name": "inventory_check"},
+        {"name": "catalog_validate"},
+    ]
+    decision = await planner.decide(
+        "system", [{"role": "user", "content": "SKU-1001 库存还有多少，合规性也查一下"}], tools
+    )
+    assert decision.kind == "plan"
+    assert [step["tool"] for step in decision.steps] == ["inventory_check", "catalog_validate"]
+
+
 def test_decision_model_defaults_to_empty():
     assert Decision(kind="final").model == ""
 

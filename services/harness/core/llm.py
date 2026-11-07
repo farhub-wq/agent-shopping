@@ -114,6 +114,27 @@ class DeterministicPlanner(LLMProvider):
                     return Decision(kind="tool", tool=name, args=args)
             return Decision(kind="final", content="当前技能没有可用的工具来处理这个请求。")
 
+        # 多意图查询：同时命中 ≥2 个独立查询类意图时产出 plan，而不是被首个关键词截断。
+        # 售后/退款属「提议类」动作，保留下面的「首选/退路」语义，不参与 plan 组合。
+        plan_steps: list[dict[str, Any]] = []
+        sku_value = sku.group(0) if sku else "SKU-1001"
+        if any(word in text for word in ("库存", "有货", "还剩", "秒杀")):
+            plan_steps.append({"tool": "inventory_check", "args": {"sku": sku_value}})
+        if any(word in text for word in ("上架", "合规", "属性", "标题", "文案")):
+            plan_steps.append({"tool": "catalog_validate", "args": {"sku": sku_value}})
+        if any(word in text for word in ("订单", "物流", "发货", "到哪")):
+            match = re.search(r"(SO\d{8}\d{6}|\b[0-9a-f]{8}-[0-9a-f-]{27}\b)", text)
+            plan_steps.append({"tool": "order_lookup", "args": {"order_id": match.group(0) if match else ""}})
+        if any(word in text for word in ("推荐", "买", "选", "耳机", "跑鞋", "精华", "衬衫")):
+            keyword = next(
+                (word for word in ("耳机", "跑鞋", "精华", "衬衫", "枕头", "收纳") if word in text),
+                "",
+            )
+            plan_steps.append({"tool": "catalog_search", "args": {"q": keyword}})
+        plan_steps = [step for step in plan_steps if step["tool"] in available]
+        if len(plan_steps) >= 2:
+            return Decision(kind="plan", steps=plan_steps)
+
         if any(word in text for word in ("退款", "退货", "售后", "换货")):
             args = {"reason": "quality_issue" if "质量" in text else "size_issue", "description": text}
             if sku:
