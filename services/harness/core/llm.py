@@ -6,6 +6,7 @@
 
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,7 +24,7 @@ SKU_PATTERN = re.compile(r"SKU-\d{4}")
 
 @dataclass
 class Decision:
-    kind: str  # final | tool
+    kind: str  # final | tool | delta（delta 为 final 答案的 token 分片）
     content: str = ""
     tool: str = ""
     args: dict[str, Any] = field(default_factory=dict)
@@ -39,11 +40,20 @@ class LLMProvider:
     ) -> Decision:
         raise NotImplementedError
 
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        # 默认实现：退回非流式，只产出一帧 terminal；流式序列约定以 0..n 个 delta 开头，
+        # 恰好一帧 terminal（final|tool）收尾。
+        yield await self.decide(system, messages, tools)
+
 
 class DeterministicPlanner(LLMProvider):
     """基于关键词与工具结果的确定性编排，用于离线演示与回归测试。"""
 
     name = "deterministic-v1"
+    # 分块步长：离线规划器瞬间出全文，按固定字符数切块模拟逐 token 流式，供默认演示打字机效果。
+    CHUNK = 8
 
     async def decide(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -107,6 +117,18 @@ class DeterministicPlanner(LLMProvider):
                 "请告诉我想处理的商品 SKU 或订单号。"
             ),
         )
+
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        terminal = await self.decide(system, messages, tools)
+        # 只有 final 且有正文才分块：tool 决策是离散动作，直接单帧 terminal，不产 delta。
+        if terminal.kind != "final" or not terminal.content:
+            yield terminal
+            return
+        for start in range(0, len(terminal.content), self.CHUNK):
+            yield Decision(kind="delta", content=terminal.content[start : start + self.CHUNK])
+        yield terminal
 
     def _compose(self, tool_messages: list[dict[str, Any]]) -> str:
         payloads: list[Any] = []

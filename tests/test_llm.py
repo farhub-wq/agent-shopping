@@ -68,6 +68,36 @@ def test_decision_model_defaults_to_empty():
     assert Decision(kind="final").model == ""
 
 
+@pytest.mark.asyncio
+async def test_planner_decide_stream_chunks_final_answer():
+    planner = DeterministicPlanner()
+    frames = [
+        item
+        async for item in planner.decide_stream(
+            "system", [{"role": "user", "content": "今天天气怎么样"}], []
+        )
+    ]
+    assert len(frames) >= 2  # 至少一帧 delta + 一帧 terminal
+    assert all(item.kind == "delta" for item in frames[:-1])
+    assert frames[-1].kind == "final"
+    assert "".join(item.content for item in frames[:-1]) == frames[-1].content
+
+
+@pytest.mark.asyncio
+async def test_planner_decide_stream_tool_decision_is_single_frame():
+    planner = DeterministicPlanner()
+    frames = [
+        item
+        async for item in planner.decide_stream(
+            "system",
+            [{"role": "user", "content": "SKU-1001 还有货吗？"}],
+            [{"name": "inventory_check"}],
+        )
+    ]
+    assert len(frames) == 1
+    assert frames[0].kind == "tool"
+
+
 def test_openai_provider_stores_timeout():
     provider = OpenAICompatibleProvider("http://x", "k", "m", timeout=3.0)
     assert provider.timeout == 3.0
