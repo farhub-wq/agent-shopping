@@ -177,10 +177,11 @@ class OpenAICompatibleProvider(LLMProvider):
         self.model = model
         self.timeout = timeout
 
-    async def decide(
-        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> Decision:
-        payload = {
+    def _payload(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], stream: bool
+    ) -> dict[str, Any]:
+        # 流式与非流式共用同一份 payload，仅 stream 开关不同，避免两处构造漂移。
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, *messages],
             # 工具 schema 直接来自白名单，模型只能在这些名字里选，减少幻觉式调用。
@@ -198,6 +199,14 @@ class OpenAICompatibleProvider(LLMProvider):
             "tool_choice": "auto",
             "temperature": 0.2,
         }
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    async def decide(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Decision:
+        payload = self._payload(system, messages, tools, stream=False)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
@@ -219,6 +228,65 @@ class OpenAICompatibleProvider(LLMProvider):
                 usage=usage,
             )
         return Decision(kind="final", content=message.get("content") or "", usage=usage)
+
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        payload = self._payload(system, messages, tools, stream=True)
+        content_parts: list[str] = []
+        tool_name = ""
+        tool_args = ""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:") :].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        # 偶发的非 JSON 心跳行直接跳过，不中断流。
+                        continue
+                    content_delta, name_delta, args_delta = _openai_stream_delta(chunk)
+                    if content_delta:
+                        content_parts.append(content_delta)
+                        yield Decision(kind="delta", content=content_delta)
+                    if name_delta:
+                        tool_name = name_delta
+                    if args_delta:
+                        tool_args += args_delta
+        if tool_name:
+            # 流式工具调用把参数拆在多帧里，累积后一次性解析为 args。
+            try:
+                args = json.loads(tool_args or "{}")
+            except ValueError:
+                args = {}
+            yield Decision(kind="tool", tool=tool_name, args=args, model=self.model)
+            return
+        yield Decision(kind="final", content="".join(content_parts), model=self.model)
+
+
+def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, str, str]:
+    # 解析单个 SSE 数据块为 (content_delta, tool_name_delta, tool_args_delta)；
+    # 兼容端点对 delta 字段命名与是否出现不保证一致，全部安全取值，缺失返回空串。
+    choices = chunk.get("choices") or []
+    if not choices:
+        return "", "", ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content") or ""
+    tool_calls = delta.get("tool_calls") or []
+    if tool_calls:
+        function = tool_calls[0].get("function") or {}
+        return content, function.get("name") or "", function.get("arguments") or ""
+    return content, "", ""
 
 
 # 双模型都不可用时的兜底话术：明确引导转人工，且必须是 final 决策，避免循环里反复试模型。
