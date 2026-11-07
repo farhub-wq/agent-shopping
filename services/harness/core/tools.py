@@ -30,6 +30,22 @@ def redact(text: str) -> str:
     return EMAIL_PATTERN.sub("***@***", text)
 
 
+def redact_data(data: Any) -> Any:
+    """递归脱敏：dict 按值、list 按元素下钻，字符串走 redact()，其余标量原样返回。
+
+    用内容级正则而不是字段名清单：自由文本字段（备注、描述）里嵌的 PII 同样能抹掉，
+    且不随下游服务字段增减而失效。工具的 args 不走这里——那是用户自己发起的内容，
+    且待审批重放需要原样参数。
+    """
+    if isinstance(data, str):
+        return redact(data)
+    if isinstance(data, dict):
+        return {key: redact_data(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [redact_data(item) for item in data]
+    return data
+
+
 @dataclass
 class ToolContext:
     user_id: str
@@ -150,10 +166,9 @@ class ToolRegistry:
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
-        # 第 4 步：输出脱敏。只对字符串结果做正则替换；
-        # 结构化结果由各工具实现自行保证不含敏感字段。
-        if isinstance(data, str):
-            data = redact(data)
+        # 第 4 步：输出脱敏。结构化结果递归下钻（订单收货信息就藏在 dict 里），
+        # trace 预览与 messages 回填都在本步之后，单点脱敏全覆盖。
+        data = redact_data(data)
         return ToolResult("ok", data=data, duration_ms=int((time.perf_counter() - started) * 1000))
 
 
