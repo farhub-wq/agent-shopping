@@ -7,6 +7,7 @@ from harness.core.manifest import SkillManifest
 from harness.core.policy import ToolPolicy
 from harness.core.runtime import AgentRuntime
 from harness.core.tools import Tool, ToolContext, ToolRegistry
+from shop_common.errors import ApiError
 
 
 class _FakeRedis:
@@ -46,7 +47,7 @@ class _FakeMemory:
     def __init__(self):
         self.redis = _FakeRedis()
 
-    async def extract_semantic(self, user_id, message, tenant):
+    async def extract_semantic(self, user_id, message, tenant, provider=None):
         return None
 
     async def retrieve(self, user_id, message, k=5):
@@ -69,6 +70,11 @@ class _FakeLedger:
     def __init__(self, run_id=None):
         self.run_id = run_id or "run-1"
         self.events = []
+
+    @classmethod
+    async def load(cls, run_id):
+        # 真实实现会从 Mongo 读回既有事件；测试只关心续写行为，给空账本即可。
+        return cls(run_id)
 
     async def append(self, event_type, **fields):
         self.events.append({"type": event_type, **fields})
@@ -100,30 +106,29 @@ def _runtime(provider):
     return AgentRuntime(registry, provider, {"t": manifest}, _FakeMemory())
 
 
-def _runtime_with_approval(provider):
-    # 在 _runtime 基础上多注册一个需审批工具，用来验证 plan 中途撞审批即停。
+def _runtime_with_approvals(provider, approval_tools=("approve_me",)):
+    # 注册 echo + 任意个需审批工具，返回 (runtime, registry) 供续跑用例插桩。
     registry = ToolRegistry()
 
     async def echo(args, ctx):
         return {"echo": args.get("text")}
 
-    async def approve_me(args, ctx):
-        return {"approved": True}
+    async def ok(args, ctx):
+        return {"done": True}
 
     registry.register(Tool("echo", "d", {"type": "object"}, echo, ToolPolicy("echo", permission="read")))
-    registry.register(
-        Tool(
-            "approve_me",
-            "d",
-            {"type": "object"},
-            approve_me,
-            ToolPolicy("approve_me", permission="read", requires_approval=True),
-        )
-    )
+    for name in approval_tools:
+        registry.register(Tool(name, "d", {"type": "object"}, ok, ToolPolicy(name, permission="read", requires_approval=True)))
     manifest = SkillManifest(
-        "t", "0.1", "d", "vendor", ["echo", "approve_me"], {}, 3, "你是助手", "x", findings=[]
+        "t", "0.1", "d", "vendor", ["echo", *approval_tools], {}, 3, "你是助手", "x", findings=[]
     )
-    return AgentRuntime(registry, provider, {"t": manifest}, _FakeMemory())
+    return AgentRuntime(registry, provider, {"t": manifest}, _FakeMemory()), registry
+
+
+def _runtime_with_approval(provider):
+    # 在 _runtime 基础上多注册一个需审批工具，用来验证 plan 中途撞审批即停。
+    runtime, _ = _runtime_with_approvals(provider)
+    return runtime
 
 
 @pytest.mark.asyncio
@@ -201,6 +206,128 @@ async def test_plan_stops_on_approval(monkeypatch):
     result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
     assert result.status == "pending_approval"
     assert result.pending["tool"] == "approve_me"
+
+
+_STAFF = ToolContext("op1", "operator", "d", "s9", "r9")
+
+
+@pytest.mark.asyncio
+async def test_approve_resumes_remaining_plan_steps(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider(
+        [
+            [
+                Decision(
+                    kind="plan",
+                    steps=[
+                        {"tool": "echo", "args": {"text": "a"}},
+                        {"tool": "approve_me", "args": {}},
+                        {"tool": "echo", "args": {"text": "b"}},
+                    ],
+                    model="fake",
+                )
+            ],
+            [Decision(kind="final", content="全部完成", model="fake")],
+        ]
+    )
+    runtime, _ = _runtime_with_approvals(provider)
+    first = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    assert first.status == "pending_approval"
+
+    resumed = await runtime.approve_and_replay(first.run_id, _STAFF)
+
+    # 断点续跑：被拦步与剩余步都执行，模型消化结果产出最终答案，run_id 不变。
+    assert resumed.status == "completed"
+    assert resumed.answer == "全部完成"
+    assert resumed.run_id == first.run_id
+    assert resumed.evidence["usage"]["tool_calls"] == 2  # approve_me + 剩余 echo b
+    assert any(e["type"] == "approval.granted" and e["approver"] == "op1" for e in resumed.trace)
+
+
+@pytest.mark.asyncio
+async def test_approve_is_one_shot(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider(
+        [
+            [Decision(kind="plan", steps=[{"tool": "approve_me", "args": {}}], model="fake")],
+            [Decision(kind="final", content="完成", model="fake")],
+        ]
+    )
+    runtime, _ = _runtime_with_approvals(provider)
+    first = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+
+    resumed = await runtime.approve_and_replay(first.run_id, _STAFF)
+    assert resumed.status == "completed"
+    # 一次性语义：全部步骤落地后 key 已删，同一审批请求不能消费第二次。
+    with pytest.raises(ApiError):
+        await runtime.approve_and_replay(first.run_id, _STAFF)
+
+
+@pytest.mark.asyncio
+async def test_resume_hitting_second_approval_stays_pending(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider(
+        [
+            [
+                Decision(
+                    kind="plan",
+                    steps=[{"tool": "approve_a", "args": {}}, {"tool": "approve_b", "args": {}}],
+                    model="fake",
+                )
+            ],
+            [Decision(kind="final", content="两步都完成", model="fake")],
+        ]
+    )
+    runtime, _ = _runtime_with_approvals(provider, ("approve_a", "approve_b"))
+    first = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    assert first.pending["tool"] == "approve_a"
+
+    # 续跑途中撞上第二个需审批工具：approve_a 已执行，run 保持待审批而非硬跑。
+    second = await runtime.approve_and_replay(first.run_id, _STAFF)
+    assert second.status == "pending_approval"
+    assert second.pending["tool"] == "approve_b"
+
+    third = await runtime.approve_and_replay(first.run_id, _STAFF)
+    assert third.status == "completed"
+    assert third.answer == "两步都完成"
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_manifest_trust_no_escalation(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider(
+        [
+            [
+                Decision(
+                    kind="plan",
+                    steps=[{"tool": "approve_me", "args": {}}, {"tool": "echo", "args": {"text": "b"}}],
+                    model="fake",
+                )
+            ],
+            [Decision(kind="final", content="完成", model="fake")],
+        ]
+    )
+    runtime, registry = _runtime_with_approvals(provider)
+    trusts: list[str] = []
+    original_execute = registry.execute
+
+    async def spy(tool, args, ctx, trust):
+        trusts.append(trust)
+        return await original_execute(tool, args, ctx, trust=trust)
+
+    registry.execute = spy
+    first = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    await runtime.approve_and_replay(first.run_id, _STAFF)
+    # 续跑全程用 manifest 原信任等级：审批只解锁被拦工具，绝不借 certified 放大权限面。
+    assert trusts and all(trust == "vendor" for trust in trusts)
 
 
 @pytest.mark.asyncio

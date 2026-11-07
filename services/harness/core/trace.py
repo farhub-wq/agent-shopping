@@ -37,6 +37,17 @@ class TraceLedger:
         self.events: list[dict[str, Any]] = []
         self._seq = 0
 
+    @classmethod
+    async def load(cls, run_id: str) -> "TraceLedger":
+        """按 run_id 续接既有事件序列：审批重放等跨次续写场景必须延续 seq，
+        否则同一文档里出现重号、digest 只覆盖新写的一段，证据链断裂。"""
+        ledger = cls(run_id)
+        doc = await _collection().find_one({"run_id": run_id})
+        if doc:
+            ledger.events = list(doc.get("events", []))
+            ledger._seq = len(ledger.events)
+        return ledger
+
     async def append(self, event_type: str, **fields: Any) -> dict[str, Any]:
         self._seq += 1
         # seq 单调递增 + 仅追加数组元素：事件只增不改，任何删除或重排都会反映到 digest 上。

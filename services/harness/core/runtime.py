@@ -109,7 +109,6 @@ class AgentRuntime:
         if any(finding.severity == "high" for finding in manifest.findings):
             raise ApiError("FORBIDDEN", f"技能 {skill_name} 未通过准入检查")
 
-        await self.memory.extract_semantic(ctx.user_id, user_message, ctx.tenant)
         memories = await self.memory.retrieve(ctx.user_id, user_message, k=5)
         system = self._build_system(manifest, memories)
         working = await self.memory.working_messages(ctx.session_id, limit=6)
@@ -197,17 +196,122 @@ class AgentRuntime:
         specs = self.registry.specs(allowed)
         steps_limit = max_steps or manifest.max_steps
         usage = {"prompt_chars": len(system), "steps": 0, "tool_calls": 0, "estimated_tokens": 0}
-        status = "completed"
-        answer = ""
-        pending: dict[str, Any] | None = None
-        tool_errors = 0
-        # 记录最终答案由哪个模型产出（降级/熔断后可能是备用模型），供证据卡审计。
-        model_used = self.provider.name
+        # 主循环状态经字典回传（异步生成器不能 return）：收尾与重放共用同一形状。
+        state: dict[str, Any] = {
+            "status": "completed",
+            "answer": "",
+            "tool_errors": 0,
+            # 记录最终答案由哪个模型产出（降级/熔断后可能是备用模型），供证据卡审计。
+            "model_used": self.provider.name,
+            "halt": None,
+        }
 
         await ledger.append("run.start", skill=skill_name, trust=manifest.trust, user=ctx.user_id, message=user_message)
 
+        async for event in self._run_loop(manifest, specs, steps_limit, system, messages, ctx, ledger, usage, state, stream):
+            yield event
+
+        status = state["status"]
+        answer = state["answer"]
+        pending: dict[str, Any] | None = None
+        if state["halt"] is not None:
+            halt = state["halt"]
+            pending = {"tool": halt["tool"], "args": halt["args"], "reason": halt["reason"]}
+            answer = "该操作需要人工审批，已生成待审批请求。"
+            # 待审批负载带完整续跑状态：消息快照、剩余步骤与已耗步数，
+            # 审批通过后从断点恢复整个计划，而不是只重放单个工具。
+            # 负载只保留 1 小时：超时即失效，避免过期请求被无意批准。
+            await self.memory.redis.set(
+                f"shop:harness:pending:{ledger.run_id}",
+                # approved 是 set，序列化成 list 才能放进 JSON；重放时再还原。
+                json.dumps(
+                    {
+                        **pending,
+                        "skill": skill_name,
+                        "ctx": ctx.__dict__ | {"approved": list(ctx.approved)},
+                        "user_message": user_message,
+                        "system": system,
+                        "messages": messages,
+                        "steps": halt["steps"][halt["index"] :],
+                        "call_ids": halt["call_ids"][halt["index"] :],
+                        "usage_steps": usage["steps"],
+                    },
+                    ensure_ascii=False,
+                ),
+                ex=3600,
+            )
+
+        if state["tool_errors"] and status == "completed":
+            answer = f"注意：本次执行中有 {state['tool_errors']} 次工具调用失败，以下结论可能不完整。\n{answer}"
+
+        usage["estimated_tokens"] = usage["prompt_chars"] // 3
+        # 结算：按「实际 - 预留」补扣/回补，单条 INCRBY 原子完成（负值即回补）。
+        # 进程崩溃时预留量泄漏，随配额键 TTL 过期自愈——有界泄漏，护栏口径可接受。
+        delta = usage["estimated_tokens"] - reserve
+        usage["user_spent_today"] = await self.memory.redis.incrby(quota_key, delta) if delta else acquired
+
+        # 语义抽取放在回答完成之后：事实是给「下一轮」召回用的，
+        # LLM 抽取的延迟与成本不进本次响应的关键路径；内部自带正则兜底。
+        await self.memory.extract_semantic(ctx.user_id, user_message, ctx.tenant, provider=self.provider)
+        # 会话结束统一落三处记忆：工作记忆保留原文、情节记忆保留结论、
+        # 语义事实已在上方抽取。失败状态给更高重要性，便于后续复盘。
+        await self.memory.append_turn(ctx.session_id, "user", user_message)
+        await self.memory.append_turn(ctx.session_id, "assistant", answer)
+        await self.memory.remember(
+            ctx.user_id,
+            f"用户问题：{user_message[:80]}；处理结论：{answer[:120]}",
+            kind="episodic",
+            importance=0.45 if status == "completed" else 0.6,
+            tenant=ctx.tenant,
+            metadata={"skill": skill_name, "run_id": ledger.run_id, "status": status},
+        )
+        await self.memory.summarize_session(ctx.session_id, ctx.user_id)
+        await ledger.append("memory.write", user=ctx.user_id, skill=skill_name)
+        await ledger.append("run.end", status=status, answer=answer[:200])
+
+        evidence = ledger.evidence_card(
+            skill=skill_name,
+            skill_hash=manifest.content_hash,
+            trust=manifest.trust,
+            model=state["model_used"],
+            usage=usage,
+            final_status=status,
+        )
+        yield (
+            "done",
+            AgentRunResult(
+                run_id=ledger.run_id,
+                skill=skill_name,
+                answer=answer,
+                status=status,
+                evidence=evidence,
+                trace=ledger.events,
+                pending=pending,
+            ),
+        )
+
+    async def _run_loop(
+        self,
+        manifest: Any,
+        specs: list[dict[str, Any]],
+        steps_limit: int,
+        system: str,
+        messages: list[dict[str, Any]],
+        ctx: ToolContext,
+        ledger: Any,
+        usage: dict[str, Any],
+        state: dict[str, Any],
+        stream: bool,
+    ):
+        """ReAct 主循环：决策 → 工具执行 → 回填，直到 final/预算耗尽/待审批/步数耗尽。
+
+        结果经 state 字典回传（异步生成器不能 return）：
+        status/answer/tool_errors/model_used；待审批时 halt 带断点信息供续跑。
+        `_run_events` 与 `approve_and_replay` 共用本循环，行为口径只有一份。
+        """
+        # 预算读模块级 settings（与 _run_events 同一来源），保证测试可统一替换。
         for step in range(steps_limit):
-            usage["steps"] = step + 1
+            usage["steps"] += 1
             # 流式读模型决策：delta 帧是答案分片（仅 stream 时外抛），
             # terminal 帧才是本步实际决策；契约是 0..n 个 delta + 恰好一帧 terminal。
             decision: Decision | None = None
@@ -220,7 +324,7 @@ class AgentRuntime:
                 break
             assert decision is not None  # decide_stream 契约：必产一帧 terminal
             if decision.model:
-                model_used = decision.model
+                state["model_used"] = decision.model
             usage["prompt_chars"] += len(json.dumps(messages, ensure_ascii=False))
             step_event = await ledger.append(
                 "agent.step",
@@ -232,19 +336,19 @@ class AgentRuntime:
             if stream:
                 yield ("trace", step_event)
             if decision.kind == "final":
-                answer = decision.content
-                break
+                state["answer"] = decision.content
+                return
 
             # 单次运行预算：本步模型调用已发生，下一步会超支就停在这里；
             # 不执行本步工具——执行了也没预算让模型消化结果，反而留下半截动作。
             if usage["prompt_chars"] // 3 > settings.agent_run_token_budget:
-                status = "budget_exceeded"
-                answer = RUN_BUDGET_EXCEEDED_MESSAGE
+                state["status"] = "budget_exceeded"
+                state["answer"] = RUN_BUDGET_EXCEEDED_MESSAGE
                 AGENT_BUDGET_EXCEEDED.labels("harness", "run").inc()
                 budget_event = await ledger.append("run.budget_exceeded", prompt_chars=usage["prompt_chars"])
                 if stream:
                     yield ("trace", budget_event)
-                break
+                return
 
             # 把「单工具」与「计划」归一成有序步骤列表：plan 超出上限截断并记 trace，
             # 避免一次决策无限执行工具（NFR-10 工具调用有上限）。
@@ -280,7 +384,6 @@ class AgentRuntime:
                 }
             )
 
-            halted = False
             for index, step in enumerate(steps):
                 usage["tool_calls"] += 1
                 call_event = await ledger.append("tool.call", tool=step["tool"], args=step["args"])
@@ -297,19 +400,28 @@ class AgentRuntime:
                 if stream:
                     yield ("trace", result_event)
                 if result.status == "needs_approval":
-                    # 不可逆动作到此为止：本步与后续 step 都不执行，转存待审批负载等人工处理。
-                    status = "pending_approval"
-                    pending = {"tool": step["tool"], "args": step["args"], "reason": result.message}
+                    # 不可逆动作到此为止：本步与后续 step 都不执行。
+                    # halt 带断点信息（被拦步索引 + 完整 steps/call_ids），
+                    # 由调用方持久化，审批通过后据此续跑剩余计划。
+                    state["status"] = "pending_approval"
+                    state["halt"] = {
+                        "index": index,
+                        "steps": steps,
+                        "call_ids": call_ids,
+                        "tool": step["tool"],
+                        "args": step["args"],
+                        "reason": result.message,
+                    }
                     approval_event = await ledger.append("approval.requested", tool=step["tool"], args=step["args"])
                     if stream:
                         yield ("trace", approval_event)
-                    halted = True
-                    break
+                    return
                 if result.status in {"error", "denied"}:
                     # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
                     # 保证最终答案不会被当成完整成功。
-                    tool_errors += 1
-                    status = "degraded" if status == "completed" else status
+                    state["tool_errors"] += 1
+                    if state["status"] == "completed":
+                        state["status"] = "degraded"
                 messages.append(
                     {
                         "role": "tool",
@@ -317,68 +429,10 @@ class AgentRuntime:
                         "content": json.dumps(result.to_dict(), ensure_ascii=False),
                     }
                 )
-            if halted:
-                break
         else:
             # for-else：循环跑满步数仍未得到 final 决策，说明任务无法在预算内收敛。
-            status = "max_steps_exceeded"
-            answer = "达到最大推理步数，未能完成任务。请缩小问题范围或转人工处理。"
-
-        if pending is not None:
-            answer = "该操作需要人工审批，已生成待审批请求。"
-            # 待审批负载只保留 1 小时：超时即失效，避免过期请求被无意批准。
-            await self.memory.redis.set(
-                f"shop:harness:pending:{ledger.run_id}",
-                # approved 是 set，序列化成 list 才能放进 JSON；重放时再还原。
-                json.dumps({"skill": skill_name, "ctx": ctx.__dict__ | {"approved": list(ctx.approved)}, **pending}, ensure_ascii=False),
-                ex=3600,
-            )
-
-        if tool_errors and status == "completed":
-            answer = f"注意：本次执行中有 {tool_errors} 次工具调用失败，以下结论可能不完整。\n{answer}"
-
-        usage["estimated_tokens"] = usage["prompt_chars"] // 3
-        # 结算：按「实际 - 预留」补扣/回补，单条 INCRBY 原子完成（负值即回补）。
-        # 进程崩溃时预留量泄漏，随配额键 TTL 过期自愈——有界泄漏，护栏口径可接受。
-        delta = usage["estimated_tokens"] - reserve
-        usage["user_spent_today"] = await self.memory.redis.incrby(quota_key, delta) if delta else acquired
-
-        # 会话结束统一落三处记忆：工作记忆保留原文、情节记忆保留结论、
-        # 语义事实在 _prepare 阶段已抽取。失败状态给更高重要性，便于后续复盘。
-        await self.memory.append_turn(ctx.session_id, "user", user_message)
-        await self.memory.append_turn(ctx.session_id, "assistant", answer)
-        await self.memory.remember(
-            ctx.user_id,
-            f"用户问题：{user_message[:80]}；处理结论：{answer[:120]}",
-            kind="episodic",
-            importance=0.45 if status == "completed" else 0.6,
-            tenant=ctx.tenant,
-            metadata={"skill": skill_name, "run_id": ledger.run_id, "status": status},
-        )
-        await self.memory.summarize_session(ctx.session_id, ctx.user_id)
-        await ledger.append("memory.write", user=ctx.user_id, skill=skill_name)
-        await ledger.append("run.end", status=status, answer=answer[:200])
-
-        evidence = ledger.evidence_card(
-            skill=skill_name,
-            skill_hash=manifest.content_hash,
-            trust=manifest.trust,
-            model=model_used,
-            usage=usage,
-            final_status=status,
-        )
-        yield (
-            "done",
-            AgentRunResult(
-                run_id=ledger.run_id,
-                skill=skill_name,
-                answer=answer,
-                status=status,
-                evidence=evidence,
-                trace=ledger.events,
-                pending=pending,
-            ),
-        )
+            state["status"] = "max_steps_exceeded"
+            state["answer"] = "达到最大推理步数，未能完成任务。请缩小问题范围或转人工处理。"
 
     async def run(
         self,
@@ -414,32 +468,167 @@ class AgentRuntime:
                 yield {"type": "final", "result": payload.to_dict()}
 
     async def approve_and_replay(self, run_id: str, ctx: ToolContext) -> AgentRunResult:
+        """审批通过后从断点续跑：先确定性执行被拦步与剩余计划步（无模型参与），
+        再恢复 ReAct 循环让模型消化结果产出最终答案。"""
         assert self.memory.redis is not None
-        raw = await self.memory.redis.get(f"shop:harness:pending:{run_id}")
+        settings = get_settings()
+        key = f"shop:harness:pending:{run_id}"
+        raw = await self.memory.redis.get(key)
         if not raw:
             raise ApiError("NOT_FOUND", "待审批请求不存在或已过期")
         payload = json.loads(raw)
-        # 人工审批即临时授权：把该工具加入 approved 让护栏放行，
-        # 并以 certified 等级重放，因为审批人本身已是 staff。
-        ctx.approved.add(payload["tool"])
-        result = await self.registry.execute(payload["tool"], payload["args"], ctx, trust="certified")
-        # 执行后立刻删除待审批 key，保证同一审批请求只能重放一次。
-        await self.memory.redis.delete(f"shop:harness:pending:{run_id}")
-        ledger = TraceLedger(run_id)
+        manifest = self.skills.get(payload["skill"])
+        if manifest is None:
+            raise ApiError("NOT_FOUND", f"技能 {payload['skill']} 不存在")
+        # 续跑用原始发起人上下文：工具审计归属原用户，审批人身份只进 trace。
+        original_ctx = ToolContext(
+            user_id=payload["ctx"]["user_id"],
+            role=payload["ctx"]["role"],
+            tenant=payload["ctx"]["tenant"],
+            session_id=payload["ctx"]["session_id"],
+            run_id=run_id,
+            approved=set(payload["ctx"].get("approved", [])),
+        )
+        # 审批只解锁「被拦的那一个工具」：加进 approved 白名单，信任等级仍是
+        # manifest.trust——续跑绝不能借 certified 把整个计划的权限面放大。
+        original_ctx.approved.add(payload["tool"])
+        # 续接既有事件序列：seq 连续、digest 覆盖「原 run + 审批 + 续跑」完整历史。
+        ledger = await TraceLedger.load(run_id)
         await ledger.append("approval.granted", tool=payload["tool"], approver=ctx.user_id)
-        await ledger.append("tool.result", tool=payload["tool"], status=result.status)
+
+        # Phase A：确定性续跑被拦步与剩余计划步。不耗 token、不需要配额；
+        # 再撞 needs_approval 就更新负载（剩余步骤 + 最新快照）保持待审批。
+        messages: list[dict[str, Any]] = payload["messages"]
+        steps: list[dict[str, Any]] = payload["steps"]
+        call_ids: list[str] = payload["call_ids"]
+        tool_errors = 0
+        halted_at: int | None = None
+        for index, step in enumerate(steps):
+            result = await self.registry.execute(step["tool"], step["args"], original_ctx, trust=manifest.trust)
+            await ledger.append(
+                "tool.result",
+                tool=step["tool"],
+                status=result.status,
+                duration_ms=result.duration_ms,
+                preview=str(result.data)[:200],
+            )
+            if result.status == "needs_approval":
+                halted_at = index
+                break
+            if result.status in {"error", "denied"}:
+                tool_errors += 1
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_ids[index],
+                    "content": json.dumps(result.to_dict(), ensure_ascii=False),
+                }
+            )
+
+        if halted_at is not None:
+            step = steps[halted_at]
+            updated = {
+                **payload,
+                "tool": step["tool"],
+                "args": step["args"],
+                "reason": result.message,
+                "steps": steps[halted_at:],
+                "call_ids": call_ids[halted_at:],
+                "messages": messages,
+                "ctx": original_ctx.__dict__ | {"approved": list(original_ctx.approved)},
+            }
+            await self.memory.redis.set(key, json.dumps(updated, ensure_ascii=False), ex=3600)
+            await ledger.append("approval.requested", tool=step["tool"], args=step["args"])
+            await ledger.append("run.end", status="pending_approval", answer="")
+            return AgentRunResult(
+                run_id=run_id,
+                skill=payload["skill"],
+                answer="续跑中遇到新的不可逆操作，已更新待审批请求。",
+                status="pending_approval",
+                evidence=ledger.evidence_card(
+                    skill=payload["skill"],
+                    skill_hash=manifest.content_hash,
+                    trust=manifest.trust,
+                    model="none",
+                    usage={"estimated_tokens": 0},
+                    final_status="pending_approval",
+                ),
+                trace=ledger.events,
+                pending={"tool": step["tool"], "args": step["args"], "reason": result.message},
+            )
+
+        # 全部步骤落地才删除 key：同一审批请求只被完整消费一次（一次性语义）。
+        await self.memory.redis.delete(key)
+
+        # Phase B：恢复 ReAct 循环，模型消化工具结果产出最终答案。
+        # 走与正常 run 相同的配额预留/运行预算护栏；配额不足时工具已落地，
+        # 诚实交代执行结果（degraded），不编造总结。
+        quota_key = f"shop:harness:quota:{original_ctx.user_id}:{datetime.now(UTC):%Y%m%d}"
+        reserve = settings.agent_run_token_budget
+        acquired = await self.memory.redis.eval(
+            _QUOTA_ACQUIRE_LUA, 1, quota_key, settings.agent_user_daily_token_quota, reserve
+        )
+        usage = {
+            "prompt_chars": len(payload["system"]),
+            "steps": payload.get("usage_steps", 0),
+            "tool_calls": len(steps),
+            "estimated_tokens": 0,
+        }
+        state: dict[str, Any] = {
+            "status": "completed",
+            "answer": "",
+            "tool_errors": tool_errors,
+            "model_used": self.provider.name,
+            "halt": None,
+        }
+        if acquired == -1:
+            AGENT_BUDGET_EXCEEDED.labels("harness", "user").inc()
+            state["status"] = "degraded"
+            state["answer"] = (
+                f"审批的操作已全部执行完成（{len(steps)} 个操作，{tool_errors} 个失败），"
+                "但今日配额已用尽，无法生成总结。"
+            )
+            await ledger.append("run.quota_exceeded", skill=payload["skill"], user=original_ctx.user_id)
+        else:
+            allowed = [name for name in manifest.allowed_tools if self.registry.get(name)]
+            specs = self.registry.specs(allowed)
+            async for _event in self._run_loop(
+                manifest, specs, manifest.max_steps, payload["system"], messages, original_ctx,
+                ledger, usage, state, False,
+            ):
+                pass  # 重放是非流式路径：事件已落账本，这里只排空生成器
+            usage["estimated_tokens"] = usage["prompt_chars"] // 3
+            delta = usage["estimated_tokens"] - reserve
+            usage["user_spent_today"] = await self.memory.redis.incrby(quota_key, delta) if delta else acquired
+
+        status = state["status"]
+        answer = state["answer"] or "审批的操作已全部执行完成。"
+        if tool_errors and status == "completed":
+            status = "degraded"
+            answer = f"注意：续跑中有 {tool_errors} 次工具调用失败。\n{answer}"
+        # 原 user 回合在首次 pending 时已写入工作/情节记忆，这里只补最终答案与续跑情节。
+        await self.memory.append_turn(original_ctx.session_id, "assistant", answer)
+        await self.memory.remember(
+            original_ctx.user_id,
+            f"审批续跑：{payload['user_message'][:80]}；结论：{answer[:120]}",
+            kind="episodic",
+            importance=0.6,
+            tenant=original_ctx.tenant,
+            metadata={"skill": payload["skill"], "run_id": run_id, "status": status},
+        )
+        await ledger.append("run.end", status=status, answer=answer[:200])
         return AgentRunResult(
             run_id=run_id,
-            skill=payload.get("skill", ""),
-            answer=f"审批已通过并执行 {payload['tool']}：{result.message or '完成'}",
-            status="completed" if result.ok else "degraded",
+            skill=payload["skill"],
+            answer=answer,
+            status=status,
             evidence=ledger.evidence_card(
-                skill=payload.get("skill", ""),
-                skill_hash="",
-                trust="certified",
-                model=self.provider.name,
-                usage={},
-                final_status="completed" if result.ok else "degraded",
+                skill=payload["skill"],
+                skill_hash=manifest.content_hash,
+                trust=manifest.trust,
+                model=state["model_used"],
+                usage=usage,
+                final_status=status,
             ),
             trace=ledger.events,
         )
