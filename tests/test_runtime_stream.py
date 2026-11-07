@@ -1,14 +1,29 @@
 import pytest
-from harness.core.llm import Decision, LLMProvider
+from harness.core.llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from harness.core.manifest import SkillManifest
 from harness.core.policy import ToolPolicy
 from harness.core.runtime import AgentRuntime
 from harness.core.tools import Tool, ToolContext, ToolRegistry
 
 
+class _FakeRedis:
+    # 待审批负载重放依赖 redis 的 set/get/delete，仅保留运行时用到的三个方法。
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+
 class _FakeMemory:
     def __init__(self):
-        self.redis = None
+        self.redis = _FakeRedis()
 
     async def extract_semantic(self, user_id, message, tenant):
         return None
@@ -64,6 +79,32 @@ def _runtime(provider):
     return AgentRuntime(registry, provider, {"t": manifest}, _FakeMemory())
 
 
+def _runtime_with_approval(provider):
+    # 在 _runtime 基础上多注册一个需审批工具，用来验证 plan 中途撞审批即停。
+    registry = ToolRegistry()
+
+    async def echo(args, ctx):
+        return {"echo": args.get("text")}
+
+    async def approve_me(args, ctx):
+        return {"approved": True}
+
+    registry.register(Tool("echo", "d", {"type": "object"}, echo, ToolPolicy("echo", permission="read")))
+    registry.register(
+        Tool(
+            "approve_me",
+            "d",
+            {"type": "object"},
+            approve_me,
+            ToolPolicy("approve_me", permission="read", requires_approval=True),
+        )
+    )
+    manifest = SkillManifest(
+        "t", "0.1", "d", "vendor", ["echo", "approve_me"], {}, 3, "你是助手", "x", findings=[]
+    )
+    return AgentRuntime(registry, provider, {"t": manifest}, _FakeMemory())
+
+
 @pytest.mark.asyncio
 async def test_run_stream_yields_delta_then_final(monkeypatch):
     import harness.core.runtime as rt
@@ -92,3 +133,67 @@ async def test_run_ignores_deltas(monkeypatch):
     result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
     assert result.answer == "答案"
     assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_plan_executes_all_steps_then_final(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    steps = [
+        {"tool": "echo", "args": {"text": "a"}},
+        {"tool": "echo", "args": {"text": "b"}},
+    ]
+    provider = _StepProvider(
+        [
+            [Decision(kind="plan", steps=steps, model="fake")],
+            [Decision(kind="final", content="答案", model="fake")],
+        ]
+    )
+    runtime = _runtime(provider)
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    assert result.status == "completed"
+    assert result.answer == "答案"
+    assert result.evidence["usage"]["tool_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_plan_stops_on_approval(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    provider = _StepProvider(
+        [
+            [
+                Decision(
+                    kind="plan",
+                    steps=[
+                        {"tool": "echo", "args": {"text": "a"}},
+                        {"tool": "approve_me", "args": {}},
+                    ],
+                    model="fake",
+                )
+            ]
+        ]
+    )
+    runtime = _runtime_with_approval(provider)
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    assert result.status == "pending_approval"
+    assert result.pending["tool"] == "approve_me"
+
+
+@pytest.mark.asyncio
+async def test_plan_truncates_beyond_max(monkeypatch):
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    steps = [{"tool": "echo", "args": {"text": str(i)}} for i in range(MAX_PLAN_STEPS + 2)]
+    provider = _StepProvider(
+        [
+            [Decision(kind="plan", steps=steps, model="fake")],
+            [Decision(kind="final", content="答案", model="fake")],
+        ]
+    )
+    runtime = _runtime(provider)
+    result = await runtime.run("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))
+    assert result.evidence["usage"]["tool_calls"] == MAX_PLAN_STEPS

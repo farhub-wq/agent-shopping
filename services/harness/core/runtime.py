@@ -13,7 +13,7 @@ from typing import Any
 from shop_common.errors import ApiError
 from shop_common.logging import get_logger
 
-from .llm import Decision, LLMProvider
+from .llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from .manifest import SkillManifest
 from .memory import MemoryManager
 from .tools import ToolContext, ToolRegistry
@@ -149,58 +149,79 @@ class AgentRuntime:
                 answer = decision.content
                 break
 
-            usage["tool_calls"] += 1
-            call_event = await ledger.append("tool.call", tool=decision.tool, args=decision.args)
-            if stream:
-                yield ("trace", call_event)
-            result = await self.registry.execute(decision.tool, decision.args, ctx, trust=manifest.trust)
-            result_event = await ledger.append(
-                "tool.result",
-                tool=decision.tool,
-                status=result.status,
-                duration_ms=result.duration_ms,
-                preview=str(result.data)[:200],
-            )
-            if stream:
-                yield ("trace", result_event)
-            if result.status == "needs_approval":
-                # 不可逆动作到此为止：不执行、不继续推理，转存待审批负载等人工处理。
-                status = "pending_approval"
-                pending = {"tool": decision.tool, "args": decision.args, "reason": result.message}
-                approval_event = await ledger.append("approval.requested", tool=decision.tool, args=decision.args)
-                if stream:
-                    yield ("trace", approval_event)
-                break
-            if result.status in {"error", "denied"}:
-                # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
-                # 保证最终答案不会被当成完整成功。
-                tool_errors += 1
-                status = "degraded" if status == "completed" else status
+            # 把「单工具」与「计划」归一成有序步骤列表：plan 超出上限截断并记 trace，
+            # 避免一次决策无限执行工具（NFR-10 工具调用有上限）。
+            if decision.kind == "plan":
+                steps = decision.steps[:MAX_PLAN_STEPS]
+                if len(decision.steps) > MAX_PLAN_STEPS:
+                    truncate_event = await ledger.append(
+                        "plan.truncated", planned=len(decision.steps), executed=MAX_PLAN_STEPS
+                    )
+                    if stream:
+                        yield ("trace", truncate_event)
+            else:
+                steps = [{"tool": decision.tool, "args": decision.args}]
 
-            call_id = f"call_{uuid.uuid4().hex[:12]}"
+            # 先记一条 assistant 消息（含全部 tool_calls），再逐 step 执行并回填 tool 结果，
+            # 让消息历史对模型可见每一步的因果链（多 tool_calls 同属一轮 assistant 回合）。
+            call_ids = [f"call_{uuid.uuid4().hex[:12]}" for _ in steps]
             messages.append(
                 {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
                         {
-                            "id": call_id,
+                            "id": call_ids[index],
                             "type": "function",
                             "function": {
-                                "name": decision.tool,
-                                "arguments": json.dumps(decision.args, ensure_ascii=False),
+                                "name": step["tool"],
+                                "arguments": json.dumps(step["args"], ensure_ascii=False),
                             },
                         }
+                        for index, step in enumerate(steps)
                     ],
                 }
             )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": json.dumps(result.to_dict(), ensure_ascii=False),
-                }
-            )
+
+            halted = False
+            for index, step in enumerate(steps):
+                usage["tool_calls"] += 1
+                call_event = await ledger.append("tool.call", tool=step["tool"], args=step["args"])
+                if stream:
+                    yield ("trace", call_event)
+                result = await self.registry.execute(step["tool"], step["args"], ctx, trust=manifest.trust)
+                result_event = await ledger.append(
+                    "tool.result",
+                    tool=step["tool"],
+                    status=result.status,
+                    duration_ms=result.duration_ms,
+                    preview=str(result.data)[:200],
+                )
+                if stream:
+                    yield ("trace", result_event)
+                if result.status == "needs_approval":
+                    # 不可逆动作到此为止：本步与后续 step 都不执行，转存待审批负载等人工处理。
+                    status = "pending_approval"
+                    pending = {"tool": step["tool"], "args": step["args"], "reason": result.message}
+                    approval_event = await ledger.append("approval.requested", tool=step["tool"], args=step["args"])
+                    if stream:
+                        yield ("trace", approval_event)
+                    halted = True
+                    break
+                if result.status in {"error", "denied"}:
+                    # 工具失败不中断循环（模型还可换路），但整体标记 degraded，
+                    # 保证最终答案不会被当成完整成功。
+                    tool_errors += 1
+                    status = "degraded" if status == "completed" else status
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_ids[index],
+                        "content": json.dumps(result.to_dict(), ensure_ascii=False),
+                    }
+                )
+            if halted:
+                break
         else:
             # for-else：循环跑满步数仍未得到 final 决策，说明任务无法在预算内收敛。
             status = "max_steps_exceeded"
