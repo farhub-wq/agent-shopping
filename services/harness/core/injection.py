@@ -6,10 +6,13 @@
 - neutralize_data()：工具结果递归中和，数据照回但指令性片段失效。
 
 定位是「高召回率的第一道墙」而非语义判定：漏判由审批护栏与最小权限兜底，
-误伤按 label 观测后收窄模式。编码混淆（base64/零宽字符）不在本层范围。
+误伤按 label 观测后收窄模式。混淆绕过覆盖：NFKC 归一（全角字符）、零宽字符、
+CJK 插空格、base64 载荷解码；更深的混淆（同形西里尔字母、分片编码）留作演进。
 """
 
+import base64
 import re
+import unicodedata
 from typing import Any
 
 # 命中后替换的占位符：让指令性片段对模型失去语义，又不破坏正常数据可读性。
@@ -73,19 +76,67 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+# 混淆预处理：零宽字符集、CJK 字符间的空格（「忽 略 之 前」形态）、
+# base64 候选 token（≥16 字符，避开普通单词误解码）。
+_ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_CJK_SPACED = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_B64_MAX_TOKENS = 20  # 单条文本最多解码的候选数：防攻击者塞几千个 token 拖慢扫描
+
+
+def _normalize(text: str) -> str:
+    """归一化副本：NFKC 折叠全角字符、剥零宽字符、合并 CJK 间空格。
+
+    只用于扫描，不回写原文——归一化后的偏移与原文对不上，中和靠原模式或整段替换。
+    """
+    text = unicodedata.normalize("NFKC", text)
+    text = _ZERO_WIDTH.sub("", text)
+    return _CJK_SPACED.sub("", text)
+
+
+def _b64_candidates(normalized: str) -> list[str]:
+    """从归一化文本提取 base64 候选并解码：攻击者常把指令编码后让模型自行解码执行。"""
+    candidates: list[str] = []
+    for match in _B64_TOKEN.finditer(normalized):
+        if len(candidates) >= _B64_MAX_TOKENS:
+            break
+        try:
+            decoded = base64.b64decode(match.group(0), validate=True).decode("utf-8")
+        except Exception:
+            continue  # 非合法 base64 或非 UTF-8 内容：不是可执行指令，跳过
+        candidates.append(decoded[:512])
+    return candidates
+
+
 def scan(text: str) -> str | None:
-    """返回命中的模式 label，未命中返回 None。只取首个命中，够用且便宜。"""
-    for label, pattern in _PATTERNS:
-        if pattern.search(text):
-            return label
+    """返回命中的模式 label，未命中返回 None。
+
+    依次扫原文、归一化副本、base64 解码候选；只取首个命中，够用且便宜。
+    """
+    sources = [text]
+    normalized = _normalize(text)
+    if normalized != text:
+        sources.append(normalized)
+    sources.extend(_b64_candidates(normalized))
+    for source in sources:
+        for label, pattern in _PATTERNS:
+            if pattern.search(source):
+                return label
     return None
 
 
 def neutralize(text: str) -> str:
-    """把命中的指令性片段替换为占位符：数据保留，指令失效。"""
+    """把命中的指令性片段替换为占位符：数据保留，指令失效。
+
+    原文模式未命中但归一化/解码后命中时，无法定位原文片段——说明文本被刻意
+    混淆过，整段替换为占位符（正常业务数据不会走这条路）。
+    """
+    redacted = text
     for _, pattern in _PATTERNS:
-        text = pattern.sub(PLACEHOLDER, text)
-    return text
+        redacted = pattern.sub(PLACEHOLDER, redacted)
+    if redacted != text:
+        return redacted
+    return PLACEHOLDER if scan(text) is not None else text
 
 
 def neutralize_data(data: Any) -> Any:
