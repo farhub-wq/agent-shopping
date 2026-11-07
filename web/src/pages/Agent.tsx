@@ -23,6 +23,8 @@ export default function Agent() {
   const [evidence, setEvidence] = useState<any>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 流式答案的累积文本：逐 delta 追加，final 落库后清空，渲染成打字机效果。
+  const [streaming, setStreaming] = useState("");
   // 会话 id 在页面生命周期内固定，让多轮对话共享 Agent 的上下文与记忆。
   const sessionId = useRef(`web-${crypto.randomUUID().slice(0, 8)}`);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -32,9 +34,9 @@ export default function Agent() {
   }, []);
 
   useEffect(() => {
-    // 新消息或等待中自动滚到底部，保证流式输出始终可见。
+    // 新消息、等待中或流式累积中自动滚到底部，保证流式输出始终可见。
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, busy]);
+  }, [messages, busy, streaming]);
 
   const send = async (text: string) => {
     if (!text.trim() || busy) return;
@@ -44,14 +46,18 @@ export default function Agent() {
     setInput("");
     setTrace([]);
     setEvidence(null);
+    setStreaming("");
     try {
       await chatStream(skill, text, sessionId.current, (event) => {
-        // trace 事件逐条累积，形成工具调用证据；final 才落最终答案并记录 run_id。
+        // trace 事件逐条累积，形成工具调用证据；delta 逐片累积成流式答案；
+        // final 才把完整答案落进消息列表并记录 run_id。
         if (event.type === "trace") setTrace((prev) => [...prev, event.event]);
+        if (event.type === "delta") setStreaming((prev) => prev + event.text);
         if (event.type === "final") {
           const result = event.result;
           setRunId(result.run_id);
           setMessages((prev) => [...prev, { role: "assistant", text: result.answer }]);
+          setStreaming("");
         }
         if (event.type === "error") setError(event.message);
       });
@@ -82,7 +88,7 @@ export default function Agent() {
           <button
             key={agent.name}
             className={agent.name === skill ? "agent-item active" : "agent-item"}
-            onClick={() => { setSkill(agent.name); setMessages([]); setTrace([]); setEvidence(null); }}
+            onClick={() => { setSkill(agent.name); setMessages([]); setTrace([]); setEvidence(null); setStreaming(""); }}
           >
             <strong>{agent.name}</strong>
             <span>{agent.description}</span>
@@ -110,7 +116,12 @@ export default function Agent() {
               <p>{message.text}</p>
             </div>
           ))}
-          {busy && <div className="bubble assistant"><p className="muted">思考中…</p></div>}
+          {busy && (
+            <div className="bubble assistant">
+              {/* 流式已到文本时用正常样式，空时显示占位思考提示。 */}
+              <p className={streaming ? "" : "muted"}>{streaming || "思考中…"}</p>
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
 
