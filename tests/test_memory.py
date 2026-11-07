@@ -2,7 +2,7 @@ import json
 
 import httpx
 import pytest
-from harness.core.memory import HashingEmbedder, OpenAIEmbedder, cosine
+from harness.core.memory import HashingEmbedder, MemoryManager, OpenAIEmbedder, _compatible, cosine
 from shop_common.errors import ApiError
 
 
@@ -57,6 +57,23 @@ async def test_openai_embedder_rejects_missing_embedding():
         await embedder.embed("你好")
 
 
+@pytest.mark.asyncio
+async def test_openai_embedder_rejects_empty_embedding():
+    # 空数组不是合法向量：落盘后无法被 _compatible 接纳，等于污染记忆。
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"embedding": []}]})
+
+    embedder = OpenAIEmbedder("http://embed", "k", "m", transport=httpx.MockTransport(handler))
+    with pytest.raises(ApiError):
+        await embedder.embed("你好")
+
+
+def test_cosine_handles_unnormalized_vectors():
+    # 第三方端点可能返回未归一化向量：点积会得到 2.0，按定义算余弦应仍为 1.0。
+    assert cosine([1.0, 1.0], [2.0, 2.0]) == pytest.approx(1.0)
+    assert cosine([1.0, 0.0], [0.0, 5.0]) == pytest.approx(0.0)
+
+
 def test_build_embedder_defaults_to_hashing(monkeypatch):
     import harness.core.memory as mem
 
@@ -87,3 +104,40 @@ def test_build_embedder_uses_openai_when_configured(monkeypatch):
     embedder = mem.build_embedder()
     assert isinstance(embedder, OpenAIEmbedder)
     assert embedder.name == "openai:text-embedding-3-small"
+
+
+class _BoomEmbedder:
+    name = "boom"
+
+    async def embed(self, text):
+        raise RuntimeError("down")
+
+
+class _StubEmbedder:
+    name = "stub"
+
+    async def embed(self, text):
+        return [1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_embed_falls_back_to_hashing_on_failure():
+    manager = MemoryManager(None, embedder=_BoomEmbedder())
+    vector, name = await manager._embed("你好")
+    assert name == "hashing-256"
+    assert len(vector) == 256
+
+
+@pytest.mark.asyncio
+async def test_embed_uses_primary_when_ok():
+    manager = MemoryManager(None, embedder=_StubEmbedder())
+    vector, name = await manager._embed("你好")
+    assert name == "stub"
+    assert vector == [1.0, 0.0]
+
+
+def test_compatible_guards_dim_mismatch():
+    assert _compatible([1.0, 0.0], [0.0, 1.0]) is True
+    assert _compatible([1.0, 0.0], [1.0, 0.0, 0.0]) is False
+    assert _compatible([1.0, 0.0], []) is False
+    assert _compatible([1.0, 0.0], None) is False

@@ -4,7 +4,8 @@
 - 情节记忆：向量化后存 MongoDB，按「相似度 + 重要性 + 时间衰减」混合召回。
 - 语义记忆：从对话中抽取稳定事实（称呼、偏好、地址、过敏史），高权重长期保留。
 
-向量由确定性哈希 n-gram 生成，离线可用；配置模型后可替换为真实 embedding。
+默认用确定性哈希 n-gram 向量，离线可用；配置 embedding 端点后自动切换为真实语义向量，
+端点故障时回退哈希向量，并按向量维度隔离新旧两个向量空间。
 """
 
 import hashlib
@@ -20,9 +21,12 @@ import httpx
 from redis.asyncio import Redis
 from shop_common.config import get_settings
 from shop_common.errors import ApiError
+from shop_common.logging import get_logger
+from shop_common.metrics import EMBEDDING_FALLBACK
 from shop_common.mongo import get_mongo_db
 
 settings = get_settings()
+logger = get_logger(__name__)
 
 # 记忆集合名与索引集中在这里：Mongo 没有 schema 迁移，索引需在首次使用时幂等补建。
 MEMORY_COLLECTION = "memory_records"
@@ -66,9 +70,16 @@ class HashingEmbedder(Embedder):
 
 
 def cosine(left: list[float], right: list[float]) -> float:
+    # 按定义计算 cos = dot / (|a||b|)：哈希向量自带归一化，但「OpenAI 兼容」的第三方
+    # 端点可能返回未归一化向量，只做点积会把相似度放大到 1 以上，破坏去重阈值与召回权重。
     if not left or not right:
         return 0.0
-    return sum(a * b for a, b in zip(left, right))
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 class OpenAIEmbedder(Embedder):
@@ -100,10 +111,12 @@ class OpenAIEmbedder(Embedder):
             response.raise_for_status()
             body = response.json()
         data = body.get("data") or []
-        # 端点缺向量属坏响应：抛 ApiError 让调用方感知，而不是静默存空向量污染记忆。
-        if not data or not isinstance(data[0].get("embedding"), list):
+        embedding = data[0].get("embedding") if data and isinstance(data[0], dict) else None
+        # 端点缺向量或返回空数组都属坏响应：抛 ApiError 让调用方感知，
+        # 而不是静默存空向量——空向量无法召回，落盘即污染记忆。
+        if not isinstance(embedding, list) or not embedding:
             raise ApiError("EMBEDDING_FAILED", "嵌入端点返回缺少 embedding 向量")
-        return data[0]["embedding"]
+        return embedding
 
 
 SEMANTIC_PATTERNS = [
@@ -114,12 +127,29 @@ SEMANTIC_PATTERNS = [
 ]
 
 
+def _compatible(query: list[float], stored: list[float] | None) -> bool:
+    # 换 embedder 后新旧向量维度不同，cosine 用 zip 截断会得到伪相似度；
+    # 维度不一致的旧向量直接跳过，宁可少召回也不错召回。
+    return bool(stored) and len(stored) == len(query)
+
+
 class MemoryManager:
-    def __init__(self, redis: Redis, namespace: str = "shop") -> None:
+    def __init__(self, redis: Redis, namespace: str = "shop", embedder: Embedder | None = None) -> None:
         self.redis = redis
         self.namespace = namespace
-        self.embedder = HashingEmbedder(settings.embedding_dim)
+        self.embedder = embedder or build_embedder()
+        # 主嵌入失败时的离线保底：哈希向量与主嵌入可能不同维，落盘时标签记录实际来源。
+        self._fallback = HashingEmbedder(settings.embedding_dim)
         self._indexed = False
+
+    async def _embed(self, text: str) -> tuple[list[float], str]:
+        # 嵌入是增强路径不是关键路径：失败回退哈希并打点，保证记忆写入/召回不因端点故障 5xx。
+        try:
+            return await self.embedder.embed(text), self.embedder.name
+        except Exception as exc:
+            logger.warning("嵌入失败，回退哈希向量：%s", exc)
+            EMBEDDING_FALLBACK.labels("harness").inc()
+            return await self._fallback.embed(text), self._fallback.name
 
     def _collection(self):
         return get_mongo_db()[MEMORY_COLLECTION]
@@ -172,15 +202,19 @@ class MemoryManager:
         tenant: str = "default",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        embedding = await self.embedder.embed(text)
+        embedding, embedder_name = await self._embed(text)
         await self._ensure_indexes()
         now = datetime.now(UTC)
         collection = self._collection()
         recent = await collection.find({"user_id": user_id, "kind": kind}).to_list(length=None)
         for record in recent:
+            stored = record.get("embedding") or []
+            # 只与同维度的历史向量比去重，跨维度比较的 cosine 无意义。
+            if not _compatible(embedding, stored):
+                continue
             # 相似度 ≥ 0.92 视为同一条记忆：用新文本覆盖并提升重要性，
             # 既去重又保留最新表述，避免同一事实反复膨胀检索结果。
-            if cosine(embedding, record.get("embedding") or []) >= 0.92:
+            if cosine(embedding, stored) >= 0.92:
                 await collection.update_one(
                     {"_id": record["_id"]},
                     {
@@ -200,6 +234,8 @@ class MemoryManager:
                 "kind": kind,
                 "text": text,
                 "embedding": embedding,
+                # 记录实际产出向量的嵌入器，换模型后可按此审计并区分新旧向量空间。
+                "embedder": embedder_name,
                 "importance": importance,
                 # metadata 里带上租户：多租户接入后仍可按租户隔离记忆
                 "metadata": {**(metadata or {}), "tenant": tenant},
@@ -213,13 +249,17 @@ class MemoryManager:
     async def retrieve(
         self, user_id: str, query: str, *, k: int = 5, token_budget: int = 900
     ) -> list[dict[str, Any]]:
-        query_vector = await self.embedder.embed(query)
+        query_vector, _ = await self._embed(query)
         now_ts = time.time()
         await self._ensure_indexes()
         rows = await self._collection().find({"user_id": user_id}).to_list(length=None)
         scored: list[tuple[float, dict[str, Any]]] = []
         for record in rows:
-            similarity = cosine(query_vector, record.get("embedding") or [])
+            stored = record.get("embedding") or []
+            # 换嵌入器前的旧向量维度不同，跳过而非跨维度比较（伪相似度会污染召回排序）。
+            if not _compatible(query_vector, stored):
+                continue
+            similarity = cosine(query_vector, stored)
             created_at = record.get("created_at")
             age_days = max((now_ts - created_at.timestamp()) / 86400, 0) if created_at else 0
             # 时间衰减尺度为 7 天：exp(-age/7)，越久权重越低。
