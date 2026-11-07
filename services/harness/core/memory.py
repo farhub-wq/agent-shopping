@@ -1,7 +1,8 @@
 """三层记忆框架（自研）：工作记忆 / 情节记忆 / 语义事实。
 
 - 工作记忆：Redis 列表，保留最近若干轮对话，控制上下文成本。
-- 情节记忆：向量化后存 MongoDB，按「相似度 + 重要性 + 时间衰减」混合召回。
+- 情节记忆：向量化后存 MongoDB，两段式有界候选（重要性/最新各 Top-N）内
+  按「相似度 + 重要性 + 时间衰减」混合精排，成本与记忆总量脱钩。
 - 语义记忆：从对话中抽取稳定事实（称呼、偏好、地址、过敏史），高权重长期保留。
 
 默认用确定性哈希 n-gram 向量，离线可用；配置 embedding 端点后自动切换为真实语义向量，
@@ -30,6 +31,12 @@ logger = get_logger(__name__)
 
 # 记忆集合名与索引集中在这里：Mongo 没有 schema 迁移，索引需在首次使用时幂等补建。
 MEMORY_COLLECTION = "memory_records"
+
+# 有界召回：两路候选（重要性/最新）各取 CANDIDATE_LIMIT 条，合并去重后 Python 精排，
+# 单次召回成本与全量记录数脱钩；两路覆盖的正是混合权重里的重要性与新鲜度维度。
+CANDIDATE_LIMIT = 100
+# 去重只防「近重复」，扫描最近写入的若干条同 kind 记录即可，往前翻没有收益。
+DEDUP_SCAN_LIMIT = 50
 
 
 class Embedder:
@@ -160,9 +167,13 @@ class MemoryManager:
             return
         collection = self._collection()
         # (user_id, kind, created_at) 支撑去重时按用户+类型取最近记录；
-        # (user_id, created_at) 支撑列表与召回的时间排序。
+        # (user_id, created_at) 支撑列表的时间排序；
+        # (user_id, embedder, importance|created_at) 支撑有界召回的两路候选：
+        # embedder 等值过滤在索引层隔离向量空间，排序不回表全扫。
         await collection.create_index([("user_id", 1), ("kind", 1), ("created_at", -1)])
         await collection.create_index([("user_id", 1), ("created_at", -1)])
+        await collection.create_index([("user_id", 1), ("embedder", 1), ("importance", -1)])
+        await collection.create_index([("user_id", 1), ("embedder", 1), ("created_at", -1)])
         self._indexed = True
 
     def _work_key(self, session_id: str) -> str:
@@ -206,10 +217,17 @@ class MemoryManager:
         await self._ensure_indexes()
         now = datetime.now(UTC)
         collection = self._collection()
-        recent = await collection.find({"user_id": user_id, "kind": kind}).to_list(length=None)
+        # 去重只在同一向量空间内、最近写入的若干条里找近重复：
+        # embedder 等值条件顺带给出空间隔离，limit 让扫描成本与总量脱钩。
+        recent = await (
+            collection.find({"user_id": user_id, "kind": kind, "embedder": embedder_name})
+            .sort("created_at", -1)
+            .limit(DEDUP_SCAN_LIMIT)
+            .to_list(length=DEDUP_SCAN_LIMIT)
+        )
         for record in recent:
             stored = record.get("embedding") or []
-            # 只与同维度的历史向量比去重，跨维度比较的 cosine 无意义。
+            # 查询已按 embedder 隔离空间，这里仍按维度兜底，防手工写入的脏数据。
             if not _compatible(embedding, stored):
                 continue
             # 相似度 ≥ 0.92 视为同一条记忆：用新文本覆盖并提升重要性，
@@ -246,17 +264,39 @@ class MemoryManager:
         )
         return memory_id
 
+    async def _candidates(
+        self, user_id: str, embedder_name: str, limit: int = CANDIDATE_LIMIT
+    ) -> list[dict[str, Any]]:
+        """两段式有界召回：重要性 Top-N 与最新 Top-N 两路候选合并去重。
+
+        不做全表扫描：候选集最大 2*limit 条，与用户的记忆总量脱钩。
+        漏检只可能发生在「极旧且低重要性」的记录上，而这类记录即使召回，
+        在混合权重下也排不进 top-k，不影响实际结果。
+        """
+        base = {"user_id": user_id, "embedder": embedder_name}
+        collection = self._collection()
+        by_importance = await (
+            collection.find(base).sort("importance", -1).limit(limit).to_list(length=limit)
+        )
+        by_recency = await (
+            collection.find(base).sort("created_at", -1).limit(limit).to_list(length=limit)
+        )
+        merged: dict[Any, dict[str, Any]] = {}
+        for record in [*by_importance, *by_recency]:
+            merged.setdefault(record["_id"], record)
+        return list(merged.values())
+
     async def retrieve(
         self, user_id: str, query: str, *, k: int = 5, token_budget: int = 900
     ) -> list[dict[str, Any]]:
-        query_vector, _ = await self._embed(query)
+        query_vector, embedder_name = await self._embed(query)
         now_ts = time.time()
         await self._ensure_indexes()
-        rows = await self._collection().find({"user_id": user_id}).to_list(length=None)
+        rows = await self._candidates(user_id, embedder_name)
         scored: list[tuple[float, dict[str, Any]]] = []
         for record in rows:
             stored = record.get("embedding") or []
-            # 换嵌入器前的旧向量维度不同，跳过而非跨维度比较（伪相似度会污染召回排序）。
+            # 查询已按 embedder 隔离空间，这里仍按维度兜底，防手工写入的脏数据。
             if not _compatible(query_vector, stored):
                 continue
             similarity = cosine(query_vector, stored)
