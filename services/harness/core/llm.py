@@ -251,25 +251,17 @@ class OpenAICompatibleProvider(LLMProvider):
             body = response.json()
         message = body["choices"][0]["message"]
         usage = body.get("usage", {})
-        calls = message.get("tool_calls") or []
-        if calls:
-            # 一次决策只执行第一个工具调用：运行时按步审计，避免并发副作用难以归因。
-            call = calls[0]
-            return Decision(
-                kind="tool",
-                tool=call["function"]["name"],
-                args=json.loads(call["function"].get("arguments") or "{}"),
-                usage=usage,
-            )
-        return Decision(kind="final", content=message.get("content") or "", usage=usage)
+        decision = parse_decision(message, tools)
+        decision.usage = usage
+        return decision
 
     async def decide_stream(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> AsyncIterator[Decision]:
         payload = self._payload(system, messages, tools, stream=True)
         content_parts: list[str] = []
-        tool_name = ""
-        tool_args = ""
+        # 并行 tool_calls 的参数拆在多帧里，按 index 归位累积，避免串到同一工具的 args。
+        tool_parts: dict[int, list[str]] = {}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
                 "POST",
@@ -289,38 +281,46 @@ class OpenAICompatibleProvider(LLMProvider):
                     except ValueError:
                         # 偶发的非 JSON 心跳行直接跳过，不中断流。
                         continue
-                    content_delta, name_delta, args_delta = _openai_stream_delta(chunk)
+                    content_delta, tool_deltas = _openai_stream_delta(chunk)
                     if content_delta:
                         content_parts.append(content_delta)
                         yield Decision(kind="delta", content=content_delta)
-                    if name_delta:
-                        tool_name = name_delta
-                    if args_delta:
-                        tool_args += args_delta
-        if tool_name:
-            # 流式工具调用把参数拆在多帧里，累积后一次性解析为 args。
-            try:
-                args = json.loads(tool_args or "{}")
-            except ValueError:
-                args = {}
-            yield Decision(kind="tool", tool=tool_name, args=args, model=self.model)
+                    for index, name_delta, args_delta in tool_deltas:
+                        entry = tool_parts.setdefault(index, ["", ""])
+                        if name_delta:
+                            entry[0] = name_delta
+                        if args_delta:
+                            entry[1] += args_delta
+        if tool_parts:
+            # 组装成伪 message 交给 parse_decision 统一校验（单个 → tool，多个 → plan）。
+            tool_calls = [
+                {"function": {"name": entry[0], "arguments": entry[1]}}
+                for entry in (tool_parts[index] for index in sorted(tool_parts))
+            ]
+            decision = parse_decision({"tool_calls": tool_calls}, tools)
+            decision.model = self.model
+            yield decision
             return
         yield Decision(kind="final", content="".join(content_parts), model=self.model)
 
 
-def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, str, str]:
-    # 解析单个 SSE 数据块为 (content_delta, tool_name_delta, tool_args_delta)；
-    # 兼容端点对 delta 字段命名与是否出现不保证一致，全部安全取值，缺失返回空串。
+def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, list[tuple[int, str, str]]]:
+    # 解析单个 SSE 数据块为 (content_delta, [(index, name_delta, args_delta), ...])；
+    # 并行 tool_calls 的每个 delta 带 index，缺失字段安全返回空，绝不抛 KeyError。
     choices = chunk.get("choices") or []
     if not choices:
-        return "", "", ""
+        return "", []
     delta = choices[0].get("delta") or {}
     content = delta.get("content") or ""
     tool_calls = delta.get("tool_calls") or []
-    if tool_calls:
-        function = tool_calls[0].get("function") or {}
-        return content, function.get("name") or "", function.get("arguments") or ""
-    return content, "", ""
+    deltas: list[tuple[int, str, str]] = []
+    for position, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") or {}
+        name = function.get("name") or ""
+        args = function.get("arguments") or ""
+        index = tool_call.get("index", position)
+        deltas.append((index, name, args))
+    return content, deltas
 
 
 # 双模型都不可用时的兜底话术：明确引导转人工，且必须是 final 决策，避免循环里反复试模型。

@@ -156,22 +156,34 @@ def test_openai_stream_delta_extracts_content():
     from harness.core.llm import _openai_stream_delta
 
     chunk = {"choices": [{"delta": {"content": "你好"}, "finish_reason": None}]}
-    assert _openai_stream_delta(chunk) == ("你好", "", "")
+    assert _openai_stream_delta(chunk) == ("你好", [])
 
 
 def test_openai_stream_delta_extracts_tool_call():
     from harness.core.llm import _openai_stream_delta
 
     chunk = {"choices": [{"delta": {"tool_calls": [{"function": {"name": "echo", "arguments": "{\"x\":"}}]}}]}
-    assert _openai_stream_delta(chunk) == ("", "echo", "{\"x\":")
+    assert _openai_stream_delta(chunk) == ("", [(0, "echo", "{\"x\":")])
 
 
 def test_openai_stream_delta_tolerates_missing_fields():
     from harness.core.llm import _openai_stream_delta
 
-    assert _openai_stream_delta({}) == ("", "", "")
-    assert _openai_stream_delta({"choices": [{"delta": {}}]}) == ("", "", "")
-    assert _openai_stream_delta({"choices": []}) == ("", "", "")
+    assert _openai_stream_delta({}) == ("", [])
+    assert _openai_stream_delta({"choices": [{"delta": {}}]}) == ("", [])
+    assert _openai_stream_delta({"choices": []}) == ("", [])
+
+
+def test_openai_stream_delta_multiple_tool_calls_by_index():
+    from harness.core.llm import _openai_stream_delta
+
+    chunk = {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "echo", "arguments": "{\"x\":"}},
+        {"index": 1, "function": {"name": "check", "arguments": "{\"y\":"}},
+    ]}}]}
+    content, deltas = _openai_stream_delta(chunk)
+    assert content == ""
+    assert deltas == [(0, "echo", "{\"x\":"), (1, "check", "{\"y\":")]
 
 
 def test_settings_have_failover_defaults():
