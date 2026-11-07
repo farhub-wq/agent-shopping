@@ -348,6 +348,29 @@ def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, list[tuple[int, st
 FALLBACK_MESSAGE = "抱歉，智能客服暂时不可用，请稍后重试或联系人工客服。"
 
 
+class CannedProvider(LLMProvider):
+    """固定话术提供者：生产降级链的终点。
+
+    不用 DeterministicPlanner 兜底是有意的——关键词规划器会在模型宕机时错选工具
+    （包括 after_sales_draft 这类写操作），把不可靠结果包装成正常答案。
+    生产环境降级宁可如实告知并转人工；model 记为 unavailable，
+    证据卡可审计「本次答案非模型产出」。
+    """
+
+    name = "canned"
+
+    async def decide(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Decision:
+        return Decision(kind="final", content=FALLBACK_MESSAGE, model="unavailable")
+
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        # 契约与离线规划器一致：恰好一帧 terminal，不产 delta。
+        yield await self.decide(system, messages, tools)
+
+
 class FailoverProvider(LLMProvider):
     """主模型优先，失败或熔断时降级到备用模型，双模型都失败时返回固定话术。
 
@@ -443,7 +466,8 @@ def build_provider() -> LLMProvider:
         settings.llm_model,
         timeout=settings.llm_timeout_seconds,
     )
-    # 降级模型：配置了就用第二个 OpenAI 兼容端点，否则退回离线确定性规划器兜底。
+    # 降级模型：配置了就用第二个 OpenAI 兼容端点；没配置就用固定话术，
+    # 生产环境绝不让关键词规划器冒充模型产出（错选工具比明确不可用更危险）。
     if settings.llm_fallback_base_url and settings.llm_fallback_api_key:
         fallback: LLMProvider = OpenAICompatibleProvider(
             settings.llm_fallback_base_url,
@@ -452,7 +476,7 @@ def build_provider() -> LLMProvider:
             timeout=settings.llm_timeout_seconds,
         )
     else:
-        fallback = DeterministicPlanner()
+        fallback = CannedProvider()
 
     breaker = CircuitBreaker(
         failure_threshold=settings.llm_failure_threshold,

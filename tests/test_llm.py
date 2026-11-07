@@ -4,6 +4,7 @@ import pytest
 from harness.core.circuit import CircuitBreaker
 from harness.core.llm import (
     FALLBACK_MESSAGE,
+    CannedProvider,
     Decision,
     DeterministicPlanner,
     FailoverProvider,
@@ -235,6 +236,61 @@ def test_build_provider_returns_planner_without_config(monkeypatch):
         assert isinstance(build_provider(), DeterministicPlanner)
     finally:
         get_settings.cache_clear()
+
+
+def test_build_provider_uses_canned_without_fallback_endpoint(monkeypatch):
+    from harness.core.llm import build_provider
+    from shop_common.config import get_settings
+
+    # 仅主模型：生产降级必须落到固定话术，而不是关键词规划器冒充模型。
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:1")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_FALLBACK_BASE_URL", "")
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "")
+    get_settings.cache_clear()
+    try:
+        provider = build_provider()
+        assert isinstance(provider, FailoverProvider)
+        assert isinstance(provider.fallback, CannedProvider)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_build_provider_uses_openai_fallback_when_configured(monkeypatch):
+    from harness.core.llm import build_provider
+    from shop_common.config import get_settings
+
+    monkeypatch.setenv("LLM_BASE_URL", "http://localhost:1")
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    monkeypatch.setenv("LLM_FALLBACK_BASE_URL", "http://localhost:2")
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "k2")
+    get_settings.cache_clear()
+    try:
+        provider = build_provider()
+        assert isinstance(provider, FailoverProvider)
+        assert isinstance(provider.fallback, OpenAICompatibleProvider)
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_canned_provider_never_calls_tools():
+    # 降级终点恒为 final：kind 决定运行时不触发任何工具调用，宕机期不会有即兴动作。
+    provider = CannedProvider()
+    decision = await provider.decide("s", [{"role": "user", "content": "SKU-1001 还有货吗"}], SPECS)
+    assert decision.kind == "final"
+    assert decision.content == FALLBACK_MESSAGE
+    assert decision.model == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_canned_provider_stream_is_single_terminal_frame():
+    provider = CannedProvider()
+    frames = [item async for item in provider.decide_stream("s", [], [])]
+    # 契约：0 个 delta + 恰好一帧 terminal，与离线规划器的 tool 决策帧形态一致。
+    assert len(frames) == 1
+    assert frames[0].kind == "final"
+    assert frames[0].model == "unavailable"
 
 
 class _EchoProvider(LLMProvider):
