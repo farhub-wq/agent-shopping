@@ -222,3 +222,56 @@ async def test_failover_canned_when_both_fail():
     assert decision.kind == "final"
     assert decision.model == "unavailable"
     assert FALLBACK_MESSAGE in decision.content
+
+
+class _StreamProvider(LLMProvider):
+    name = "stream"
+
+    def __init__(self, frames, fail_after=None):
+        self.frames = frames
+        # fail_after：0 表示首帧前失败；N 表示发出第 N 帧后失败；None 表示不失败
+        self.fail_after = fail_after
+        self.emitted = 0
+
+    async def decide_stream(self, system, messages, tools):
+        if self.fail_after == 0:
+            raise RuntimeError("boom")
+        for item in self.frames:
+            self.emitted += 1
+            yield item
+            if self.fail_after is not None and self.emitted >= self.fail_after:
+                raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_failover_stream_relays_primary():
+    primary = _StreamProvider(
+        [Decision(kind="delta", content="a"), Decision(kind="final", content="ab", model="stream")]
+    )
+    fallback = _EchoProvider("B")
+    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    frames = [item async for item in provider.decide_stream("s", [], [])]
+    assert [f.kind for f in frames] == ["delta", "final"]
+    assert fallback.called is False
+
+
+@pytest.mark.asyncio
+async def test_failover_stream_falls_back_before_first_token():
+    primary = _StreamProvider([], fail_after=0)  # 首帧前即失败
+    fallback = _EchoProvider("B")
+    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    frames = [item async for item in provider.decide_stream("s", [], [])]
+    assert frames[-1].kind == "final"
+    assert frames[-1].content == "B"
+
+
+@pytest.mark.asyncio
+async def test_failover_stream_no_fallback_after_first_token():
+    primary = _StreamProvider([Decision(kind="delta", content="a")], fail_after=1)
+    fallback = _EchoProvider("B")
+    provider = FailoverProvider(primary, fallback, CircuitBreaker())
+    frames = [item async for item in provider.decide_stream("s", [], [])]
+    assert frames[0].kind == "delta"
+    assert frames[-1].kind == "final"
+    assert frames[-1].model == "unavailable"  # 收尾帧，不回退降级模型
+    assert fallback.called is False

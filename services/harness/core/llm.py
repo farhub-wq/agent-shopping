@@ -340,6 +340,39 @@ class FailoverProvider(LLMProvider):
         decision.model = self.fallback.name
         return decision
 
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        # 流式降级只能在「首 token 前」：已流出内容无法撤回，中途失败只能收尾，
+        # 不能再叠降级模型的输出，否则前端会看到两段拼在一起的答案。
+        if self.breaker.allow_request():
+            emitted = False
+            try:
+                async for frame in self.primary.decide_stream(system, messages, tools):
+                    emitted = True
+                    yield frame
+            except Exception as exc:
+                self.breaker.record_failure()
+                logger.warning("主模型流式调用失败：%s", exc)
+                if emitted:
+                    # 收尾帧：让前端结束 busy，不回退降级模型。
+                    yield Decision(kind="final", content="", model="unavailable")
+                    return
+            else:
+                self.breaker.record_success()
+                return
+        else:
+            # 熔断中：不碰主模型，直接走降级模型的流。
+            LLM_CIRCUIT_OPEN.labels("harness").inc()
+
+        LLM_FALLBACK.labels("harness").inc()
+        try:
+            async for frame in self.fallback.decide_stream(system, messages, tools):
+                yield frame
+        except Exception as exc:
+            logger.error("备用模型流式调用也失败，返回固定话术：%s", exc)
+            yield Decision(kind="final", content=self.canned_message, model="unavailable")
+
 
 def build_provider() -> LLMProvider:
     settings = get_settings()
