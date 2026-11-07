@@ -136,7 +136,7 @@ tool_calls ──> ToolRegistry.execute
 | 情节记忆 | MongoDB `memory_records` | 每轮 + 显式 remember | 混合打分召回 top-k |
 | 语义事实 | 同上（`kind=semantic`） | 正则抽取（称呼/地址/偏好/过敏） | 重要性 0.85，长期保留 |
 
-召回分 `0.6*cosine + 0.25*importance + 0.15*recency`，相似度 ≥0.92 视为重复并更新，避免记忆膨胀。向量是确定性哈希 n-gram（每 gram 三次投影降碰撞），离线可用；接真实 embedding 时只替换 `HashingEmbedder`。
+召回分 `0.6*cosine + 0.25*importance + 0.15*recency`，相似度 ≥0.92 视为重复并更新，避免记忆膨胀。向量默认由确定性哈希 n-gram 生成（每 gram 三次投影降碰撞），离线可用；配置 `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` 后自动切换为 OpenAI 兼容 `/embeddings` 的真实语义向量，端点故障回退哈希并打 `embedding_fallback_total` 指标。每条记录落盘带 `embedder` 标签，召回与去重只比较同维度向量，换模型后旧向量自动跳过（宁可少召回不误召回）。
 
 ## 5. 网关
 

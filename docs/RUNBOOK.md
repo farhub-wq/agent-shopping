@@ -226,7 +226,7 @@ docker build -t shop-agent-sandbox:latest infra/sandbox
 | 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
-| 记忆检索结果差 | 无模型时用哈希 n-gram | 属预期；接真实 embedding 后重建索引 |
+| 记忆检索结果差 | 未配真实嵌入，或端点故障回退哈希 | 配 `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` 启用真实向量；换模型/维度后旧向量被维度守卫跳过，需清理或重建 `memory_records` |
 
 ## 7. 当前验证状态
 
