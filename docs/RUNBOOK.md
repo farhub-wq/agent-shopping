@@ -57,7 +57,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 ```
 
-当前结果：`270 passed`。
+当前结果：`318 passed`。
 
 只启动不依赖 Redis 的服务做冒烟：
 
@@ -196,27 +196,65 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 
 **runner 只持有专用密钥与受限 Redis 凭据**（SBX-15/16）：runner 不接受 Bearer JWT，`Authorization` 头不参与鉴权；harness 用 `RUNNER_SIGNING_SECRET` 签身份头，runner 用同一把专用密钥验签，二者都不得复用 `INTERNAL_SIGNING_SECRET`。runner 的 Redis 连接走 `SANDBOX_REDIS_URL`（受限 ACL 用户 `sandbox-runner`），只允许 `sandbox:exec:*` 与 `shop:events:audit`，不能读业务键。Redis 的 `default` 用户已改为密码认证，业务服务通过 `REDIS_PASSWORD` 注入凭据；runner 容器拿不到该密码，因此无法匿名绕过 ACL。非 dev 下缺任一项 runner 直接拒绝启动。
 
-**生产必须是 rootless dockerd**：runner 被攻破时若连的是默认 `/var/run/docker.sock`（root 守护进程），攻击者等于拿到宿主 root，容器加固全部失效。因此生产 overlay 把 rootless socket 挂到容器内独立路径，并由 runner 启动守卫强制校验：
+**隔离档位（`SANDBOX_ISOLATION_MODE`）**：生产有互斥的两种隔离形态，默认 `rootless`。
 
-- `SANDBOX_DOCKER_HOST` 生产必填，且不允许是默认 root socket，否则 runner 拒绝启动；
+| 档位 | Docker 端点 | 守护进程 | runner 运行身份 | 节点要求 | 适用场景 |
+|---|---|---|---|---|---|
+| `rootless`（默认） | 必须显式，禁止默认 root socket | rootless dockerd | 沙箱用户 uid/gid（socket 属主） | 可与业务同机 | 单机小规模 |
+| `dedicated` | 必须显式本地 `unix://` socket | rootful dockerd | 容器内 root | **只跑沙箱栈**，不承载业务容器/业务库/业务密钥 | 生产推荐 |
+
+**rootless 档位必须是 rootless dockerd**：runner 被攻破时若连的是默认 `/var/run/docker.sock`（root 守护进程），攻击者等于拿到宿主 root，容器加固全部失效。生产 overlay 把 rootless socket 挂到容器内独立路径，并由 runner 启动守卫强制校验：
+
+- `SANDBOX_DOCKER_HOST` 生产必填：`rootless` 档位不允许默认 root socket；`dedicated` 档位不允许空值（会回落 SDK 默认）或 `tcp://`（远端 root 守护进程），只接受本地 `unix://`；
 - `SANDBOX_RUNTIME` 生产强制 `runsc`（gVisor），共享宿主内核的 runc 被启动守卫拒绝；
-- `/healthz` 在不可达、隔离退化或 runsc 未注册时返回 **HTTP 503**，并暴露 `docker.rootless` / `docker.insecure` / `docker.runtime_ok` 供定位。
+- `/healthz` 在不可达、隔离退化、档位与守护进程不符、节点混部或 runsc 未注册时返回 **HTTP 503**，并暴露 `docker.rootless` / `docker.insecure` / `docker.runtime_ok` / `isolation.mode` / `isolation.node_exclusive` / `isolation.foreign_containers` 供定位。
+
+**dedicated 档位为什么可以接受 rootful**：`rootless + runsc` 在部分内核/发行版上不可用（systemd cgroup manager 需要系统总线授权，改 cgroupfs 驱动又会撞 `cgroup.subtree_control` 权限），实测 rootful + runsc 正常。于是把风险从「进程权限」转移到「节点边界」：Docker 守护进程只服务沙箱，节点不承载任何业务容器与数据，失陷上限是可整机重建的节点本身；gVisor 继续收敛内核 CVE 面。**这条前提不可协商**——`dedicated` 节点上出现任何非沙箱容器时，runner 在每次执行前拒绝（返回 `unavailable`）并让 healthz 503。
+
+节点独占靠容器标签 `shop.sandbox.role` 判定：`runner`（runner 自身）、`execution`（沙箱执行容器，runner 自动打标）、`infra`（节点上的沙箱配套容器，如本地 Redis，由 compose 显式声明）。其它标签或没有标签的容器一律视为混部。
 
 宿主侧初始化已脚本化（Debian/Ubuntu，root 执行，幂等）：
 
 ```bash
+# rootless（默认）：rootless dockerd + runsc
 sudo make setup-sandbox-host
-# 等价于：sudo bash infra/rootless-docker/setup.sh
+
+# dedicated：rootful dockerd + runsc（专用节点）
+sudo -E SANDBOX_SETUP_MODE=dedicated make setup-sandbox-node
+# 可选镜像加速（不会把第三方源固化进仓库）：DOCKER_REGISTRY_MIRRORS=https://mirror.example
 ```
 
-脚本会创建专用用户、开启 linger、安装 rootless dockerd 与 gVisor（runsc）、把 runsc 写入该用户的 `daemon.json`，最后打印：
+rootless 分支最后打印：
 
 ```
 SANDBOX_ROOTLESS_SOCKET=/run/user/<uid>/docker.sock
 SANDBOX_RUNTIME=runsc
+SANDBOX_UID=<uid>
+SANDBOX_GID=<gid>
 ```
 
-把这两行写入部署机 `.env`。之后 runner 只接受 rootless dockerd + runsc 的组合。
+把这些写入部署机 `.env`，runner 只接受 rootless dockerd + runsc 的组合。dedicated 分支打印：
+
+```
+SANDBOX_ISOLATION_MODE=dedicated
+SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock
+SANDBOX_RUNTIME=runsc
+```
+
+**专用节点部署**（与业务栈分开，节点只跑沙箱栈）：
+
+```bash
+# 1) 节点 .env 只放沙箱所需配置：SANDBOX_IMAGE(digest)、RUNNER_SIGNING_SECRET、
+#    SANDBOX_REDIS_URL（受限 ACL）、SANDBOX_RUNNER_BIND=<节点私网 IP>
+# 2) 在节点自身 rootful dockerd 上构建镜像并取 digest：make build-sandbox-image
+# 3) 起 runner：8000 只绑 SANDBOX_RUNNER_BIND（默认 127.0.0.1），不发布其它端口
+docker compose -f docker-compose.sandbox-node.yml up -d --build
+# 4) 业务侧 harness 指向节点：.env 设 SANDBOX_RUNNER_URLS=http://<节点私网 IP>:8000
+```
+
+节点要求：不部署业务服务/业务库/业务密钥；防火墙只放行 harness 网段到 8000；节点可整机重建。`SANDBOX_IMAGE` 留空仍是 tag 时会被启动守卫拒绝（dedicated 不放宽 digest 校验）。
+
+**跨节点去重依赖共享 Redis**：专用节点的 runner 仍需通过 `SANDBOX_REDIS_URL` 连接同一份受限 ACL Redis（执行锁 + 结果缓存 + 审计流）。若改在节点本地起 Redis，跨节点去重会退化为「每节点独立锁」，只在单 runner 部署时可接受，必须在 `.env` 注释中写明。
 
 gVisor 兼容性：Python 标准库与镜像内预装依赖需在部署机跑一遍真实脚本回归。runsc 不支持个别 syscall，表现为沙箱执行失败（fail-closed，不会静默回落 runc）；这也是生产强制它的代价。
 
@@ -243,9 +281,10 @@ gVisor 兼容性：Python 标准库与镜像内预装依赖需在部署机跑一
 
 ```bash
 # 1) 构建并输出内容寻址的 SANDBOX_IMAGE（形如 sha256:...）。
-#    生产必须构建进 runner 实际连接的 rootless dockerd，否则 runner 会一直 ImageNotFound：
-#    SANDBOX_DOCKER_HOST 填 setup.sh 打印的宿主 socket（SANDBOX_ROOTLESS_SOCKET）
+#    镜像必须构建进 runner 实际连接的守护进程，否则 runner 会一直 ImageNotFound：
+#    rootless 档位填 setup.sh 打印的宿主 socket（SANDBOX_ROOTLESS_SOCKET）
 SANDBOX_DOCKER_HOST=unix:///run/user/<uid>/docker.sock make build-sandbox-image
+#    dedicated 档位在专用节点上直接 make build-sandbox-image（走本机 rootful 默认端点）
 #    本地开发直接 make build-sandbox-image 即可（走 Docker Desktop 默认端点）
 # 2) 把上一步输出的 SANDBOX_IMAGE 写入部署机 .env（禁止保留 :latest）
 # 3) 确认镜像在 runner 端点可见后再重启
@@ -275,9 +314,10 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 
 `POST /api/agents/sandbox/run` 仅供 staff，runner 侧会再校验一次（非 staff 返回 403）；执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
 
-### 5.1 部署机待办与验证清单（待执行）
+### 5.1 同机 rootless 部署机待办与验证清单（待执行）
 
 > 本地代码侧通过不等于部署机可用。以下每一项都必须在部署机执行并回填结果；全部完成前，沙箱不得标记为可上线。
+> 专用节点（`dedicated` 档位）用 §5.2 清单，不要在本清单里混用 rootless 的 socket 与 uid/gid。
 > 约定：`$ROOTLESS` 为 `setup.sh` 打印的宿主 socket（如 `/run/user/1000/docker.sock`），`$TOKEN` 为 §4.1 登录得到的 staff access token。
 
 **环境前提（不满足则停止）**
@@ -364,6 +404,78 @@ except Exception as exc:
 |  | E | gVisor 兼容性 |  |  |
 |  | F | 告警与运维 |  |  |
 
+### 5.2 专用节点（dedicated）部署与验证清单（2026-11-08 已执行节点侧；控制面项待补）
+
+> 必须在**干净专用节点**执行：与本仓库业务栈不共机，节点上没有业务容器、业务库与业务密钥。混部节点（例如同时跑 erp-agent 的部署机）只能走 §5.1 的 rootless 清单，不能用本清单验收 dedicated。
+> 约定：`$NODE` 为节点私网 IP，`$TOKEN` 为 §4.1 登录得到的 staff access token，控制面 `.env` 指业务侧 harness 所在机器。
+
+**环境前提（不满足则停止）**
+
+- [x] 节点仅运行沙箱栈：`docker ps --format '{{.Names}} {{.Label "shop.sandbox.role"}}'` 只出现带 `runner` / `execution` / `infra` 标签的容器。
+- [x] 节点不承载业务数据：无 MySQL / Mongo / 业务 Redis 容器，无业务库挂载。
+- [x] 节点私网可达 harness，且公网只放行运维 SSH；8000 不对公网开放。
+
+**A. 宿主初始化与 `.env`**
+
+- [x] `sudo -E SANDBOX_SETUP_MODE=dedicated make setup-sandbox-node`，脚本退出 0。
+- [x] `docker info --format '{{.Runtimes}}'` 含 `runsc`；`docker info --format '{{.SecurityOptions}}'` **不含** `rootless`。
+- [x] 节点 `.env` 写入 `SANDBOX_ISOLATION_MODE=dedicated`、`SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock`、`SANDBOX_RUNTIME=runsc`。
+- [x] 节点 `.env` 写入 `RUNNER_SIGNING_SECRET`（≥32 字符，与 `INTERNAL_SIGNING_SECRET` 不同）与受限 ACL 的 `SANDBOX_REDIS_URL`；**不得**出现 `JWT_SECRET` / `INTERNAL_SIGNING_SECRET` / `REDIS_PASSWORD`。
+- [x] `docker compose -f docker-compose.sandbox-node.yml config --format json` 中 `services.sandbox-runner.environment` 只含上述沙箱参数与隔离类参数。
+- [ ] 控制面 `.env` 写入 `SANDBOX_RUNNER_URLS=http://$NODE:8000`，`SANDBOX_ENABLED=true`。
+
+**B. 镜像（必须与节点 rootful 守护进程一致）**
+
+- [x] 在节点执行 `make build-sandbox-image`，记录 `SANDBOX_IMAGE=sha256:...` 并写入节点 `.env`。
+- [x] `docker image inspect <digest>` 在节点成功返回（runner 与构建共用同一守护进程）。
+- [x] `docker compose -f docker-compose.sandbox-node.yml up -d --build`，`docker compose ps` 持续 `healthy`，无反复重启。
+
+**C. 健康与隔离档位**
+
+- [x] `curl -fsS http://$NODE:8000/healthz` 期望 `status=ok`、`isolation.mode=dedicated`、`isolation.node_exclusive=true`、`docker.rootless=false`、`docker.runtime_ok=true`、`image_pinned=true`、`security.secrets_configured=true`。
+- [ ] 业务侧 `/sandbox/health` 期望 `enabled=true`、`backend=remote`、对应 runner 状态 `ok`。
+
+**D. 节点独占强制（核心验收项）**
+
+- [x] 在节点临时启动一个非沙箱容器（如 `docker run -d --name mixed-in alpine:3.20 sleep 3600`），不带 `shop.sandbox.role` 标签。
+- [x] `curl -fsS http://$NODE:8000/healthz` 返回 **503**，`isolation.foreign_containers` 列出 `mixed-in`。
+- [x] 此时调用沙箱执行，期望 `status=unavailable`，`docker ps` 中没有新建的执行容器（执行边界已拒绝）。
+- [x] 删除临时容器后 healthz 恢复 200，`isolation.node_exclusive=true`（健康检查按请求时探测，无需重启 runner）。
+
+**E. 端到端功能与隔离探针**
+
+- [x] 基本执行：`{"code":"print(6*7)"}` 期望 `status=ok`、`stdout=42`。
+- [x] 隔离探针（同 §5.1 D 代码），期望 `UID=65534`、`NETWORK_BLOCKED`、`READONLY_OK`。
+- [x] 实际运行时为 runsc：执行 sleep 脚本期间在节点运行
+  `docker ps -q | xargs -r docker inspect --format '{{.HostConfig.Runtime}} {{.Config.Image}} {{.Config.Labels}}'`
+  期望 `runsc sha256:... map[shop.sandbox.role:execution]`。
+- [x] 端口暴露面：节点 `ss -lntp` 中 8000 只绑 `$NODE:8000`（或 127.0.0.1），无 3306/6379/27017。
+- [ ] fail-closed：停掉 runner 后沙箱调用 `status=unavailable`，harness 日志无「本地子进程执行」。
+- [x] 内存炸弹与输出刷屏按 §5.1 D 同法验证；节点磁盘与内存保持稳定。
+
+**F. 观测与运维**
+
+- [ ] healthz 503 能被告警发现；节点容器清单可作为「混部」巡检项。
+- [x] `docker compose logs sandbox-runner` 无刷屏；节点可整机重建（重建后只需 `.env` + 镜像 digest + compose 文件）。
+- [ ] gVisor 兼容性回归（SBX-09）在 dedicated 档位重跑一遍，结果回填 sandbox-hardening。
+
+**结果记录**
+
+| 日期 | 分组 | 命令/用例 | 实际结果 | 结论 |
+|---|---|---|---|---|
+| 2026-11-08 | A | setup-sandbox-node + `.env` | `runc+runsc`、无 rootless；环境只含沙箱参数（无 `JWT_SECRET`/`INTERNAL_SIGNING_SECRET`/`REDIS_PASSWORD`） | 通过 |
+| 2026-11-08 | B | 节点构建/镜像可见/healthy | `SANDBOX_IMAGE=sha256:e73edb37…`；runner 容器 healthy，未重启 | 通过 |
+| 2026-11-08 | C | healthz dedicated + harness | 200；`isolation.mode=dedicated`、`node_exclusive=true`、`docker.rootless=false`、`runtime_ok=true`、`image_pinned=true`、`secrets_configured=true`；harness 项未验证 | 节点侧通过 |
+| 2026-11-08 | D | 混部容器 → 503 + unavailable | healthz→503 且 `foreign_containers=["mixed-probe"]`；`/run`→`unavailable`，无新建容器；删除后 healthz→200 | 通过 |
+| 2026-11-08 | E | 端到端 + 探针 + 端口面 | `42`；`uid=65534`；`NETWORK_BLOCKED`；`ROOTFS_READONLY`；`runtime=runsc`、`network=none`、`capdrop=[ALL]`、`shm=16MB`；timeout 20s→`status=timeout`；同 execution_id 第二次耗时一致；20KB→`truncated=true`；400MB 写入→`exit_code=137` | 通过（修复 2 处缺陷） |
+| 2026-11-08 | F | 告警、重建与 gVisor 回归 | 日志无刷屏；8000 仅 127.0.0.1；告警未验证（节点无 Prometheus）；SBX-09 兼容性未跑 | 部分通过 |
+
+**验收中发现并修复的缺陷（2026-11-08）**
+
+1. `container.wait` 读超时被 urllib3 2.x 包装成 `ConnectionError`，未映射为 `timeout`，实测返回 `infra_error`。修复：仅对错误文本含 `read timed out` 的 `ConnectionError` 按 timeout 处理，其余连接故障仍走基础设施错误；补 `test_wait_wrapped_read_timeout_maps_to_timeout` 与 `test_wait_connection_error_maps_to_infra_error`。
+2. 只设 `mem_limit` 时 Docker 默认放开同等大小 swap，256MB 限制下脚本仍可写入 400MB。修复：`memswap_limit` 与 `mem_limit` 取同值禁用 swap，实测 400MB 写入立即 `exit_code=137`，宿主内存稳定。
+3. 受限网络构建：`infra/Dockerfile` 增加 `APT_MIRROR` / `PIP_INDEX_URL` / `PIP_TRUSTED_HOST` 构建参数（默认仍为官方源），节点构建传阿里云镜像，避免卡在 `deb.debian.org` 与 `pypi.org`。
+
 ## 6. 故障排查
 
 | 现象 | 可能原因 | 处理 |
@@ -392,6 +504,11 @@ except Exception as exc:
 | 服务启动即退出并提示「生产环境安全配置不合格」 | `ENV=prod` 但密钥仍是开发默认值/长度不足 | 按 `.env.example` 注入随机密钥，identity/payment 还要各自专属密钥 |
 | sandbox-runner 启动报 `RUNNER_SIGNING_SECRET` / `SANDBOX_REDIS_URL` 不合格 | runner 密钥复用内网密钥，或 Redis 仍用共享/默认用户 | 注入独立的 `RUNNER_SIGNING_SECRET` 与非 `default`、带密码的 `SANDBOX_REDIS_URL` |
 | sandbox-runner 启动报 `SANDBOX_NETWORK`/`SANDBOX_CPU`/`SANDBOX_MEMORY_MB` 不合格 | 生产隔离参数被改回 bridge/host 或资源上限过高 | 恢复 `none` 与 (0, 2.0] 核、(0, 2048] MB；扩容需改代码常量并扩容专用宿主机 |
+| sandbox-runner 启动报 `SANDBOX_ISOLATION_MODE` 无法识别 | 档位值拼错（如 `dedicated-node`） | 只能是 `rootless` 或 `dedicated`；拼错不回落默认，避免隔离预期与部署不一致 |
+| dedicated 档位启动报端点不合格 | `SANDBOX_DOCKER_HOST` 为空或写成 `tcp://` | 专用节点必须显式 `unix:///var/run/docker.sock`（本地 socket，不接受远端守护进程） |
+| dedicated 档位 healthz 503 且 `isolation.foreign_containers` 非空 | 节点混部：存在无 `shop.sandbox.role` 标签（或标签不在 `execution/runner/infra`）的容器 | 移走业务容器；临时维护容器加 `shop.sandbox.role=infra` 标签后重启 runner |
+| dedicated 档位 healthz 503 且 `isolation.mode_mismatch=true` | 声明 dedicated 却连到 rootless 守护进程 | 按专用节点重新执行 `setup-sandbox-node`；或改回 `rootless` 档位与 rootless socket |
+| 沙箱返回 `unavailable` 且 stderr 提示「专用节点存在非沙箱容器」 | 执行边界独占检查拦截（节点混部） | 清理非沙箱容器；这是预期 fail-closed，不会回退 runc 或本地进程 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
 | 记忆检索结果差 | 未配真实嵌入，或端点故障回退哈希 | 配 `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` 启用真实向量；换模型/维度后旧向量被维度守卫跳过，需清理或重建 `memory_records` |
 
@@ -399,7 +516,7 @@ except Exception as exc:
 
 已执行：
 
-- `pytest -q` → **270 passed**
+- `pytest -q` → **318 passed**
 - `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
 - `cd web && npm install && npm run build` → **构建成功**

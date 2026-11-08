@@ -6,16 +6,17 @@
 ## 0. 现状基线
 
 ```
-浏览器 → gateway → harness ──签名身份头 + X-Execution-Id──→ sandbox-runner ──rootless docker.sock──→ 一次性容器
+浏览器 → gateway → harness ──签名身份头 + X-Execution-Id──→ sandbox-runner（专用节点） ──rootful / rootless docker.sock──→ 一次性容器
                                     │                              │
                                     └──── 内网 HTTP 故障转移 ────────┴── Redis（执行锁 + 结果缓存）
 ```
 
-- 隔离档位：**生产 gVisor（runsc，用户态内核）**；本地开发未装 runsc 时回落容器级（共享宿主内核）。非 microVM。
-- Docker 端点：**生产必须接 rootless dockerd**，默认 root socket 仅限本地开发（启动守卫拦截，见 SBX-04）。
-- runner 是唯一持有 Docker socket 的组件；生产挂载 rootless dockerd 的 socket，不再是宿主 root 守护进程。
+- 隔离档位由 `SANDBOX_ISOLATION_MODE` 决定：`rootless`（默认，同机 rootless dockerd）与 `dedicated`（专用节点 rootful dockerd，节点只跑沙箱栈）。
+- 生产 gVisor（runsc，用户态内核）两档位都强制；本地开发未装 runsc 时回落容器级（共享宿主内核）。非 microVM。
+- Docker 端点：`rootless` 档位生产必须接 rootless dockerd，默认 root socket 仅限本地开发（启动守卫拦截，见 SBX-04）；`dedicated` 档位允许 rootful socket，由节点独占 + gVisor + digest 补偿（见 SBX-17）。
+- runner 是唯一持有 Docker socket 的组件；`dedicated` 节点不承载业务容器、业务库与业务密钥，失陷上限是节点本身。
 - 执行失败 fail-closed，不回退本地子进程；`SANDBOX_ENABLED=false` 仅限本地演示。
-- 已具备：`network=none`、只读根、`/tmp` 32MB tmpfs、CPU/内存/PID 限制、`no-new-privileges`、uid 65534、`python -I`、输出 8KB 截断、跨实例执行去重、all-staff 鉴权。
+- 已具备：`network=none`、只读根、`/tmp` 32MB tmpfs、CPU/内存/PID 限制、`no-new-privileges`、uid 65534、`python -I`、输出 8KB 截断、跨实例执行去重、all-staff 鉴权、执行容器角色标签。
 
 **判断**：阶段一配置级洞口（SBX-01/02/03/05/06）与阶段三审计/模型安全（SBX-07/08/14）已全部关闭；剩余集中在 gVisor 部署验证、孤儿容器回收、全局配额与冷启动。
 
@@ -41,6 +42,8 @@
 | SBX-14 | P2 | 输入边界 | harness 侧 `SandboxRequest.code` 无长度上限，超限请求要跨网传到 runner 才被拒 | ☑ 2026-11-08 |
 | SBX-15 | P1 | 密钥半径 | runner 同时持有 `JWT_SECRET`/`INTERNAL_SIGNING_SECRET`，并与业务服务共用 Redis 凭据；被攻破后能伪造任意 staff 身份、读写全部业务数据 | ☑ 2026-11-08 |
 | SBX-16 | P1 | 凭据隔离 | Redis `default` 用户为 `nopass +@all`，runner 被攻破后可匿名连接绕过受限 ACL，直接读写全库 | ☑ 2026-11-08 |
+| SBX-17 | P1 | 节点边界 | rootless + gVisor 在部分内核不可用，需专用节点 rootful 档位；必须用节点独占替代 rootless 的进程级降权 | ◐ 2026-11-08 |
+| SBX-18 | P1 | 资源耗尽 | 只设 `mem_limit` 时 Docker 默认放开同等 swap，内存炸弹可绕过上限 | ☑ 2026-11-08 |
 
 ---
 
@@ -139,7 +142,7 @@
 
 ### SBX-09~13（P2，待排期）
 
-- **SBX-09 gVisor（代码与部署已就绪 2026-11-08）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到 rootless daemon 的 `daemon.json`；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。**待办**：在部署机跑 `python -I` 与镜像预装依赖（numpy/pandas 等）的兼容性回归，通过后勾选 ☑。
+- **SBX-09 gVisor（代码与部署已就绪 2026-11-08）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。**待办**：在部署机跑 `python -I` 与镜像预装依赖（numpy/pandas 等）的兼容性回归，通过后勾选 ☑。
 - **SBX-10 孤儿容器回收**：容器打 label（`sandbox.execution_id`），runner 启动时与定时任务清理超龄容器；或 `auto_remove=True` + 结果读取前先取日志（当前先 wait 后 logs，顺序要调整）。
 - **SBX-11 全局配额**：多 worker 下并发上限除以 worker 数，或引入 Redis 全局信号量；按租户加权配额。
 - **SBX-12 预热池**：镜像分层 + 容器池 / microVM snapshot；先量 P95 冷启动再决定是否投入。
@@ -170,6 +173,27 @@
   - compose 只在业务服务注入 `REDIS_PASSWORD`，runner 容器仍拿不到该密码；Redis 健康检查改为带认证的 `PING`。
 - **验证**：`test_prod_rejects_anonymous_redis`、`test_prod_rejects_whitespace_redis_password`、`test_resolved_redis_url_injects_password`；容器内实测匿名 `PING`/`GET` 被拒，带密码 `default` 与受限 `sandbox-runner` 行为符合预期。
 
+### SBX-17 专用沙箱节点档位（P1，节点侧已验收 2026-11-08，控制面待补）
+
+- **证据**：部署机 121.41.73.188（Ubuntu 22.04 / kernel 5.15）实测 `rootless + runsc` 不可用——systemd cgroup manager 走系统总线被 polkit 拒（`Interactive authentication required`）；改 cgroupfs 驱动后 `open /sys/fs/cgroup/cgroup.subtree_control: permission denied`；`--rootless` 与容器 create 不兼容；仅 `--ignore-cgroups` 可跑但丢失 CPU/内存限额。同一宿主 rootful + runsc 正常（`Linux 4.19.0-gvisor`）。
+- **方案**：新增 `SANDBOX_ISOLATION_MODE`（`rootless` 默认 / `dedicated`）。`dedicated` 允许 rootful 本地 unix socket，但仍强制 runsc、digest 镜像、`network=none`、CPU/内存上限；安全性由**节点独占**承担——节点只运行带 `shop.sandbox.role ∈ {execution, runner, infra}` 标签的容器，不承载业务容器、业务库与业务密钥，失陷上限是可整机重建的节点。
+- **实施**：
+  - 启动守卫按档位分支：`rootless` 保留「禁止默认 root socket」；`dedicated` 要求显式 `unix://`（拒绝空值与 `tcp://` 远端守护进程），其余生产约束一条不放宽。
+  - 节点独占在**执行边界**强制：`_run_blocking` 创建容器前列举运行中容器，发现非白名单容器即返回 `unavailable` 且不创建容器（harness 不读 compose health，只有执行边界拦得住）。启动期再做一次尽力校验，守护进程不可达只告警不阻断。
+  - `/healthz` 新增 `isolation.mode` / `isolation.node_exclusive` / `isolation.foreign_containers` / `isolation.mode_mismatch`；任一不成立返回 503。执行容器自动打 `shop.sandbox.role=execution` 标签（同时为 SBX-10 铺路）。
+  - 部署拆分：`docker-compose.sandbox-node.yml` 只跑 runner，8000 只绑 `SANDBOX_RUNNER_BIND`（默认 127.0.0.1）；`setup.sh` 增加 `SANDBOX_SETUP_MODE=dedicated` 分支（rootful docker-ce + runsc + 实机校验），`make setup-sandbox-node` 为入口。
+- **残余风险**：runner 被攻破仍然等价节点 root（rootful socket 固有属性）。补偿是节点不承载任何业务数据与密钥、端口只绑私网、节点可整机重建。**禁止把 dedicated 档位套到混部节点上**（例如同时跑 erp-agent 的部署机）。
+- **验证**：`test_prod_dedicated_accepts_root_socket`、`test_prod_dedicated_requires_explicit_endpoint`、`test_prod_dedicated_rejects_tcp_endpoint`、`test_prod_rejects_unknown_isolation_mode`、`test_healthz_exposes_dedicated_isolation`、`test_healthz_returns_503_when_node_not_exclusive`、`test_healthz_returns_503_when_isolation_mode_mismatches`、`test_dedicated_refuses_execution_on_contaminated_node`、`test_dedicated_executes_when_node_is_exclusive`、`test_run_labels_execution_container`。
+- **节点验收（2026-11-08，121.41.73.188）**：宿主 rootful + `runsc`、`SecurityOptions` 无 rootless；`/healthz` 返回 `status=ok`、`mode=dedicated`、`node_exclusive=true`、`runtime_ok=true`、`image_pinned=true`；临时启动无标签容器 `mixed-probe` 后 healthz→**503** 且 `foreign_containers=["mixed-probe"]`，此时 `/run`→`unavailable` 且未创建执行容器；删除容器后 healthz 自动恢复 200。执行侧实测 `runtime=runsc`、`network=none`、`readonly=true`、`capdrop=[ALL]`、`shm=16MB`、`uid=65534`、`NETWORK_BLOCKED`、`ROOTFS_READONLY`，8000 只绑 `127.0.0.1`。完整记录见 [RUNBOOK §5.2](../RUNBOOK.md#52-专用节点dedicated部署与验证清单2026-11-08-已执行节点侧控制面项待补)。
+- **待办**：控制面 `SANDBOX_RUNNER_URLS=http://<node>:8000` 与 `/sandbox/health` 未在本轮验证（专用节点不承载业务栈）；gVisor 兼容性回归（SBX-09）与告警发现（Prometheus）待补。补齐后再勾选 ☑。
+
+### SBX-18 内存上限可被 swap 绕过（P1）
+
+- **证据**：验收时 `SANDBOX_MEMORY_MB=256`，沙箱内 `bytearray(400MB)` 逐页写入仍成功返回；`docker inspect` 确认 `HostConfig.Memory=268435456` 与 `NanoCpus=500000000` 已下发，`runsc` 也带 `--total-memory 268435456`。
+- **原因**：只设 `mem_limit` 时 Docker 默认放开同等大小 swap（`memswap_limit` 未设约等于 2×memory）。宿主机有 4GB swap，超出部分被换出而不是触发 OOM，内存上限形同虚设，还会拖垮节点 swap 与磁盘 IO。
+- **修复（2026-11-08）**：`create_kwargs` 增加 `memswap_limit` 并与 `mem_limit` 取同值（禁用 swap）。复测同一 400MB 逐页写入 → `exit_code=137`（OOM），`free -m` 前后稳定。
+- **验证**：`test_run_applies_container_hardening` 断言 `memswap_limit == mem_limit`；节点集成复测见 [RUNBOOK §5.2](../RUNBOOK.md#52-专用节点dedicated部署与验证清单2026-11-08-已执行节点侧控制面项待补) 结果记录。
+
 ---
 
 ## 3. 实现难点（设计取舍，不是单点 bug）
@@ -193,7 +217,7 @@
 
 | 威胁面 | 具体泄露点 | 现状 | 目标 | 对应条目 |
 |---|---|---|---|---|
-| 宿主逃逸 | 共享内核 CVE、runc/Docker 漏洞、docker.sock 等价 root、privileged、host path 挂载、cgroup v1 逃逸 | 已切 rootless dockerd + 生产强制 runsc，启动守卫与 healthz 双重校验（待宿主兼容性回归） | rootless + gVisor 已完成代码侧收敛 | SBX-04、SBX-09 |
+| 宿主逃逸 | 共享内核 CVE、runc/Docker 漏洞、docker.sock 等价 root、privileged、host path 挂载、cgroup v1 逃逸 | 两档位均强制 runsc；`rootless` 档位用 rootless dockerd 降权，`dedicated` 档位用节点独占 + 私网端口 + 可重建节点补偿 rootful socket；启动守卫与 healthz 双重校验（待专用节点验收） | 生产二选一：rootless dockerd 或专用节点 rootful + 节点独占 | SBX-04、SBX-09、SBX-17 |
 | 网络外泄 | 内网服务探测、云元数据 `169.254.169.254`、DNS 外带、SSRF、DDoS 跳板 | 生产硬锁 `none`，非 dev 改成 `bridge`/`host` 直接拒绝启动 | 硬锁 none + allowlist egress 代理 | SBX-05 |
 | 供应链 | `pip install` 恶意包、基础镜像被替换/tag 漂移 | 生产已强制 digest pinning；无镜像白名单；运行期安装被 `network=none` + 只读根文件系统阻断 | 补镜像白名单 | SBX-01、D2 |
 | 资源 DoS | 日志刷爆磁盘、`/dev/shm` 滥用、句柄耗尽、内存/CPU 抢占、并发容器压垮守护进程 | CPU/内存/PID 已限；日志已封顶 1MB/容器；shm 16MB + nofile 1024 已限；生产 CPU/内存有硬上限 | 全局配额 | SBX-02、SBX-06、SBX-11 |
@@ -210,7 +234,7 @@
 **阶段一（配置级，不改架构）**：SBX-01 → SBX-02 → SBX-03 → SBX-06 → SBX-05
 低成本、可独立验证，先把「可直接利用」的洞口堵上。
 
-**阶段二（隔离升级）**：SBX-04 → SBX-09
+**阶段二（隔离升级）**：SBX-04 → SBX-09 → SBX-17（已完成代码侧 2026-11-08）
 治 docker.sock 与共享内核，需宿主侧变更（compose / runtime / 代理），按第 8 节要求先给方案等人工批准。
 
 **阶段三（审计与模型安全）**：SBX-07 → SBX-08 → SBX-14（已完成 2026-11-08）
@@ -222,7 +246,7 @@
 
 ## 6. 变更后风险与注意事项
 
-前一轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd + gVisor + digest 镜像 + 日志/健康检查硬约束」；本轮再关闭 SBX-03/05/06，阶段一配置级洞口全部清零；随后关闭 SBX-07/08/14，执行结果按主体隔离、真实执行留持久审计、沙箱输出不再直接驱动写操作；并关闭 SBX-15，runner 不再持有 JWT/内网签名密钥，Redis 凭据收敛到沙箱键与审计流。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
+前一轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd 或专用节点 rootful + gVisor + digest 镜像 + 日志/健康检查硬约束」；本轮再关闭 SBX-03/05/06，阶段一配置级洞口全部清零；随后关闭 SBX-07/08/14，执行结果按主体隔离、真实执行留持久审计、沙箱输出不再直接驱动写操作；并关闭 SBX-15/16，runner 不再持有 JWT/内网签名密钥，Redis 凭据收敛到沙箱键与审计流。SBX-17 补充 dedicated 档位，解决 rootless + runsc 在部分内核不可用的问题。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
 
 ### 6.1 新增的生产硬前置（不满足就起不来）
 
@@ -232,21 +256,34 @@
 | runner 独立密钥 | `.env` 注入 ≥32 字符 `RUNNER_SIGNING_SECRET`，必须与 `INTERNAL_SIGNING_SECRET` 不同；harness 与 runner 都要读取 | harness/runner 启动抛错 |
 | runner Redis ACL | `SANDBOX_REDIS_URL` 使用带密码的非 `default` 用户，且不等于共享 `REDIS_URL`；compose 由 `SANDBOX_REDIS_PASSWORD` 生成 ACL 文件 | runner 启动抛错（拒绝共享凭据） |
 | 业务 Redis 认证 | 注入 ≥32 字符 `REDIS_PASSWORD`（或让 `REDIS_URL` 自带凭据）；compose 由该变量生成 default 用户密码，runner 容器拿不到 | 业务服务启动抛错（拒绝匿名 default） |
-| rootless dockerd | `SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock` | runner 启动抛错，容器反复重启 |
+| 隔离档位 | `SANDBOX_ISOLATION_MODE=rootless`（默认）或 `dedicated`；非法值拒绝启动 | 拼错档位直接抛错，不回落默认 |
+| rootless dockerd | `SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock`（rootless 档位） | runner 启动抛错，容器反复重启 |
+| dedicated 节点 | 节点只跑沙箱栈；`SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock`（dedicated 档位，必须是显式本地 unix socket） | 端点为空/`tcp://` 启动抛错；节点混部时 healthz 503 且执行返回 `unavailable` |
 | gVisor 运行时 | `SANDBOX_RUNTIME=runsc`，且宿主已注册 `runsc` | 启动抛错；注册缺失时 healthz 503 |
 | 镜像 digest | `SANDBOX_IMAGE=repo@sha256:...` 或 `sha256:...` | 启动抛错 |
 | 沙箱启用 | `SANDBOX_ENABLED=true`（prod overlay 已写死） | harness 启动抛错，禁止回退本地子进程 |
-| 宿主初始化 | `sudo make setup-sandbox-host` | 以上三项无法成立 |
+| 宿主初始化 | `sudo make setup-sandbox-host`（rootless）或 `sudo -E SANDBOX_SETUP_MODE=dedicated make setup-sandbox-node`（专用节点） | 以上前置无法成立 |
 
 这是有意的 breaking change：宁可 runner 起不来，也不让隔离静默退回共享内核或 root socket。沙箱不可用期间 `sandbox_run` 返回 `unavailable`（fail-closed）；订单、支付等主链路不经过沙箱，不受影响。
 
-### 6.2 rootless dockerd 的边界与坑
+### 6.2 rootless 与 dedicated 的边界与坑
 
-- 依赖内核 user namespace + cgroup v2；cgroup v1 的老内核装不上，只能改走「专用沙箱主机 + TLS」路线。
+**rootless 档位**：
+
+- 依赖内核 user namespace + cgroup v2；cgroup v1 的老内核装不上，且实测部分发行版上 `rootless + runsc` 直接不可用（SBX-17 证据），此时只能走专用节点 dedicated 或「专用沙箱主机 + TLS」路线。
 - rootless 守护进程靠用户 linger 常驻；关闭 linger、切换部署用户、宿主重启后 socket 路径变化，都会让 runner 503，需要重新跑 setup 并更新 `SANDBOX_ROOTLESS_SOCKET`。
 - rootless socket 属主是沙箱用户，runner 容器必须以同一 uid/gid 运行（prod overlay 的 `user: ${SANDBOX_UID}:${SANDBOX_GID}`）。默认容器内是 uid 0，直接挂载 socket 会 EACCES；`setup.sh` 会打印这两个值。
 - 被攻破后的上限是「沙箱用户权限」而非宿主 root，但该用户仍能读写自己的 Docker 数据根（`~/.local/share/docker`）。生产应把沙箱用户数据目录与业务数据分盘，最好独立主机。
 - 不支持绑定 <1024 端口等特权操作；沙箱本身 `network=none`，不受影响。
+
+**dedicated 档位**：
+
+- rootful socket 等价节点 root，这是固有属性而不是可修复项；补偿只有「节点边界」：节点只跑沙箱栈、不承载业务容器/业务库/业务密钥、端口只绑私网、可整机重建。
+- 节点独占检查只认容器标签（`shop.sandbox.role ∈ {execution, runner, infra}`）。缺少标签的临时容器（包括运维手工 `docker run -it`）都会让 healthz 503 且执行被拒；临时维护容器请显式加 `shop.sandbox.role=infra`。
+- 检查发生在**启动期（尽力）与每次执行前（强制）**：harness 不读 compose health，只要 runner 可达就会派发请求，因此不能只靠 healthcheck 兜底。
+- 镜像构建必须在节点自身的 rootful dockerd 上执行，否则 runner 侧 `ImageNotFound`；跨节点部署时 runner 无法共享镜像存储，P2 需要 registry 推送 digest。
+- 节点仍需访问受限 ACL Redis（去重锁 + 结果缓存 + 审计流）。若在节点本地起 Redis，跨节点去重退化为「每节点独立锁」。
+- 不要把 `docker-compose.prod.yml`（同机 rootless 形态）套到专用节点上；专用节点用 `docker-compose.sandbox-node.yml`。
 
 ### 6.3 gVisor 兼容性
 
@@ -271,13 +308,14 @@
 
 ### 6.6 healthz 语义变化
 
-- 非 dev 下不可达、非 rootless、runsc 未注册、镜像未固定，任一成立都返回 **HTTP 503**，不再是 200 + `status` 字段。
-- compose healthcheck 与 harness 探测都按状态码判死；本地调试看到 503 时，直接看响应里的 `docker.error` / `docker.endpoint` / `image_pinned`。
+- 非 dev 下不可达、隔离退化、档位与守护进程不符、节点混部、runsc 未注册、镜像未固定，任一成立都返回 **HTTP 503**，不再是 200 + `status` 字段。
+- 档位相关字段新增 `isolation.mode` / `isolation.node_exclusive` / `isolation.foreign_containers` / `isolation.mode_mismatch`；`docker.insecure` 在 dedicated 档位恒为 false（rootful 是既定设计），退化只由 `mode_mismatch` 表达。
+- compose healthcheck 与 harness 探测都按状态码判死；本地调试看到 503 时，直接看响应里的 `docker.error` / `docker.endpoint` / `image_pinned` / `isolation.foreign_containers`。
 - 不能为了「让容器看起来 healthy」把 503 改回 200，那等于重新引入静默退化。
 
 ### 6.7 仍需记住的未解决项
 
-- 本轮已关闭 SBX-07/08/14/15/16；未覆盖：SBX-09 部署机兼容性回归、SBX-10 孤儿容器回收、SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
+- 本轮已关闭 SBX-07/08/14/15/16/18；SBX-17 已在专用节点 121.41.73.188 完成节点侧验收（控制面 E2E 待补）；未覆盖：SBX-09 部署机兼容性回归、SBX-10 孤儿容器回收、SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
 - Redis 的 ACL 与密码已收敛到凭据层，但网络可达面仍需部署侧限制：生产 Redis 不应暴露到公网，并应定期轮换 `REDIS_PASSWORD` / `SANDBOX_REDIS_PASSWORD`。
 - 沙箱执行的审计证据是 `audit.sandbox.executed` 事件，只含哈希不含明文；事故复盘需要代码或输出原文时，只能靠调用方自己的留存，不要去审计库里找明文。
 - `untrusted_output` 标记只在单次运行内生效：同一次工具循环里会拦住写入，下一轮会话会重新建模。跨轮会话的高危操作仍依赖审批，不能假设标记一直在。
@@ -289,6 +327,7 @@
 
 - 镜像问题：把 `SANDBOX_IMAGE` 改回上一版 digest 并重启 runner，不要回退到 tag。
 - 隔离问题：不允许通过删除启动守卫或 healthz 校验来「先跑起来」；确需临时放宽只能在 dev，并记录风险与恢复时间。
+- 档位回滚：dedicated → rootless 时，把 `SANDBOX_ISOLATION_MODE` 改回 `rootless`、`SANDBOX_DOCKER_HOST` 改回 rootless socket、runner 恢复 `SANDBOX_UID/GID` 运行身份并重启；代码默认值仍是 rootless，回滚不需要回退代码。
 - rootless 安装失败：`setup.sh` 幂等可重跑；不要手删 `/run/user/<uid>/docker.sock`，按官方文档卸载。
 
 ---
@@ -328,3 +367,8 @@ docker compose config -q
 | 2026-11-08 | SBX-14 关闭：`MAX_CODE_CHARS` 共享常量，harness Pydantic 入口、客户端本地校验、工具 schema `maxLength` 三处统一；空代码同样本地拒绝 |
 | 2026-11-08 | SBX-15 关闭：runner 移除 Bearer JWT 与内网签名密钥，改用独立 `RUNNER_SIGNING_SECRET`；Redis 改用 `sandbox-runner` ACL 用户（仅沙箱键与审计流），生产守卫拒绝共享凭据 |
 | 2026-11-08 | SBX-16 关闭：Redis `default` 用户改为密码认证，业务服务通过 `REDIS_PASSWORD` 注入凭据；生产守卫拒绝匿名 Redis，runner 仍拿不到业务密码 |
+| 2026-11-08 | SBX-17 代码与配置就绪：新增 `dedicated` 档位（rootful + 节点独占 + gVisor），healthz 暴露档位/独占/档位不符，执行边界强制拒绝混部节点；新增专用节点 compose 与 `setup-sandbox-node`；待专用节点验收 |
+| 2026-11-08 | SBX-17 节点侧验收通过（121.41.73.188）：混部容器→healthz 503 + `/run` unavailable 且不创建容器；执行实测 runsc / network=none / 只读根 / cap_drop / shm 16MB；控制面 E2E 待补 |
+| 2026-11-08 | SBX-18 关闭：`memswap_limit` 与 `mem_limit` 同值禁用 swap，修复 256MB 上限下 400MB 写入成功的问题；超限复测立即 OOM（137） |
+| 2026-11-08 | 验收修复：`container.wait` 读超时被 urllib3 2.x 包装为 `ConnectionError`，按 `read timed out` 文本映射回 `timeout`，避免超时被固化为 `infra_error` |
+| 2026-11-08 | 构建可移植性：`infra/Dockerfile` 新增 `APT_MIRROR` / `PIP_INDEX_URL` / `PIP_TRUSTED_HOST` 构建参数，默认官方源，受限网络改用内网镜像 |
