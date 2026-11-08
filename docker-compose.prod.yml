@@ -3,11 +3,17 @@
 # 双主机部署、LB 与托管 MySQL / MongoDB / Redis 在 M3 接入；M1 只验证本 overlay 可解析。
 name: shop-agent
 
+# 生产统一环境位：任何服务漏掉 ENV=prod 都会让 dev 默认值静默生效，
+# 因此在这里逐服务写死，不依赖部署机 .env 是否记得设置。
+x-prod-env: &prod-env
+  ENV: prod
+
 services:
   # 内网服务一律不暴露宿主机端口，外部流量只能走 gateway / web
   catalog:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -18,6 +24,7 @@ services:
   inventory:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -26,6 +33,7 @@ services:
   order:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -34,6 +42,7 @@ services:
   fulfillment:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -42,6 +51,7 @@ services:
   aftersales:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -50,6 +60,31 @@ services:
   harness:
     restart: unless-stopped
     ports: !reset []
+    environment:
+      <<: *prod-env
+      # 生产必须走远程 runner：漏配会让沙箱请求在 harness 容器内本地执行，隔离整体失效
+      SANDBOX_ENABLED: "true"
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
+  sandbox-runner:
+    restart: unless-stopped
+    ports: !reset []
+    # rootless socket 属主是宿主沙箱用户，容器内 uid 0 访问会 EACCES；
+    # 必须以同一 uid/gid 运行，值由 setup.sh 写给 SANDBOX_UID / SANDBOX_GID。
+    user: "${SANDBOX_UID:-1000}:${SANDBOX_GID:-1000}"
+    environment:
+      ENV: prod
+      # 生产必须接 rootless dockerd：容器内用独立路径挂载，runner 启动守卫据此
+      # 拒绝默认 /var/run/docker.sock，避免被攻破后等价宿主 root
+      SANDBOX_DOCKER_HOST: unix:///run/rootless/docker.sock
+      # 生产强制 gVisor：共享宿主内核的逃逸面不可接受
+      SANDBOX_RUNTIME: runsc
+    volumes: !override
+      # 宿主侧 rootless socket：默认 uid 1000，按实际部署用户覆盖 SANDBOX_ROOTLESS_SOCKET
+      - ${SANDBOX_ROOTLESS_SOCKET:-/run/user/1000/docker.sock}:/run/rootless/docker.sock
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -58,6 +93,7 @@ services:
   identity:
     restart: unless-stopped
     ports: !reset []
+    environment: *prod-env
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
@@ -70,6 +106,7 @@ services:
       resources:
         limits: { cpus: "1.0", memory: 512M }
     environment:
+      ENV: prod
       # 生产必须关闭 mock 收银台；真实渠道接入前 payment 只能接受内部创建与已配置渠道回调
       PAYMENT_MOCK_MODE: "false"
     logging: *logging

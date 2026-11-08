@@ -4,7 +4,38 @@ from dataclasses import dataclass
 from typing import Any
 
 # status 取值：ok 成功 / error 执行失败 / timeout 超时 / unavailable 运行时不可用
-STATUSES = {"ok", "error", "timeout", "unavailable"}
+# / infra_error 容器已启动但 runner 侧基础设施故障（结果不可信，只用于去重）
+STATUSES = {"ok", "error", "timeout", "unavailable", "infra_error"}
+
+# 真正执行过容器的状态：audit 要留痕，结果缓存也要落盘。
+# 缓存 infra_error 不是把它当可信结果，而是让同一 execution_id 的重复请求
+# 返回同一次执行结论，避免换 runner 重复执行；重试必须使用新的 execution_id。
+EXECUTED_STATUSES = {"ok", "error", "timeout", "infra_error"}
+
+# 代码长度上限：harness 与 runner 共用同一数值，避免大请求跨网传到 runner 才被拒。
+MAX_CODE_CHARS = 65536
+
+# 执行超时下限：0/负数会退化成「立即超时」，统一按配置默认值处理。
+MIN_TIMEOUT_SECONDS = 1
+
+
+def clamp_timeout(requested: int | None, configured: int) -> int:
+    """把调用方请求的超时收敛到 [1, 配置值]。
+
+    配置值是上限而不是建议值：否则调用方传超大 timeout 就能长期占住并发槽，
+    甚至在被调用方断开后仍让容器继续运行；非正数按配置值处理，避免进入
+    Docker wait 的异常路径。
+    """
+    maximum = max(int(configured), MIN_TIMEOUT_SECONDS)
+    if requested is None:
+        return maximum
+    try:
+        value = int(requested)
+    except (TypeError, ValueError):
+        return maximum
+    if value <= 0:
+        return maximum
+    return min(value, maximum)
 
 
 @dataclass

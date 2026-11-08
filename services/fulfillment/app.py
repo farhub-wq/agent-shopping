@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, signed_identity_headers
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
@@ -117,8 +117,10 @@ async def _sla_scan_once() -> None:
 async def lifespan(_: FastAPI):
     global redis, bus
     configure_logging("fulfillment")
+    # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
+    validate_production_settings(settings)
     await init_models()
-    redis = create_redis(settings.redis_url)
+    redis = create_redis(settings.resolved_redis_url)
     bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     relay = OutboxRelay(get_session_factory(), bus)
     tasks = [

@@ -2,7 +2,13 @@ import json
 
 import httpx
 import pytest
-from harness.core.sandbox import SandboxManager, SandboxResult
+from harness.core.sandbox import SandboxManager, SandboxResult, validate_sandbox_production
+from shop_common.auth import verify_internal_signature
+from shop_common.config import ServiceSettings
+from shop_common.sandbox import MAX_CODE_CHARS
+
+RUNNER_SECRET = "r" * 40
+INTERNAL_SECRET = "i" * 40
 
 
 def _enabled_manager(monkeypatch, handler, urls: str = "http://runner.test") -> SandboxManager:
@@ -69,6 +75,55 @@ async def test_enabled_sandbox_calls_runner(monkeypatch):
     assert seen["user"] == "ops-1"
     # 每次调用必须带 execution_id，runner 依赖它做跨实例去重。
     assert isinstance(seen["execution_id"], str) and seen["execution_id"]
+
+
+@pytest.mark.asyncio
+async def test_runner_calls_use_dedicated_signing_secret(monkeypatch):
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update({key.lower(): value for key, value in request.headers.items()})
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+    monkeypatch.setattr(manager.settings, "runner_signing_secret", RUNNER_SECRET)
+    monkeypatch.setattr(manager.settings, "internal_signing_secret", INTERNAL_SECRET)
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    await manager.run("print(1)", user_id="ops-1", role="operator", tenant="acme")
+
+    # 发给 runner 的身份头必须用 runner 专用密钥签名，业务内网密钥无效；
+    # 同时不再携带 Bearer 令牌，runner 侧也已移除该鉴权分支。
+    assert "authorization" not in seen
+    arguments = {
+        "user_id": "ops-1",
+        "role": "operator",
+        "tenant": "acme",
+        "request_id": seen["x-request-id"],
+    }
+    signature = seen["x-internal-signature"]
+    assert verify_internal_signature(signature, secret=RUNNER_SECRET, **arguments)
+    assert not verify_internal_signature(signature, secret=INTERNAL_SECRET, **arguments)
+
+
+@pytest.mark.asyncio
+async def test_requested_timeout_is_clamped_to_configured_max(monkeypatch):
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["timeout"])
+        return httpx.Response(200, json={"status": "ok", "stdout": "", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+    monkeypatch.setattr(manager.settings, "sandbox_timeout_seconds", 20)
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    # 配置值是上限：更大的请求被收敛，更小的请求保留，避免调用方长期占用并发槽。
+    await manager.run("print(1)", timeout=3600)
+    await manager.run("print(1)", timeout=5)
+    await manager.run("print(1)", timeout=-3)
+
+    assert seen == [20, 5, 20]
 
 
 @pytest.mark.asyncio
@@ -165,6 +220,66 @@ async def test_enabled_sandbox_500_does_not_fail_over(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_infra_error_is_not_retried_on_another_runner(monkeypatch):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(
+            200, json={"status": "infra_error", "stderr": "APIError: daemon down", "backend": "docker"}
+        )
+
+    manager = _enabled_manager(monkeypatch, handler, "http://bad.test,http://good.test")
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    result = await manager.run("print(1)")
+
+    # 容器已启动后的 runner 故障：执行可能已发生，禁止换实例重跑，如实返回 infra_error。
+    assert result.status == "infra_error"
+    assert calls == ["bad.test"]
+
+
+def test_from_dict_keeps_infra_error_status():
+    result = SandboxResult.from_dict({"status": "infra_error", "stderr": "APIError"})
+    # 跨进程响应必须保留 infra_error，不能被降级成 error。
+    assert result.status == "infra_error"
+
+
+@pytest.mark.asyncio
+async def test_oversized_code_rejected_before_network(monkeypatch):
+    called: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(True)
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+
+    result = await manager.run("x" * (MAX_CODE_CHARS + 1))
+
+    # 长度边界在 harness 侧先拦：超长代码不该占用网络与 runner 队列
+    assert result.status == "error"
+    assert str(MAX_CODE_CHARS) in result.stderr
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_empty_code_rejected_before_network(monkeypatch):
+    called: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(True)
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+
+    result = await manager.run("   ")
+
+    assert result.status == "error"
+    assert called == []
+
+
+@pytest.mark.asyncio
 async def test_runner_status_aggregates_all_endpoints(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "bad.test":
@@ -178,3 +293,26 @@ async def test_runner_status_aggregates_all_endpoints(monkeypatch):
     assert status["status"] == "ok"
     assert [item["url"] for item in status["endpoints"]] == ["http://bad.test", "http://good.test"]
     assert [item["status"] for item in status["endpoints"]] == ["unavailable", "ok"]
+
+
+def test_prod_requires_remote_sandbox_enabled():
+    # 非 dev 缺 SANDBOX_ENABLED 时必须拒绝启动：否则请求会落到 harness 进程内的本地子进程
+    with pytest.raises(RuntimeError):
+        validate_sandbox_production(ServiceSettings(_env_file=None, env="prod", sandbox_enabled=False))
+    validate_sandbox_production(ServiceSettings(_env_file=None, env="prod", sandbox_enabled=True))
+    # 本地开发保留关闭沙箱的演示能力
+    validate_sandbox_production(ServiceSettings(_env_file=None, env="dev", sandbox_enabled=False))
+
+
+@pytest.mark.asyncio
+async def test_prod_without_remote_sandbox_is_fail_closed(monkeypatch):
+    manager = SandboxManager()
+    monkeypatch.setattr(manager.settings, "sandbox_enabled", False)
+    monkeypatch.setattr(manager.settings, "env", "prod")
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    result = await manager.run("print(1)")
+
+    # 即使绕过启动守卫，生产也不允许本地执行：本地进程与 harness 同权限
+    assert result.status == "unavailable"
+    assert "生产环境未启用沙箱" in result.stderr

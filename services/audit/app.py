@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import install_error_handlers
 from shop_common.events import EventBus, create_redis
@@ -79,11 +79,13 @@ async def handle_audit_event(event: dict[str, Any]) -> None:
 async def lifespan(_: FastAPI):
     global redis, bus
     configure_logging("audit")
+    # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
+    validate_production_settings(settings)
     await init_models()
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
         # 单测关闭后台任务，避免测试进程连接 Redis 常驻消费
-        redis = create_redis(settings.redis_url)
+        redis = create_redis(settings.resolved_redis_url)
         bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         tasks = [asyncio.create_task(bus.run_consumer("audit", "audit-svc", "audit-1", handle_audit_event))]
     try:

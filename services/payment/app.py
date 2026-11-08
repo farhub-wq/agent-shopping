@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep
-from shop_common.config import get_settings
+from shop_common.config import COMMON_SECRETS, get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
@@ -87,10 +87,12 @@ async def _expire_payments_once() -> None:
 async def lifespan(_: FastAPI):
     global redis, bus
     configure_logging("payment")
+    # payment 额外持有回调验签密钥：默认值意味着任何人都能伪造支付成功回调。
+    validate_production_settings(settings, secrets=(*COMMON_SECRETS, "payment_webhook_secret"))
     await init_models()
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
-        redis = create_redis(settings.redis_url)
+        redis = create_redis(settings.resolved_redis_url)
         bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         relay = OutboxRelay(get_session_factory(), bus)
         # outbox 投递与超时关单随应用生命周期统一启动

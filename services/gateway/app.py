@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import Principal, PrincipalDep, create_internal_signature, create_token
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
 from shop_common.logging import configure_logging, get_logger
@@ -98,7 +98,9 @@ def _request_id(request: Request) -> str:
 async def lifespan(_: FastAPI):
     global redis
     configure_logging("gateway")
-    redis = create_redis(settings.redis_url)
+    # 网关签发内网身份头：签名密钥为默认值时，下游所有 staff 鉴权都形同虚设。
+    validate_production_settings(settings)
+    redis = create_redis(settings.resolved_redis_url)
     yield
     await redis.close()
 

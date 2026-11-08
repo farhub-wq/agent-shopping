@@ -53,20 +53,24 @@ def create_internal_signature(*, user_id: str, role: str, tenant: str, ts: str, 
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
-def signed_identity_headers(user_id: str, role: str, tenant: str = "default") -> dict[str, str]:
+def signed_identity_headers(
+    user_id: str, role: str, tenant: str = "default", *, secret: str | None = None
+) -> dict[str, str]:
     """服务间调用使用的身份头：现签时间戳 + 请求号，下游按签名校验身份。
 
     服务间调用不能再手写 X-User-* 头，否则开启 TRUST_IDENTITY_HEADERS 后会被判无签名。
+    `secret` 允许调用方改用专用密钥（例如 runner 的独立密钥），缺省仍走内网签名密钥。
     """
     ts = str(int(time.time()))
     request_id = uuid4().hex
+    key = settings.internal_signing_secret if secret is None else secret
     signature = create_internal_signature(
         user_id=user_id,
         role=role,
         tenant=tenant,
         ts=ts,
         request_id=request_id,
-        secret=settings.internal_signing_secret,
+        secret=key,
     )
     return {
         "X-User-Id": user_id,
@@ -119,6 +123,36 @@ class Principal:
             raise ApiError("FORBIDDEN", "该操作仅限管理员")
 
 
+def principal_from_signed_headers(
+    *,
+    user_id: str | None,
+    role: str | None,
+    tenant: str | None,
+    signature: str | None,
+    request_id: str | None,
+    secret: str,
+    trusted: bool,
+) -> Principal:
+    """只按签名身份头解析主体：供 runner 等不接收 Bearer JWT 的服务复用。"""
+    if not user_id:
+        return Principal("guest", "customer", "default")
+    if not trusted:
+        # 未开启信任时身份头一律不生效，降级为访客而不是报错，保证直连调试仍可用
+        return Principal("guest", "customer", "default")
+    if not signature or not request_id:
+        raise ApiError("UNAUTHORIZED", "身份头缺少签名")
+    if not verify_internal_signature(
+        signature,
+        user_id=user_id,
+        role=role or "customer",
+        tenant=tenant or "default",
+        request_id=request_id,
+        secret=secret,
+    ):
+        raise ApiError("UNAUTHORIZED", "身份头签名无效或已过期")
+    return Principal(user_id, role or "customer", tenant or "default")
+
+
 async def get_principal(
     authorization: Annotated[str | None, Header()] = None,
     x_user_id: Annotated[str | None, Header()] = None,
@@ -135,23 +169,15 @@ async def get_principal(
     if authorization and authorization.startswith("Bearer "):
         claims = decode_token(authorization[7:])
         return Principal(str(claims.get("sub")), str(claims.get("role", "customer")), str(claims.get("tenant", "default")))
-    if x_user_id:
-        if not settings.trust_identity_headers:
-            # 未开启信任时身份头一律不生效，降级为访客而不是报错，保证直连调试仍可用
-            return Principal("guest", "customer", "default")
-        if not x_internal_signature or not x_request_id:
-            raise ApiError("UNAUTHORIZED", "身份头缺少签名")
-        if not verify_internal_signature(
-            x_internal_signature,
-            user_id=x_user_id,
-            role=x_user_role or "customer",
-            tenant=x_tenant or "default",
-            request_id=x_request_id,
-            secret=settings.internal_signing_secret,
-        ):
-            raise ApiError("UNAUTHORIZED", "身份头签名无效或已过期")
-        return Principal(x_user_id, x_user_role or "customer", x_tenant or "default")
-    return Principal("guest", "customer", "default")
+    return principal_from_signed_headers(
+        user_id=x_user_id,
+        role=x_user_role,
+        tenant=x_tenant,
+        signature=x_internal_signature,
+        request_id=x_request_id,
+        secret=settings.internal_signing_secret,
+        trusted=settings.trust_identity_headers,
+    )
 
 
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
