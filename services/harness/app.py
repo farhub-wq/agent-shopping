@@ -276,9 +276,13 @@ async def memory_search(user_id: str, payload: MemoryQuery, principal: Principal
 
 @app.get("/sandbox/health")
 async def sandbox_health() -> dict[str, Any]:
+    # harness 不再持有 Docker socket：enabled 时以全部 runner 的实时健康状态为准。
+    runners = await sandbox.runner_status() if settings.sandbox_enabled else {"status": "disabled", "endpoints": []}
     return {
         "enabled": settings.sandbox_enabled,
-        "docker_sdk": sandbox.docker_available(),
+        "backend": sandbox.backend,
+        "runner_urls": sandbox.endpoints if settings.sandbox_enabled else [],
+        "runners": runners,
         "image": settings.sandbox_image,
         "network": settings.sandbox_network,
         "limits": {
@@ -293,7 +297,15 @@ async def sandbox_health() -> dict[str, Any]:
 async def sandbox_run(payload: SandboxRequest, principal: PrincipalDep) -> dict[str, Any]:
     # 沙箱执行属于高危能力，只能由运营/管理员触发，不开放给普通终端用户。
     principal.require_staff()
-    result = await sandbox.run(payload.code, language=payload.language, timeout=payload.timeout)
+    result = await sandbox.run(
+        payload.code,
+        language=payload.language,
+        timeout=payload.timeout,
+        # 透传调用者身份：runner 侧会再校验一次 staff，避免 harness 被绕过时直接执行代码。
+        user_id=principal.user_id,
+        role=principal.role,
+        tenant=principal.tenant,
+    )
     return result.to_dict()
 
 

@@ -125,6 +125,10 @@ async def _sandbox_run(args: dict[str, Any], ctx: ToolContext) -> Any:
         args.get("code", ""),
         language=args.get("language", "python"),
         timeout=int(args.get("timeout", settings.sandbox_timeout_seconds)),
+        # 工具调用同样透传身份：runner 只接受 staff，工具权限不能替代数据侧授权。
+        user_id=ctx.user_id,
+        role=ctx.role,
+        tenant=ctx.tenant,
     )
     return result.to_dict()
 

@@ -1,44 +1,35 @@
-"""沙箱执行器：Docker 优先，本地子进程兜底。
+"""沙箱客户端：生产经独立 sandbox-runner 执行，本地演示才允许子进程。
 
-明确边界：本地子进程不是安全边界，只能防误操作，不能防恶意代码；
-Docker 模式关闭网络、只读根文件系统、限制 CPU/内存/PID，并禁止提权。
+安全边界：
+- `SANDBOX_ENABLED=true`：只调用独立 runner（runner 持有 Docker socket），
+  harness 自身不接触容器运行时；runner 不可用即 fail-closed，绝不回退本地进程。
+- `SANDBOX_ENABLED=false`：本地子进程只用于本地演示/测试，不是安全边界。
 """
 
 import asyncio
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+import uuid
 from typing import Any
 
+import httpx
+from shop_common.auth import signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.logging import get_logger
+from shop_common.sandbox import SandboxResult
 
 logger = get_logger(__name__)
 
 MAX_OUTPUT_BYTES = 8192
-
-
-@dataclass
-class SandboxResult:
-    status: str
-    stdout: str = ""
-    stderr: str = ""
-    exit_code: int = -1
-    duration_ms: int = 0
-    backend: str = "none"
-    truncated: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "exit_code": self.exit_code,
-            "duration_ms": self.duration_ms,
-            "backend": self.backend,
-            "truncated": self.truncated,
-        }
+# 客户端超时 = 容器执行超时 + 网络往返与容器创建/删除开销；
+# 否则 runner 还在等容器退出，客户端就先超时并误报 unavailable。
+RUNNER_TIMEOUT_MARGIN = 10
+# 故障 runner 冷却时间：期间排到最后，避免每个请求都先白等一次超时。
+RUNNER_COOLDOWN_SECONDS = 30
+# 可安全换实例重试的 HTTP 状态：连接级失败或上游不可用；
+# 500 不在此列——它可能是容器已执行后响应序列化失败，重试会造成重复执行。
+TRANSIENT_STATUSES = {429, 502, 503, 504}
 
 
 def _truncate(raw: bytes) -> tuple[str, bool]:
@@ -49,98 +40,152 @@ def _truncate(raw: bytes) -> tuple[str, bool]:
 
 
 class SandboxManager:
-    def __init__(self) -> None:
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.settings = get_settings()
+        # transport 仅用于单测注入 MockTransport，生产保持 None（走真实网络）。
+        self.transport = transport
+        # 轮询游标与按 endpoint 的冷却截止时间；仅进程内状态，不依赖 Redis。
+        self._cursor = 0
+        self._cooldown_until: dict[str, float] = {}
 
-    def docker_available(self) -> bool:
+    @property
+    def backend(self) -> str:
+        return "remote" if self.settings.sandbox_enabled else "local"
+
+    @property
+    def endpoints(self) -> list[str]:
+        # 配置是逗号分隔的 URL 列表；去空、去尾斜杠，避免拼出 //run。
+        raw = self.settings.sandbox_runner_urls
+        return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+
+    def _mark_failure(self, url: str) -> None:
+        # 单实例内的短冷却：坏掉的 runner 在冷却期内不再优先接新请求，
+        # 避免每个请求都先等一次连接超时；冷却结束后自动重新参与轮询。
+        self._cooldown_until[url] = time.monotonic() + RUNNER_COOLDOWN_SECONDS
+
+    def _mark_success(self, url: str) -> None:
+        self._cooldown_until.pop(url, None)
+
+    def _ordered_endpoints(self) -> list[str]:
+        endpoints = self.endpoints
+        if not endpoints:
+            return []
+        # 轮询起点逐请求后移，避免所有请求同时压到第一台；
+        # 冷却中的 runner 排在最后而不是直接丢弃，全部冷却时仍会尝试一次。
+        start = self._cursor % len(endpoints)
+        self._cursor += 1
+        rotated = endpoints[start:] + endpoints[:start]
+        now = time.monotonic()
+        ready = [url for url in rotated if self._cooldown_until.get(url, 0) <= now]
+        cooling = [url for url in rotated if self._cooldown_until.get(url, 0) > now]
+        return ready + cooling
+
+    async def runner_status(self) -> dict[str, Any]:
+        """并发探测全部 runner，供 /sandbox/health 展示；失败不抛异常。"""
+        endpoints = self.endpoints
+        if not endpoints:
+            return {"status": "unavailable", "endpoints": [], "error": "未配置 SANDBOX_RUNNER_URLS"}
+        results = await asyncio.gather(*(self._probe_runner(url) for url in endpoints))
+        healthy = any(item.get("status") == "ok" for item in results)
+        return {"status": "ok" if healthy else "unavailable", "endpoints": results}
+
+    async def _probe_runner(self, url: str) -> dict[str, Any]:
         try:
-            import docker  # noqa: F401
+            async with httpx.AsyncClient(timeout=3.0, transport=self.transport) as client:
+                response = await client.get(f"{url}/healthz")
+                response.raise_for_status()
+                payload = response.json()
+            if isinstance(payload, dict):
+                return {**payload, "url": url}
+            return {"url": url, "status": "ok"}
+        except Exception as exc:
+            return {"url": url, "status": "unavailable", "error": type(exc).__name__}
 
-            return True
-        except ImportError:
-            return False
-
-    async def run(self, code: str, *, language: str = "python", timeout: int | None = None) -> SandboxResult:
+    async def run(
+        self,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: int | None = None,
+        user_id: str = "harness",
+        role: str = "operator",
+        tenant: str = "default",
+    ) -> SandboxResult:
         if language != "python":
             # 只支持 python：其他语言需要额外镜像与运行时，当前不静默降级。
             return SandboxResult("error", stderr="当前沙箱仅支持 python", backend="none")
         limit = timeout or self.settings.sandbox_timeout_seconds
         if self.settings.sandbox_enabled:
-            result = await asyncio.to_thread(self._run_docker, code, limit)
-            # 只有「Docker 根本不可用」才降级到本地子进程；
-            # 容器已启动但执行出错时不降级，避免用更弱的安全边界重跑同一段代码。
-            if result.status != "unavailable":
-                return result
-            logger.warning("Docker 沙箱不可用，降级到本地子进程（非安全边界）")
+            # 生产边界：必须在独立 runner 的容器里执行；runner 不可用直接拒绝，
+            # 绝不回退本地子进程——本地进程与宿主同权限，回退等于抹掉安全边界。
+            return await self._run_remote(code, limit, user_id, role, tenant)
+        # 未启用沙箱只允许用于本地演示/测试：本地子进程不是安全边界，不能承接生产流量。
+        logger.warning("沙箱未启用，使用本地子进程执行（非安全边界，仅限本地演示）")
         return await self._run_local(code, limit)
 
-    def _run_docker(self, code: str, timeout: int) -> SandboxResult:
-        started = time.perf_counter()
-        try:
-            import docker
-            from docker.errors import ContainerError, ImageNotFound
-
-            client = docker.from_env()
-        except Exception as exc:
-            return SandboxResult("unavailable", stderr=f"docker 不可达: {type(exc).__name__}", backend="docker")
-
-        container = None
-        try:
-            # 安全基线：网络模式走配置（默认 none）、只读根文件系统、/tmp 限额可写、
-            # 限制 CPU/内存/PID、禁止提权、以 65534 低权用户运行、python -I 隔离用户 site-packages。
-            container = client.containers.create(
-                self.settings.sandbox_image,
-                command=["python", "-I", "-c", code],
-                network_mode=self.settings.sandbox_network,
-                mem_limit=f"{self.settings.sandbox_memory_mb}m",
-                nano_cpus=int(self.settings.sandbox_cpu * 1_000_000_000),
-                pids_limit=64,
-                read_only=True,
-                tmpfs={"/tmp": "rw,size=32m"},
-                security_opt=["no-new-privileges"],
-                user="65534:65534",
-                working_dir="/tmp",
-            )
-            container.start()
-            wait_result = container.wait(timeout=timeout)
-            stdout_raw = container.logs(stdout=True, stderr=False)
-            stderr_raw = container.logs(stdout=False, stderr=True)
-            stdout, truncated = _truncate(stdout_raw)
-            stderr, _ = _truncate(stderr_raw)
-            exit_code = int(wait_result.get("StatusCode", -1))
-            return SandboxResult(
-                "ok" if exit_code == 0 else "error",
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=exit_code,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                backend="docker",
-                truncated=truncated,
-            )
-        except ImageNotFound:
-            return SandboxResult(
-                "unavailable", stderr=f"镜像 {self.settings.sandbox_image} 不存在", backend="docker"
-            )
-        except ContainerError as exc:
-            return SandboxResult(
-                "error", stderr=str(exc)[:MAX_OUTPUT_BYTES], backend="docker",
-                duration_ms=int((time.perf_counter() - started) * 1000),
-            )
-        except Exception as exc:
-            logger.exception("Docker 沙箱执行失败")
-            return SandboxResult(
-                "error",
-                stderr=f"{type(exc).__name__}: {exc}"[:MAX_OUTPUT_BYTES],
-                backend="docker",
-                duration_ms=int((time.perf_counter() - started) * 1000),
-            )
-        finally:
-            if container is not None:
-                # 无论成功与否都强制删除容器，避免残留进程与磁盘占用。
+    async def _run_remote(
+        self, code: str, timeout: int, user_id: str, role: str, tenant: str
+    ) -> SandboxResult:
+        targets = self._ordered_endpoints()
+        if not targets:
+            # 没配 runner 就拒绝执行，绝不用本地进程顶替生产沙箱。
+            return SandboxResult("unavailable", stderr="未配置 SANDBOX_RUNNER_URLS", backend="remote")
+        # 身份头必须现签：runner 会再次校验 staff 权限，沙箱能力不能靠内网位置默认放行。
+        headers = signed_identity_headers(user_id, role, tenant)
+        # execution_id 在整次故障转移中保持不变：换 runner 只是换执行者，
+        # 由 runner 用 Redis 去重保证同一段代码最多真正跑一次。
+        headers["X-Execution-Id"] = uuid.uuid4().hex
+        payload = {"code": code, "language": "python", "timeout": timeout}
+        failures: list[str] = []
+        # connect 单独限 3s：坏掉的主机快速失败，执行阶段仍给足容器超时。
+        client_timeout = httpx.Timeout(timeout + RUNNER_TIMEOUT_MARGIN, connect=3.0)
+        async with httpx.AsyncClient(timeout=client_timeout, transport=self.transport) as client:
+            for url in targets:
                 try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
+                    response = await client.post(f"{url}/run", json=payload, headers=headers)
+                except Exception as exc:
+                    self._mark_failure(url)
+                    failures.append(f"{url} 不可达({type(exc).__name__})")
+                    continue
+                if response.status_code in TRANSIENT_STATUSES:
+                    # 429/502/503/504 属于可重试的实例级故障，换下一台。
+                    self._mark_failure(url)
+                    failures.append(f"{url} HTTP {response.status_code}")
+                    continue
+                if response.status_code >= 500:
+                    # 500 可能是执行后响应失败，换实例会重复执行，直接 fail-closed。
+                    self._mark_failure(url)
+                    return SandboxResult(
+                        "unavailable",
+                        stderr=f"sandbox-runner 返回 {response.status_code}",
+                        backend="remote",
+                    )
+                if response.status_code >= 400:
+                    # 4xx 是身份/参数问题，换实例结果相同，如实回传。
+                    return SandboxResult(
+                        "error",
+                        stderr=f"sandbox-runner 拒绝请求：{response.status_code}",
+                        backend="remote",
+                    )
+                try:
+                    result = SandboxResult.from_dict(response.json())
+                except ValueError:
+                    self._mark_failure(url)
+                    failures.append(f"{url} 响应格式错误")
+                    continue
+                if result.status == "unavailable":
+                    # runner 可达但自身不可用（Docker 故障/排队超时），换一台重试。
+                    self._mark_failure(url)
+                    failures.append(f"{url} {result.stderr or 'unavailable'}")
+                    continue
+                self._mark_success(url)
+                return result
+        logger.error("全部 sandbox-runner 不可用: %s", "; ".join(failures))
+        return SandboxResult(
+            "unavailable",
+            stderr="全部 sandbox-runner 不可用：" + "; ".join(failures),
+            backend="remote",
+        )
 
     async def _run_local(self, code: str, timeout: int) -> SandboxResult:
         started = time.perf_counter()
