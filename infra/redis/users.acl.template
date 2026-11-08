@@ -1,0 +1,2 @@
+user default on >__REDIS_PASSWORD__ ~* &* +@all
+user sandbox-runner on >__SANDBOX_REDIS_PASSWORD__ resetkeys ~sandbox:exec:* ~shop:events:audit resetchannels -@all +get +set +del +expire +evalsha +script|load +xadd +ping +client|setinfo

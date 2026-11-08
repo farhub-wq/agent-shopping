@@ -65,6 +65,9 @@ log "runsc: $RUNSC_BIN"
 
 SANDBOX_HOME="$(getent passwd "$SANDBOX_USER" | cut -d: -f6)"
 SANDBOX_UID="$(id -u "$SANDBOX_USER")"
+# rootless socket 属主是沙箱用户：runner 容器必须以同一 uid/gid 运行，
+# 否则容器内 root(uid 0) 对 socket 无权限，会得到 EACCES。
+SANDBOX_GID="$(id -g "$SANDBOX_USER")"
 SOCKET="/run/user/$SANDBOX_UID/docker.sock"
 
 if [ ! -S "$SOCKET" ]; then
@@ -109,7 +112,10 @@ as_user "docker info --format '{{.SecurityOptions}}'" | grep -q rootless \
 as_user "docker info --format '{{.Runtimes}}'" | grep -q "$RUNSC_RUNTIME" \
   || die "runsc 未注册到 Docker runtime"
 
-log "校验通过。把下面两行写入部署机 .env："
+log "校验通过。把下面四行写入部署机 .env："
 printf 'SANDBOX_ROOTLESS_SOCKET=%s\n' "$SOCKET"
 printf 'SANDBOX_RUNTIME=%s\n' "$RUNSC_RUNTIME"
+# runner 容器需要以沙箱用户的 uid/gid 运行才能访问 socket，否则会 EACCES。
+printf 'SANDBOX_UID=%s\n' "$SANDBOX_UID"
+printf 'SANDBOX_GID=%s\n' "$SANDBOX_GID"
 log "容器内端点由 prod overlay 固定为 unix:///run/rootless/docker.sock，无需改动"

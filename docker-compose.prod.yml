@@ -72,6 +72,9 @@ services:
   sandbox-runner:
     restart: unless-stopped
     ports: !reset []
+    # rootless socket 属主是宿主沙箱用户，容器内 uid 0 访问会 EACCES；
+    # 必须以同一 uid/gid 运行，值由 setup.sh 写给 SANDBOX_UID / SANDBOX_GID。
+    user: "${SANDBOX_UID:-1000}:${SANDBOX_GID:-1000}"
     environment:
       ENV: prod
       # 生产必须接 rootless dockerd：容器内用独立路径挂载，runner 启动守卫据此
