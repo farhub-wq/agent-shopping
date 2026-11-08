@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host build-sandbox-image
+.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host setup-sandbox-node build-sandbox-image
 
 up:
 	docker compose up --build -d
@@ -37,6 +37,11 @@ build-sandbox-image:
 # 宿主侧一次性初始化：rootless dockerd + gVisor（需 root，仅 Debian/Ubuntu，幂等）
 setup-sandbox-host:
 	sudo bash infra/rootless-docker/setup.sh
+
+# 专用沙箱节点初始化：rootful dockerd + gVisor（节点不得承载业务容器与业务数据）。
+# 用 -E 透传 SANDBOX_SETUP_MODE，脚本据此走 dedicated 分支；可选 DOCKER_REGISTRY_MIRRORS。
+setup-sandbox-node:
+	SANDBOX_SETUP_MODE=dedicated sudo -E bash infra/rootless-docker/setup.sh
 
 dev-web:
 	cd web && npm install && npm run dev

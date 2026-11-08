@@ -1,0 +1,62 @@
+# 专用沙箱节点编排：节点只跑沙箱栈，由 rootful dockerd + gVisor 提供执行隔离。
+#
+# 与业务栈（docker-compose.yml + prod overlay）完全分离：本节点不部署业务服务、
+# 不存业务库、不挂业务密钥，rootful socket 的风险半径因此收敛到可整机重建的节点。
+# 宿主机初始化用 rootful 分支：sudo -E SANDBOX_SETUP_MODE=dedicated make setup-sandbox-node
+#
+# 关键变量（部署机 .env）：
+#   SANDBOX_IMAGE         沙箱镜像 digest（make build-sandbox-image 打印）
+#   RUNNER_SIGNING_SECRET 与 harness 共享的 runner 专用签名密钥（≥32 字符）
+#   SANDBOX_REDIS_URL     受限 ACL Redis 连接串（去重锁 / 结果缓存 / 审计流）
+#   SANDBOX_RUNNER_BIND   runner 发布地址，必须是节点私网 IP（默认仅本机）
+name: shop-agent-sandbox
+
+services:
+  sandbox-runner:
+    build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: sandbox_runner } }
+    restart: unless-stopped
+    # rootful socket 属主是节点 root：runner 必须以内置 root 运行才能创建容器。
+    # 这不是降权失败，而是 dedicated 档位的既定前提——安全性由节点独占承担。
+    user: "0:0"
+    labels:
+      # 专用节点独占校验靠该标签识别 runner 自身，不被判成业务容器。
+      shop.sandbox.role: runner
+    environment:
+      ENV: prod
+      # dedicated：允许 rootful socket，但仍强制 runsc / digest 镜像 / network=none /
+      # 资源上限，并且每次执行前校验「节点无其他业务容器」。
+      SANDBOX_ISOLATION_MODE: dedicated
+      SANDBOX_DOCKER_HOST: unix:///var/run/docker.sock
+      SANDBOX_RUNTIME: runsc
+      # 镜像留空默认值：缺省即被 runner 启动守卫拒绝（digest 校验），不会静默跑 :latest。
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-}
+      SANDBOX_NETWORK: none
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-256}
+      SANDBOX_CPU: ${SANDBOX_CPU:-0.5}
+      SANDBOX_TIMEOUT_SECONDS: ${SANDBOX_TIMEOUT_SECONDS:-20}
+      SANDBOX_MAX_CONCURRENCY: ${SANDBOX_MAX_CONCURRENCY:-4}
+      SANDBOX_QUEUE_TIMEOUT_SECONDS: ${SANDBOX_QUEUE_TIMEOUT_SECONDS:-10}
+      SANDBOX_DEDUPE_WAIT_SECONDS: ${SANDBOX_DEDUPE_WAIT_SECONDS:-5}
+      # runner 只认专用签名密钥：不注入 JWT / 网关内网密钥 / 业务库地址。
+      RUNNER_SIGNING_SECRET: ${RUNNER_SIGNING_SECRET:-}
+      TRUST_IDENTITY_HEADERS: "true"
+      # 去重与审计依赖 Redis；留空会被 runner 安全守卫拒绝（禁止匿名或共用业务 URL）。
+      SANDBOX_REDIS_URL: ${SANDBOX_REDIS_URL:-}
+    volumes:
+      # 节点上唯一持有 Docker socket 的组件，且不向业务网络暴露任何端口。
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      # 只绑私网：默认 127.0.0.1 表示「未显式配置就不对外」，不提供 0.0.0.0 默认值。
+      - "${SANDBOX_RUNNER_BIND:-127.0.0.1}:8000:8000"
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s

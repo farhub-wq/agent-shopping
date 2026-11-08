@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# 宿主侧一次性初始化：rootless dockerd + gVisor（runsc）。
+# 宿主侧一次性初始化：两种隔离档位，均注册 gVisor（runsc）。
 #
-# 目的：让 sandbox-runner 被攻破时拿到的是普通用户权限而非宿主 root，
-# 并用 gVisor 的用户态内核收敛共享宿主内核的 CVE 面。
+# rootless（默认）：rootless dockerd + runsc，用于单机小规模部署；
+#   让 sandbox-runner 被攻破时拿到的是普通用户权限而非宿主 root。
+# dedicated：rootful dockerd + runsc，用于专用沙箱节点；
+#   节点只跑沙箱栈（不承载业务容器与业务数据），rootful socket 的风险半径
+#   被限定在可整机重建的节点上。专用节点请用 docker-compose.sandbox-node.yml。
 # 仅支持 Debian/Ubuntu（apt），需要 root 或 sudo 执行，可重复运行（幂等）。
 #
 # 用法：
-#   sudo bash infra/rootless-docker/setup.sh
+#   sudo bash infra/rootless-docker/setup.sh                       # rootless
 #   SANDBOX_USER=sandbox sudo -E bash infra/rootless-docker/setup.sh
+#   sudo -E SANDBOX_SETUP_MODE=dedicated bash infra/rootless-docker/setup.sh
+#   # 专用节点可选镜像加速（逗号分隔，仅写入 rootful daemon.json）：
+#   sudo -E SANDBOX_SETUP_MODE=dedicated DOCKER_REGISTRY_MIRRORS=https://mirror.example bash infra/rootless-docker/setup.sh
 set -euo pipefail
 
 SANDBOX_USER="${SANDBOX_USER:-sandbox}"
+SANDBOX_SETUP_MODE="${SANDBOX_SETUP_MODE:-rootless}"
 RUNSC_RUNTIME="runsc"
 
 log() { printf '[setup-sandbox-host] %s\n' "$*"; }
@@ -29,6 +36,101 @@ as_user() {
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -lc "$*"
 }
 
+RUNSC_BIN=""
+
+# 安装 Docker 官方 apt 源：rootless 与 rootful 档位共用同一份源。
+add_docker_repo() {
+  install -m 0755 -d /etc/apt/keyrings
+  if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+}
+
+# 安装 gVisor：runsc 作为 Docker 的一个 runtime 注册，容器内核调用走用户态实现。
+install_runsc() {
+  if ! command -v runsc >/dev/null 2>&1; then
+    log "安装 gVisor runsc"
+    curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+      > /etc/apt/sources.list.d/gvisor.list
+    apt-get update -qq
+    apt-get install -y -qq runsc
+  fi
+  RUNSC_BIN="$(command -v runsc)" || die "runsc 安装后仍不在 PATH"
+  log "runsc: $RUNSC_BIN"
+}
+
+# 合并 daemon.json：注册 runsc 运行时；mirrors 为空时不写 registry-mirrors，
+# 避免把第三方镜像源固化进仓库（部署时按需注入 DOCKER_REGISTRY_MIRRORS）。
+write_daemon_json() {
+  local path="$1" mirrors="$2"
+  python3 - "$path" "$RUNSC_RUNTIME" "$RUNSC_BIN" "$mirrors" <<'PY'
+import json
+import os
+import sys
+
+path, runtime_name, runsc_bin, mirrors = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+data = {}
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read().strip()
+    if text:
+        data = json.loads(text)
+data.setdefault("runtimes", {})[runtime_name] = {"path": runsc_bin}
+if mirrors:
+    data["registry-mirrors"] = [item.strip() for item in mirrors.split(",") if item.strip()]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PY
+}
+
+# dedicated 档位：rootful dockerd + runsc。
+# 该节点的安全性由「节点独占」承担：不部署业务容器/业务库/业务密钥，
+# runner 被攻破等价节点 root，因此节点必须可整机重建。
+setup_dedicated() {
+  log "专用沙箱节点档位（rootful dockerd + gVisor），节点不得运行业务容器"
+  add_docker_repo
+  if ! command -v dockerd >/dev/null 2>&1; then
+    log "安装 rootful Docker Engine"
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+  fi
+  install_runsc
+  log "写入 runtime 配置: /etc/docker/daemon.json"
+  write_daemon_json /etc/docker/daemon.json "${DOCKER_REGISTRY_MIRRORS:-}"
+  log "启动 rootful dockerd 并等待 socket"
+  systemctl enable --now docker
+  systemctl restart docker
+  for _ in $(seq 1 30); do
+    docker info >/dev/null 2>&1 && break
+    sleep 1
+  done
+  # 实机校验：runsc 已注册且守护进程不是 rootless，否则 dedicated 档位不成立。
+  docker info --format '{{.Runtimes}}' | grep -q "$RUNSC_RUNTIME" \
+    || die "runsc 未注册到 Docker runtime"
+  if docker info --format '{{.SecurityOptions}}' | grep -q rootless; then
+    die "dedicated 档位要求 rootful 守护进程，但 dockerd 报告 rootless"
+  fi
+  log "校验通过。把下面三行写入专用节点 .env："
+  printf 'SANDBOX_ISOLATION_MODE=dedicated\n'
+  printf 'SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock\n'
+  printf 'SANDBOX_RUNTIME=%s\n' "$RUNSC_RUNTIME"
+  log "用 docker-compose.sandbox-node.yml 部署 runner；SANDBOX_RUNNER_BIND 只填节点私网 IP"
+}
+
+case "$SANDBOX_SETUP_MODE" in
+  dedicated) setup_dedicated; exit 0 ;;
+  rootless) ;;
+  *) die "SANDBOX_SETUP_MODE 只能是 rootless 或 dedicated，当前值: $SANDBOX_SETUP_MODE" ;;
+esac
+
 if ! id -u "$SANDBOX_USER" >/dev/null 2>&1; then
   log "创建专用非 root 用户 $SANDBOX_USER"
   useradd -m -s /bin/bash "$SANDBOX_USER"
@@ -39,29 +141,10 @@ log "开启 linger"
 loginctl enable-linger "$SANDBOX_USER"
 
 log "安装 rootless Docker 依赖（uidmap / dbus-user-session / rootless extras）"
-install -m 0755 -d /etc/apt/keyrings
-if [ ! -f /etc/apt/keyrings/docker.asc ]; then
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-fi
-# shellcheck disable=SC1091
-. /etc/os-release
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
-  > /etc/apt/sources.list.d/docker.list
-apt-get update -qq
+add_docker_repo
 apt-get install -y -qq uidmap dbus-user-session docker-ce-rootless-extras
 
-# 安装 gVisor：runsc 作为 Docker 的一个 runtime 注册，容器内核调用走用户态实现。
-if ! command -v runsc >/dev/null 2>&1; then
-  log "安装 gVisor runsc"
-  curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
-    > /etc/apt/sources.list.d/gvisor.list
-  apt-get update -qq
-  apt-get install -y -qq runsc
-fi
-RUNSC_BIN="$(command -v runsc)" || die "runsc 安装后仍不在 PATH"
-log "runsc: $RUNSC_BIN"
+install_runsc
 
 SANDBOX_HOME="$(getent passwd "$SANDBOX_USER" | cut -d: -f6)"
 SANDBOX_UID="$(id -u "$SANDBOX_USER")"
@@ -78,24 +161,7 @@ fi
 # 把 runsc 注册到 rootless 守护进程配置里；合并而不是覆盖，保留已有设置。
 DAEMON_JSON="$SANDBOX_HOME/.config/docker/daemon.json"
 log "写入 runtime 配置: $DAEMON_JSON"
-python3 - "$DAEMON_JSON" "$RUNSC_RUNTIME" "$RUNSC_BIN" <<'PY'
-import json
-import os
-import sys
-
-path, runtime_name, runsc_bin = sys.argv[1], sys.argv[2], sys.argv[3]
-os.makedirs(os.path.dirname(path), exist_ok=True)
-data = {}
-if os.path.exists(path):
-    with open(path, encoding="utf-8") as handle:
-        text = handle.read().strip()
-    if text:
-        data = json.loads(text)
-data.setdefault("runtimes", {})[runtime_name] = {"path": runsc_bin}
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(data, handle, ensure_ascii=False, indent=2)
-    handle.write("\n")
-PY
+write_daemon_json "$DAEMON_JSON" ""
 chown "$SANDBOX_USER":"$SANDBOX_USER" "$DAEMON_JSON"
 
 log "重启用户级 dockerd 并等待 socket"

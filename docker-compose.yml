@@ -170,6 +170,8 @@ services:
       SANDBOX_DOCKER_HOST: ${SANDBOX_DOCKER_HOST:-}
       # 容器运行时：留空走 runc（本地开发）；生产强制 runsc（gVisor）
       SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-}
+      # 隔离档位：rootless（同机 rootless dockerd）或 dedicated（专用节点 rootful dockerd）
+      SANDBOX_ISOLATION_MODE: ${SANDBOX_ISOLATION_MODE:-rootless}
       # 跨 runner 的执行去重靠 Redis 共享状态；使用受限 ACL 用户，
       # 只允许 sandbox:exec:* 与审计流，不注入业务共享 REDIS_URL。
       SANDBOX_REDIS_URL: redis://sandbox-runner:${SANDBOX_REDIS_PASSWORD:-dev-sandbox-redis-password}@redis:6379/0
@@ -178,6 +180,9 @@ services:
       # 全系统唯一持有 Docker socket 的组件；不映射宿主端口、不经 gateway 暴露。
       # 宿主侧 socket 路径可覆盖：生产指向 rootless dockerd 的 socket（见 prod overlay）。
       - ${SANDBOX_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    labels:
+      # 专用节点独占校验靠该标签识别 runner 自身，不被判成业务容器。
+      shop.sandbox.role: runner
     depends_on:
       redis: { condition: service_healthy }
     healthcheck: *healthcheck
@@ -191,9 +196,8 @@ services:
       MONGO_DB: ${MONGO_DB:-shop_harness}
       SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
       # harness 自身不接触 Docker：启用沙箱后只经内网调用 runner。
-      # 生产多主机时改为逗号分隔的全部 runner，例如：
-      # SANDBOX_RUNNER_URLS: http://runner-a:8000,http://runner-b:8000
-      SANDBOX_RUNNER_URLS: http://sandbox-runner:8000
+      # 专用节点部署时用 .env 覆盖为节点私网地址；多主机用逗号分隔全部 runner。
+      SANDBOX_RUNNER_URLS: ${SANDBOX_RUNNER_URLS:-http://sandbox-runner:8000}
       # harness 调用 runner 使用 runner 专用签名密钥，与业务内网签名密钥分开
       RUNNER_SIGNING_SECRET: ${RUNNER_SIGNING_SECRET:-dev-runner-signing-secret}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-shop-agent-sandbox:latest}

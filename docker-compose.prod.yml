@@ -82,6 +82,9 @@ services:
       SANDBOX_DOCKER_HOST: unix:///run/rootless/docker.sock
       # 生产强制 gVisor：共享宿主内核的逃逸面不可接受
       SANDBOX_RUNTIME: runsc
+      # 单机形态固定 rootless 档位，不随 .env 漂移；专用节点请用
+      # docker-compose.sandbox-node.yml，不要把该 overlay 套到专用节点上。
+      SANDBOX_ISOLATION_MODE: rootless
     volumes: !override
       # 宿主侧 rootless socket：默认 uid 1000，按实际部署用户覆盖 SANDBOX_ROOTLESS_SOCKET
       - ${SANDBOX_ROOTLESS_SOCKET:-/run/user/1000/docker.sock}:/run/rootless/docker.sock

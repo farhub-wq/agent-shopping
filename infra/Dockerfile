@@ -8,7 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+# 构建期 apt 源可覆盖：默认仍走 Debian 官方源，受限网络可传内网镜像源，
+# 否则单是安装 curl 就可能在 deb.debian.org 上等到超时。
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ] && [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s#http://deb.debian.org#${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,7 +23,14 @@ COPY packages ./packages
 COPY services ./services
 COPY migrations ./migrations
 
-RUN pip install --upgrade pip && pip install -e .
+# 构建期 pip 源可覆盖：默认仍走官方 pypi，受限网络可在构建时传内网镜像源，
+# 避免依赖安装卡在 pypi.org 超时。参数只作用于构建阶段，不写入运行环境。
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=
+RUN set -eux; \
+    PIP_ARGS="--index-url ${PIP_INDEX_URL}"; \
+    if [ -n "${PIP_TRUSTED_HOST}" ]; then PIP_ARGS="${PIP_ARGS} --trusted-host ${PIP_TRUSTED_HOST}"; fi; \
+    pip install --upgrade pip ${PIP_ARGS} && pip install -e . ${PIP_ARGS}
 
 ARG SERVICE_NAME=gateway
 ENV SERVICE_NAME=${SERVICE_NAME}
