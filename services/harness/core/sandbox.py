@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 from shop_common.auth import signed_identity_headers
-from shop_common.config import get_settings
+from shop_common.config import ServiceSettings, get_settings
 from shop_common.logging import get_logger
 from shop_common.sandbox import SandboxResult
 
@@ -30,6 +30,21 @@ RUNNER_COOLDOWN_SECONDS = 30
 # 可安全换实例重试的 HTTP 状态：连接级失败或上游不可用；
 # 500 不在此列——它可能是容器已执行后响应序列化失败，重试会造成重复执行。
 TRANSIENT_STATUSES = {429, 502, 503, 504}
+
+
+def validate_sandbox_production(settings: ServiceSettings) -> None:
+    """生产启动守卫：非 dev 必须启用远程沙箱。
+
+    未启用时 run() 会退到本地子进程，而本地进程与 harness 同权限、能访问内网与密钥，
+    等于把「沙箱执行」变成内网任意代码执行；宁可拒绝启动，也不能静默降级。
+    """
+    if settings.env.strip().lower() == "dev":
+        return
+    if not settings.sandbox_enabled:
+        raise RuntimeError(
+            "生产环境必须启用沙箱（SANDBOX_ENABLED=true），"
+            "禁止回退到与 harness 同权限的本地子进程"
+        )
 
 
 def _truncate(raw: bytes) -> tuple[str, bool]:
@@ -119,6 +134,9 @@ class SandboxManager:
             # 生产边界：必须在独立 runner 的容器里执行；runner 不可用直接拒绝，
             # 绝不回退本地子进程——本地进程与宿主同权限，回退等于抹掉安全边界。
             return await self._run_remote(code, limit, user_id, role, tenant)
+        if self.settings.env.strip().lower() != "dev":
+            # 启动守卫之外再兜一层：配置被热改或守卫漏调时，生产也绝不允许本地执行。
+            return SandboxResult("unavailable", stderr="生产环境未启用沙箱", backend="none")
         # 未启用沙箱只允许用于本地演示/测试：本地子进程不是安全边界，不能承接生产流量。
         logger.warning("沙箱未启用，使用本地子进程执行（非安全边界，仅限本地演示）")
         return await self._run_local(code, limit)

@@ -23,7 +23,7 @@ from .core.mcp import MCPHub, MCPServer, build_mcp_hub, discover_and_register
 from .core.memory import MemoryManager
 from .core.policy import summarize
 from .core.runtime import AgentRuntime
-from .core.sandbox import SandboxManager
+from .core.sandbox import SandboxManager, validate_sandbox_production
 from .core.tools import ToolContext, registry
 from .core.tools_impl import BUSINESS_TOOLS  # noqa: F401  （导入即注册业务工具）
 from .core.trace import load_trace
@@ -48,6 +48,8 @@ async def lifespan(_: FastAPI):
     configure_logging("harness")
     # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
     validate_production_settings(settings)
+    # 生产未启用远程沙箱时拒绝启动：本地子进程与 harness 同权限，等于内网任意代码执行。
+    validate_sandbox_production(settings)
     # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.redis_url)
     # harness 只发布审计事件不消费，无需会话工厂；session_factory 仅消费路径会用到

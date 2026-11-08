@@ -2,7 +2,8 @@ import json
 
 import httpx
 import pytest
-from harness.core.sandbox import SandboxManager, SandboxResult
+from harness.core.sandbox import SandboxManager, SandboxResult, validate_sandbox_production
+from shop_common.config import ServiceSettings
 
 
 def _enabled_manager(monkeypatch, handler, urls: str = "http://runner.test") -> SandboxManager:
@@ -178,3 +179,26 @@ async def test_runner_status_aggregates_all_endpoints(monkeypatch):
     assert status["status"] == "ok"
     assert [item["url"] for item in status["endpoints"]] == ["http://bad.test", "http://good.test"]
     assert [item["status"] for item in status["endpoints"]] == ["unavailable", "ok"]
+
+
+def test_prod_requires_remote_sandbox_enabled():
+    # 非 dev 缺 SANDBOX_ENABLED 时必须拒绝启动：否则请求会落到 harness 进程内的本地子进程
+    with pytest.raises(RuntimeError):
+        validate_sandbox_production(ServiceSettings(_env_file=None, env="prod", sandbox_enabled=False))
+    validate_sandbox_production(ServiceSettings(_env_file=None, env="prod", sandbox_enabled=True))
+    # 本地开发保留关闭沙箱的演示能力
+    validate_sandbox_production(ServiceSettings(_env_file=None, env="dev", sandbox_enabled=False))
+
+
+@pytest.mark.asyncio
+async def test_prod_without_remote_sandbox_is_fail_closed(monkeypatch):
+    manager = SandboxManager()
+    monkeypatch.setattr(manager.settings, "sandbox_enabled", False)
+    monkeypatch.setattr(manager.settings, "env", "prod")
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    result = await manager.run("print(1)")
+
+    # 即使绕过启动守卫，生产也不允许本地执行：本地进程与 harness 同权限
+    assert result.status == "unavailable"
+    assert "生产环境未启用沙箱" in result.stderr
