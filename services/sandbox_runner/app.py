@@ -4,6 +4,7 @@
 调用方必须携带平台签名的身份头与 execution_id，且只允许运营/管理员触发。
 """
 
+import hashlib
 import re
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,18 +12,20 @@ from typing import Any
 from fastapi import FastAPI, Header, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import PrincipalDep
+from shop_common.audit import publish_audit
+from shop_common.auth import Principal, PrincipalDep
 from shop_common.config import (
     get_settings,
     production_security_issues,
     validate_production_settings,
 )
 from shop_common.errors import ApiError, install_error_handlers
+from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
-from shop_common.sandbox import SandboxResult
+from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult
 
-from .dedupe import CACHEABLE_STATUSES, ExecutionDedupe
+from .dedupe import CACHEABLE_STATUSES, ExecutionDedupe, owner_scope
 from .runner import ConcurrencyGate, DockerRunner, validate_sandbox_isolation
 
 logger = get_logger(__name__)
@@ -41,17 +44,27 @@ dedupe = ExecutionDedupe(
     # 锁 TTL 覆盖单次容器执行；执行期间心跳续租，runner 崩溃后才按 TTL 自动过期。
     lock_ttl_seconds=settings.sandbox_timeout_seconds + 20,
 )
+# 审计走同一 Redis 流：audit 服务异步消费落库（只增不改、保留 180 天），
+# 执行证据不能只留 5 分钟的结果缓存。
+audit_redis: Redis | None = None
+audit_bus: EventBus | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global audit_redis, audit_bus
     configure_logging("sandbox-runner")
     # runner 接受 Bearer JWT 与签名身份头：密钥不合格时任何人都能伪造 staff 身份执行代码。
     validate_production_settings(settings)
     # 配置漂移直接拒绝启动：生产连默认 root socket 或未启用 gVisor 都等于隔离退化。
     validate_sandbox_isolation(settings)
+    # 审计只发布不消费，不需要 session_factory；独立连接避免与执行锁的 bytes 解码混用。
+    audit_redis = create_redis(settings.redis_url)
+    audit_bus = EventBus(audit_redis, namespace="shop", session_factory=None)
     yield
     await redis_client.aclose()
+    if audit_redis is not None:
+        await audit_redis.aclose()
 
 
 app = FastAPI(title="sandbox-runner", version="0.1.0", lifespan=lifespan)
@@ -61,7 +74,7 @@ install_metrics(app, "sandbox-runner")
 
 class RunRequest(BaseModel):
     # 代码长度设上限：runner 是执行边界，不能接受无界请求体。
-    code: str = Field(min_length=1, max_length=65536)
+    code: str = Field(min_length=1, max_length=MAX_CODE_CHARS)
     language: str = "python"
     timeout: int | None = None
 
@@ -111,6 +124,37 @@ def _unavailable(reason: str) -> dict[str, Any]:
     return SandboxResult("unavailable", stderr=reason, backend="docker").to_dict()
 
 
+async def publish_execution_audit(
+    principal: Principal, execution_id: str, code: str, result: SandboxResult
+) -> None:
+    """执行证据落审计流：记录主体、镜像、输入/输出哈希与耗时。
+
+    只存哈希不存明文代码与输出：审计需要可核对，但不该把沙箱内容变成长期可读数据。
+    """
+    if audit_bus is None:
+        return
+    output = result.stdout + result.stderr
+    await publish_audit(
+        audit_bus,
+        actor_id=principal.user_id,
+        actor_role=principal.role,
+        action="sandbox.executed",
+        target_type="sandbox_execution",
+        target_id=execution_id,
+        after={
+            "image": settings.sandbox_image,
+            "input_sha256": hashlib.sha256(code.encode()).hexdigest(),
+            "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+            "status": result.status,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "truncated": result.truncated,
+            "backend": result.backend,
+        },
+        tenant=principal.tenant,
+    )
+
+
 @app.post("/run")
 async def run_sandbox(
     payload: RunRequest,
@@ -122,9 +166,11 @@ async def run_sandbox(
     exec_id = execution_id.strip()
     if not EXECUTION_ID_PATTERN.fullmatch(exec_id):
         raise ApiError("BAD_REQUEST", "X-Execution-Id 缺失或格式非法")
+    # 去重键绑定执行主体：别人即使拿到同一个 execution_id 也读不到本次结果。
+    owner = owner_scope(principal.tenant, principal.user_id)
 
     try:
-        cached = await dedupe.cached(exec_id)
+        cached = await dedupe.cached(owner, exec_id)
     except Exception:
         # 去重存储不可用时拒绝执行：宁可沙箱不可用，也不能失去跨实例去重保护。
         logger.exception("读取沙箱执行缓存失败 exec=%s", exec_id)
@@ -134,7 +180,7 @@ async def run_sandbox(
         return cached.to_dict()
 
     try:
-        lock = dedupe.lock(exec_id)
+        lock = dedupe.lock(owner, exec_id)
         acquired = await lock.acquire()
     except Exception:
         logger.exception("获取沙箱执行锁失败 exec=%s", exec_id)
@@ -143,7 +189,7 @@ async def run_sandbox(
     if not acquired:
         # 另一台 runner 正在执行同一份代码：短轮询结果，绝不再跑一遍。
         try:
-            cached = await dedupe.wait_for_result(exec_id, settings.sandbox_dedupe_wait_seconds)
+            cached = await dedupe.wait_for_result(owner, exec_id, settings.sandbox_dedupe_wait_seconds)
         except Exception:
             logger.exception("等待沙箱执行结果失败 exec=%s", exec_id)
             cached = None
@@ -154,7 +200,7 @@ async def run_sandbox(
     try:
         # 抢到锁后再查一次：上一任可能刚写完结果并释放锁，堵住这个竞态窗口。
         try:
-            cached = await dedupe.cached(exec_id)
+            cached = await dedupe.cached(owner, exec_id)
         except Exception:
             logger.exception("复核沙箱执行缓存失败 exec=%s", exec_id)
             return _unavailable("去重存储不可用")
@@ -171,8 +217,13 @@ async def run_sandbox(
             gate.release()
 
         if result.status in CACHEABLE_STATUSES:
+            # 审计失败不影响执行结果返回；最坏情况是丢了这条执行证据，不能反过来阻断业务。
             try:
-                await dedupe.store(exec_id, result)
+                await publish_execution_audit(principal, exec_id, payload.code, result)
+            except Exception:
+                logger.exception("沙箱执行审计投递失败 exec=%s", exec_id)
+            try:
+                await dedupe.store(owner, exec_id, result)
             except Exception:
                 # 缓存失败不影响本次返回；最坏情况是后续故障转移重复执行一次。
                 logger.exception("写入沙箱执行结果失败 exec=%s", exec_id)

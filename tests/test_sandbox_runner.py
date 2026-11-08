@@ -1,10 +1,12 @@
 """sandbox-runner 服务契约测试：鉴权、执行去重、结果映射与 fail-closed 语义。"""
 
+import hashlib
+
 import httpx
 import pytest
 from sandbox_runner import app as runner_app
 from sandbox_runner.runner import DockerRunner, validate_sandbox_isolation
-from shop_common.auth import create_token
+from shop_common.auth import Principal, create_token
 from shop_common.config import ServiceSettings
 from shop_common.sandbox import SandboxResult
 
@@ -26,16 +28,18 @@ class _FakeDedupe:
         self.store_calls: list[tuple[str, SandboxResult]] = []
         self.lock_obj = _FakeLock()
 
-    async def cached(self, execution_id: str) -> SandboxResult | None:
+    async def cached(self, owner: str, execution_id: str) -> SandboxResult | None:
         return self.cached_value
 
-    async def store(self, execution_id: str, result: SandboxResult) -> None:
+    async def store(self, owner: str, execution_id: str, result: SandboxResult) -> None:
         self.store_calls.append((execution_id, result))
 
-    def lock(self, execution_id: str) -> _FakeLock:
+    def lock(self, owner: str, execution_id: str) -> _FakeLock:
         return self.lock_obj
 
-    async def wait_for_result(self, execution_id: str, wait_seconds: float) -> SandboxResult | None:
+    async def wait_for_result(
+        self, owner: str, execution_id: str, wait_seconds: float
+    ) -> SandboxResult | None:
         return None
 
 
@@ -55,9 +59,9 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-def _headers(role: str, execution_id: str = "exec-1") -> dict[str, str]:
+def _headers(role: str, execution_id: str = "exec-1", user: str = "u-1") -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {create_token(user_id='u-1', role=role)}",
+        "Authorization": f"Bearer {create_token(user_id=user, role=role)}",
         "X-Execution-Id": execution_id,
     }
 
@@ -342,6 +346,98 @@ async def test_healthz_returns_503_when_runtime_not_registered(monkeypatch):
     # 配了 runsc 但宿主没注册，执行必然失败，健康检查不能报 ok
     assert response.status_code == 503
     assert response.json()["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_run_scopes_cached_result_to_principal(monkeypatch, fake_dedupe):
+    stored: dict[tuple[str, str], SandboxResult] = {}
+    executed: list[str] = []
+
+    async def fake_cached(owner: str, execution_id: str) -> SandboxResult | None:
+        return stored.get((owner, execution_id))
+
+    async def fake_store(owner: str, execution_id: str, result: SandboxResult) -> None:
+        stored[(owner, execution_id)] = result
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        executed.append(code)
+        return SandboxResult("ok", stdout="secret", backend="docker")
+
+    monkeypatch.setattr(fake_dedupe, "cached", fake_cached)
+    monkeypatch.setattr(fake_dedupe, "store", fake_store)
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-1"))
+        # 另一个 staff 拿到同一个 execution_id：键绑定主体，必须重新执行而不是读到他人结果
+        other = await client.post(
+            "/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-2")
+        )
+        repeat = await client.post(
+            "/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-1")
+        )
+
+    assert other.json()["stdout"] == "secret"
+    assert executed == ["print(1)", "print(1)"]
+    # 同一主体重复请求命中自己的缓存，不再执行
+    assert repeat.json()["stdout"] == "secret"
+    assert len(stored) == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_audit_records_hashes(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _Bus:
+        async def publish(self, topic, event_type, payload, *, tenant="default"):
+            captured.update(
+                {"topic": topic, "type": event_type, "payload": payload, "tenant": tenant}
+            )
+
+    monkeypatch.setattr(runner_app, "audit_bus", _Bus())
+    monkeypatch.setattr(
+        runner_app,
+        "settings",
+        ServiceSettings(_env_file=None, env="dev", sandbox_image="sha256:" + "a" * 64),
+    )
+
+    await runner_app.publish_execution_audit(
+        Principal("u-1", "operator", "acme"),
+        "exec-1",
+        "print(1)",
+        SandboxResult("ok", stdout="1", backend="docker", duration_ms=12),
+    )
+
+    payload = captured["payload"]
+    # 审计只落哈希：既保留可核对性，也不把代码与输出变成长期可读数据
+    assert captured["type"] == "audit.sandbox.executed"
+    assert captured["tenant"] == "acme"
+    assert payload["actor_id"] == "u-1"
+    assert payload["target_id"] == "exec-1"
+    after = payload["after"]
+    assert after["input_sha256"] == hashlib.sha256(b"print(1)").hexdigest()
+    assert after["output_sha256"] == hashlib.sha256(b"1").hexdigest()
+    assert after["image"] == "sha256:" + "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_run_audits_real_execution(monkeypatch, fake_dedupe):
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_audit(principal, execution_id: str, code: str, result: SandboxResult) -> None:
+        calls.append((principal.user_id, execution_id, code))
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app, "publish_execution_audit", fake_audit)
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+
+    # 真正跑过容器的执行必须留审计记录，且归属到发起该次执行的主体
+    assert calls == [("u-1", "exec-1", "print(1)")]
 
 
 def test_prod_rejects_default_docker_socket():
