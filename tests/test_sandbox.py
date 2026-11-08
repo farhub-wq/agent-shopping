@@ -4,6 +4,7 @@ import httpx
 import pytest
 from harness.core.sandbox import SandboxManager, SandboxResult, validate_sandbox_production
 from shop_common.config import ServiceSettings
+from shop_common.sandbox import MAX_CODE_CHARS
 
 
 def _enabled_manager(monkeypatch, handler, urls: str = "http://runner.test") -> SandboxManager:
@@ -163,6 +164,40 @@ async def test_enabled_sandbox_500_does_not_fail_over(monkeypatch):
     # 500 可能是容器已执行后响应失败：不允许换实例重试，避免重复执行。
     assert result.status == "unavailable"
     assert calls == ["bad.test"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_code_rejected_before_network(monkeypatch):
+    called: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(True)
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+
+    result = await manager.run("x" * (MAX_CODE_CHARS + 1))
+
+    # 长度边界在 harness 侧先拦：超长代码不该占用网络与 runner 队列
+    assert result.status == "error"
+    assert str(MAX_CODE_CHARS) in result.stderr
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_empty_code_rejected_before_network(monkeypatch):
+    called: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(True)
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+
+    result = await manager.run("   ")
+
+    assert result.status == "error"
+    assert called == []
 
 
 @pytest.mark.asyncio

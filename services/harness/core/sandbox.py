@@ -17,7 +17,7 @@ import httpx
 from shop_common.auth import signed_identity_headers
 from shop_common.config import ServiceSettings, get_settings
 from shop_common.logging import get_logger
-from shop_common.sandbox import SandboxResult
+from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult
 
 logger = get_logger(__name__)
 
@@ -129,6 +129,15 @@ class SandboxManager:
         if language != "python":
             # 只支持 python：其他语言需要额外镜像与运行时，当前不静默降级。
             return SandboxResult("error", stderr="当前沙箱仅支持 python", backend="none")
+        # 输入边界在调用方先拦：超长代码不该先跨网传到 runner 才被 422 拒绝。
+        if not code.strip():
+            return SandboxResult("error", stderr="代码不能为空", backend=self.backend)
+        if len(code) > MAX_CODE_CHARS:
+            return SandboxResult(
+                "error",
+                stderr=f"代码长度超过上限 {MAX_CODE_CHARS} 字符",
+                backend=self.backend,
+            )
         limit = timeout or self.settings.sandbox_timeout_seconds
         if self.settings.sandbox_enabled:
             # 生产边界：必须在独立 runner 的容器里执行；runner 不可用直接拒绝，

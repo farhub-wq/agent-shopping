@@ -6,6 +6,9 @@ from typing import Any
 # status 取值：ok 成功 / error 执行失败 / timeout 超时 / unavailable 运行时不可用
 STATUSES = {"ok", "error", "timeout", "unavailable"}
 
+# 代码长度上限：harness 与 runner 共用同一数值，避免大请求跨网传到 runner 才被拒。
+MAX_CODE_CHARS = 65536
+
 
 @dataclass
 class SandboxResult:

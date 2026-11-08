@@ -16,6 +16,7 @@ from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
 from shop_common.mongo import close_mongo
+from shop_common.sandbox import MAX_CODE_CHARS
 
 from .core.llm import build_provider
 from .core.manifest import load_all, load_skill
@@ -92,7 +93,8 @@ class MemoryQuery(BaseModel):
 
 
 class SandboxRequest(BaseModel):
-    code: str
+    # 长度上限与 runner 侧一致：入口就拒绝，不让超大请求占网络与容器队列。
+    code: str = Field(min_length=1, max_length=MAX_CODE_CHARS)
     language: str = "python"
     timeout: int | None = None
 
