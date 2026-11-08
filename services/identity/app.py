@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, create_token
-from shop_common.config import get_settings
+from shop_common.config import COMMON_SECRETS, get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
@@ -68,6 +68,8 @@ async def bootstrap_admin() -> None:
 async def lifespan(_: FastAPI):
     global redis
     configure_logging("identity")
+    # identity 额外持有 MFA 主密钥：TOTP 密文可被解出等于管理员二次验证失效。
+    validate_production_settings(settings, secrets=(*COMMON_SECRETS, "mfa_encryption_key"))
     await init_models()
     await bootstrap_admin()
     tasks: list[asyncio.Task] = []

@@ -124,6 +124,61 @@ class ServiceSettings(BaseSettings):
         return f"sqlite+aiosqlite:///./data/{self.service_name}.db"
 
 
+# 生产禁止沿用的开发默认值：这些值在仓库里公开可见，命中即等于没有密钥。
+DEV_SECRET_DEFAULTS = {
+    "jwt_secret": "dev-only-secret-change-me",
+    "internal_signing_secret": "dev-internal-signing-secret",
+    "payment_webhook_secret": "dev-payment-webhook-secret",
+    "mfa_encryption_key": "0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU=",
+}
+
+# 所有服务都会用到的密钥：JWT 校验身份，内网签名校验网关/runner 转发身份头。
+COMMON_SECRETS = ("jwt_secret", "internal_signing_secret")
+
+# HS256 / HMAC-SHA256 密钥最短长度：低于 32 字符的密钥可被暴力枚举，失去防伪意义。
+MIN_SECRET_LENGTH = 32
+
+
+def production_security_issues(
+    settings: ServiceSettings, *, secrets: tuple[str, ...] = COMMON_SECRETS
+) -> list[str]:
+    """列出生产环境的安全配置问题；dev 返回空列表，保证本地零配置可启动。
+
+    只校验「是否仍为开发默认值 / 是否过短」，不读取或打印任何密钥内容。
+    """
+    if settings.env.strip().lower() == "dev":
+        return []
+    issues: list[str] = []
+    for field in secrets:
+        value = str(getattr(settings, field) or "").strip()
+        if not value:
+            issues.append(f"{field.upper()} 未注入")
+        elif value == DEV_SECRET_DEFAULTS[field]:
+            issues.append(f"{field.upper()} 仍是开发默认值")
+        elif len(value) < MIN_SECRET_LENGTH:
+            issues.append(f"{field.upper()} 长度不足 {MIN_SECRET_LENGTH} 字符")
+    # 这两个开关在代码里都要求 env=dev 才生效，这里再拦一次，
+    # 防止部署时把 ENV 写成其它非 dev 值却仍按 dev 语义理解配置。
+    if settings.auth_dev_mode:
+        issues.append("AUTH_DEV_MODE 必须在生产关闭")
+    if settings.payment_mock_mode:
+        issues.append("PAYMENT_MOCK_MODE 必须在生产关闭")
+    return issues
+
+
+def validate_production_settings(
+    settings: ServiceSettings, *, secrets: tuple[str, ...] = COMMON_SECRETS
+) -> None:
+    """生产启动守卫：密钥仍是开发默认值或强度不足时直接拒绝启动（fail-fast）。
+
+    信任身份头保持开启是设计要求（gateway 签名后下游才能拿到 staff 身份），
+    其安全性由 INTERNAL_SIGNING_SECRET 的强度兜底，而不是靠关闭信任。
+    """
+    issues = production_security_issues(settings, secrets=secrets)
+    if issues:
+        raise RuntimeError("生产环境安全配置不合格：" + "；".join(issues))
+
+
 # 配置是进程级单例：lru_cache 保证环境变量只解析一次，避免各模块持有不同配置快照。
 @lru_cache
 def get_settings() -> ServiceSettings:

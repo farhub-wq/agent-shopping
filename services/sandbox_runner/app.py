@@ -12,7 +12,11 @@ from fastapi import FastAPI, Header, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep
-from shop_common.config import get_settings
+from shop_common.config import (
+    get_settings,
+    production_security_issues,
+    validate_production_settings,
+)
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
@@ -42,6 +46,8 @@ dedupe = ExecutionDedupe(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging("sandbox-runner")
+    # runner 接受 Bearer JWT 与签名身份头：密钥不合格时任何人都能伪造 staff 身份执行代码。
+    validate_production_settings(settings)
     # 配置漂移直接拒绝启动：生产连默认 root socket 或未启用 gVisor 都等于隔离退化。
     validate_sandbox_isolation(settings)
     yield
@@ -63,6 +69,8 @@ class RunRequest(BaseModel):
 @app.get("/healthz")
 async def healthz(response: Response) -> dict[str, Any]:
     runtime = runner.runtime_info()
+    # 密钥仍是开发默认值等同身份可伪造；启动守卫已在 prod 拦下，这里再暴露一次便于运维定位。
+    security_issues = production_security_issues(settings)
     # 不可达、隔离退化、或配置的 runsc 未注册，都按失败处理并返回 503：
     # compose healthcheck 与 harness 探测都以 HTTP 状态判死，不能只靠 status 字段。
     healthy = (
@@ -70,6 +78,7 @@ async def healthz(response: Response) -> dict[str, Any]:
         and not runtime.get("insecure")
         and not runtime.get("insecure_image")
         and bool(runtime.get("runtime_ok", True))
+        and not security_issues
     )
     if not healthy:
         response.status_code = 503
@@ -82,6 +91,11 @@ async def healthz(response: Response) -> dict[str, Any]:
         "image": settings.sandbox_image,
         "image_pinned": runtime.get("image_pinned", False),
         "network": settings.sandbox_network,
+        "security": {
+            "env": settings.env,
+            "secrets_configured": not security_issues,
+            "issues": security_issues,
+        },
         "max_concurrency": gate.limit,
         "dedupe": "redis",
         "limits": {

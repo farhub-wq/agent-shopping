@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import enqueue_audit
 from shop_common.auth import PrincipalDep, signed_identity_headers
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
@@ -189,6 +189,8 @@ async def _release_locked(session, rows: list[Reservation], *, reason: str) -> N
 async def lifespan(_: FastAPI):
     global redis, _reserve_script, _release_script, _commit_script, _restock_script, _sec_kill_script, _sync_script
     configure_logging("inventory")
+    # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
+    validate_production_settings(settings)
     await init_models()
     redis = create_redis(settings.redis_url)
     # 脚本启动时注册一次，实际调用由 Redis 单线程原子执行，避免检查与扣减之间的竞态。

@@ -142,6 +142,8 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: sandbox_runner } }
     environment:
       # runner 只做一件事：执行沙箱容器。不注入数据库/Redis/业务服务地址，缩小被攻破后的影响面。
+      # 但 runner 同时接受 Bearer JWT：JWT_SECRET 必须是强值，否则任何人都能伪造 staff 身份执行代码。
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
       INTERNAL_SIGNING_SECRET: ${INTERNAL_SIGNING_SECRET:-dev-internal-signing-secret}
       TRUST_IDENTITY_HEADERS: ${TRUST_IDENTITY_HEADERS:-true}
       ENV: ${ENV:-dev}

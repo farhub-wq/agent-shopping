@@ -488,3 +488,86 @@ def test_run_caps_container_log_size(monkeypatch):
     assert isinstance(log_config, dict)
     # stdout 落在宿主 json-file，只读根文件系统挡不住刷屏，必须单容器封顶
     assert log_config["Config"] == {"max-size": "1m", "max-file": "1"}
+
+
+def test_run_applies_container_hardening(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    runner._run_blocking("print(1)", 5)
+
+    kwargs = client.containers.create_kwargs
+    # 显式丢弃全部 capability，不依赖镜像默认能力集
+    assert kwargs["cap_drop"] == ["ALL"]
+    # /dev/shm 默认 64MB，必须单独压下；nofile 防止句柄耗尽宿主配额
+    assert kwargs["shm_size"] == 16 * 1024 * 1024
+    ulimits = kwargs["ulimits"]
+    assert [(u.name, u.soft, u.hard) for u in ulimits] == [("nofile", 1024, 1024)]
+
+
+def _prod_sandbox(**overrides) -> ServiceSettings:
+    values = {
+        "env": "prod",
+        "sandbox_docker_host": "unix:///run/rootless/docker.sock",
+        "sandbox_runtime": "runsc",
+        "sandbox_image": "sha256:" + "a" * 64,
+    }
+    values.update(overrides)
+    return ServiceSettings(_env_file=None, **values)
+
+
+def test_prod_rejects_network_bridge():
+    # 出网等于给沙箱开内网探测与数据外带的通道，生产不允许改回 bridge/host
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_network="bridge"))
+
+
+def test_prod_rejects_excessive_cpu():
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_cpu=8.0))
+
+
+def test_prod_rejects_excessive_memory():
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_memory_mb=16384))
+
+
+def test_dev_allows_relaxed_sandbox_params():
+    # 本地开发需要临时放宽网络/资源参数，守卫只在非 dev 生效
+    validate_sandbox_isolation(
+        ServiceSettings(
+            _env_file=None,
+            env="dev",
+            sandbox_network="bridge",
+            sandbox_cpu=8.0,
+            sandbox_memory_mb=16384,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_secrets_are_dev_defaults(monkeypatch):
+    monkeypatch.setattr(runner_app, "settings", ServiceSettings(_env_file=None, env="prod"))
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///run/rootless/docker.sock",
+            "rootless": True,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "sha256:" + "a" * 64,
+            "image_pinned": True,
+            "insecure": False,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 隔离与镜像都达标，但密钥仍是开发默认值：身份可伪造，必须判死
+    assert response.status_code == 503
+    assert response.json()["security"]["secrets_configured"] is False
+    assert "JWT_SECRET" in response.json()["security"]["issues"][0]

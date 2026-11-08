@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import publish_audit
 from shop_common.auth import PrincipalDep
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
@@ -46,6 +46,8 @@ sandbox = SandboxManager()
 async def lifespan(_: FastAPI):
     global redis, bus, memory, runtime, mcp_server, mcp_hub
     configure_logging("harness")
+    # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
+    validate_production_settings(settings)
     # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.redis_url)
     # harness 只发布审计事件不消费，无需会话工厂；session_factory 仅消费路径会用到

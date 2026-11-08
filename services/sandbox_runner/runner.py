@@ -1,7 +1,8 @@
 """Docker 沙箱执行器：由独立 runner 进程持有 Docker socket，harness 不接触运行时。
 
 安全基线：默认关闭网络、只读根文件系统、/tmp 限额可写、限制 CPU/内存/PID、
-禁止提权、以 65534 低权用户运行、python -I 隔离用户 site-packages。
+丢弃全部 capability、限制 /dev/shm 与 nofile、禁止提权、以 65534 低权用户运行、
+python -I 隔离用户 site-packages。
 
 Docker 端点：留空沿用 SDK 默认 socket 仅供本地开发；生产必须显式指向 rootless
 dockerd（或受限 socket 代理），启动守卫会拒绝默认 root socket——否则 runner 一旦
@@ -34,6 +35,10 @@ ROOT_DOCKER_ENDPOINTS = frozenset(
 
 # 生产允许的隔离运行时：gVisor 在用户态拦截 syscall，逃逸不再直接命中宿主内核。
 ISOLATED_RUNTIMES = frozenset({"runsc"})
+
+# 资源硬上限：配置可以按部署规模上调，但不能无限抬高，否则单个沙箱容器就能压垮宿主。
+MAX_SANDBOX_CPU = 2.0
+MAX_SANDBOX_MEMORY_MB = 2048
 
 # 只有内容寻址的镜像引用才不可变：registry 的 repo@sha256:... 或本地镜像 ID sha256:...
 PINNED_IMAGE_RE = re.compile(r"^(?:[^@\s]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
@@ -68,6 +73,21 @@ def validate_sandbox_isolation(settings: ServiceSettings) -> None:
         raise RuntimeError(
             "生产环境 SANDBOX_IMAGE 必须固定 digest（repo@sha256:... 或 sha256:...），"
             "禁止使用可被覆盖的 tag；make build-sandbox-image 会打印可用的值"
+        )
+    if settings.sandbox_network.strip().lower() != "none":
+        # 出网等于把沙箱变成内网探测/云元数据读取/数据外带的跳板；确需出网只能走 allowlist 代理。
+        raise RuntimeError(
+            "生产环境 SANDBOX_NETWORK 必须为 none，禁止 bridge/host 等可出网模式"
+        )
+    if not 0 < settings.sandbox_cpu <= MAX_SANDBOX_CPU:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_CPU 必须在 (0, {MAX_SANDBOX_CPU}] 内，"
+            "抬高上限前先扩容专用沙箱主机"
+        )
+    if not 0 < settings.sandbox_memory_mb <= MAX_SANDBOX_MEMORY_MB:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_MEMORY_MB 必须在 (0, {MAX_SANDBOX_MEMORY_MB}] 内，"
+            "内存炸弹会把宿主先于业务打满"
         )
 
 
@@ -182,6 +202,7 @@ class DockerRunner:
         started = time.perf_counter()
         try:
             from docker.errors import ContainerError, ImageNotFound
+            from docker.types import Ulimit
 
             # 显式走配置的端点（生产为 rootless socket），不再隐式使用默认 socket。
             client = self._client()
@@ -198,8 +219,16 @@ class DockerRunner:
                 "mem_limit": f"{self.settings.sandbox_memory_mb}m",
                 "nano_cpus": int(self.settings.sandbox_cpu * 1_000_000_000),
                 "pids_limit": 64,
+                # 显式丢弃全部 capability：即使存在提权漏洞也无法 mount/keyctl 等，
+                # 不依赖镜像自身能力集（镜像换代时能力集会漂移）。
+                "cap_drop": ["ALL"],
                 "read_only": True,
+                # /tmp 必须可写；其余路径全部只读。
                 "tmpfs": {"/tmp": "rw,size=32m"},
+                # /dev/shm 默认 64MB 且可写，脚本可用它放大内存占用；这里单独压到 16MB。
+                "shm_size": 16 * 1024 * 1024,
+                # 文件句柄上限：避免脚本用海量 socket/文件耗尽宿主 nofile 配额。
+                "ulimits": [Ulimit(name="nofile", soft=1024, hard=1024)],
                 "security_opt": ["no-new-privileges"],
                 "user": "65534:65534",
                 "working_dir": "/tmp",

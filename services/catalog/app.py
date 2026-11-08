@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from shop_common.auth import PrincipalDep
-from shop_common.config import get_settings
+from shop_common.config import get_settings, validate_production_settings
 from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.logging import configure_logging, get_logger
@@ -66,6 +66,8 @@ async def seed_products() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging("catalog")
+    # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
+    validate_production_settings(settings)
     # 启动顺序固定：先建表再投种子数据，否则空库上写入种子会失败。
     await init_models()
     await seed_products()
