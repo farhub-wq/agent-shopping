@@ -15,10 +15,16 @@ class _FakeRedis:
     async def get(self, key: str) -> object:
         return self.data.get(key)
 
-    async def set(self, key: str, value: object, ex: int | None = None) -> bool:
+    async def set(self, key: str, value: object, ex: int | None = None, nx: bool = False) -> bool:
+        if nx and key in self.data:
+            return False
         self.data[key] = value
         self.expires[key] = ex
         return True
+
+    async def delete(self, key: str) -> None:
+        self.data.pop(key, None)
+        self.expires.pop(key, None)
 
 
 @pytest.mark.asyncio
@@ -61,6 +67,32 @@ async def test_result_is_scoped_to_owner():
 
     # 同一个 execution_id 换主体必须查不到：键里绑定主体摘要，内网他人无法串读。
     assert await dedupe.cached("owner-b", "exec-1") is None
+
+
+@pytest.mark.asyncio
+async def test_mark_started_is_set_once_and_cleared():
+    redis = _FakeRedis()
+    dedupe = ExecutionDedupe(redis, result_ttl_seconds=300)
+
+    # 第一次写墓碑成功；同一 execution_id 再次写失败，阻止重复执行。
+    assert await dedupe.mark_started(OWNER, "exec-1") is True
+    assert await dedupe.mark_started(OWNER, "exec-1") is False
+    assert redis.expires[dedupe.attempt_key(OWNER, "exec-1")] == 300
+
+    # 启动前失败可以清墓碑，允许正常故障转移。
+    await dedupe.clear_started(OWNER, "exec-1")
+    assert await dedupe.mark_started(OWNER, "exec-1") is True
+
+
+@pytest.mark.asyncio
+async def test_tombstone_outlives_execution_lock():
+    redis = _FakeRedis()
+    dedupe = ExecutionDedupe(redis, lock_ttl_seconds=620, result_ttl_seconds=300)
+
+    await dedupe.mark_started(OWNER, "exec-1")
+
+    # 长 timeout 下锁 TTL 会超过结果缓存；墓碑必须活过锁，才能覆盖崩溃窗口。
+    assert redis.expires[dedupe.attempt_key(OWNER, "exec-1")] == 650
 
 
 def test_owner_scope_is_stable_and_opaque():

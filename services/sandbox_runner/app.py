@@ -23,9 +23,9 @@ from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
-from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult
+from shop_common.sandbox import EXECUTED_STATUSES, MAX_CODE_CHARS, SandboxResult
 
-from .dedupe import CACHEABLE_STATUSES, ExecutionDedupe, owner_scope
+from .dedupe import ExecutionDedupe, owner_scope
 from .runner import ConcurrencyGate, DockerRunner, validate_sandbox_isolation
 
 logger = get_logger(__name__)
@@ -76,7 +76,8 @@ class RunRequest(BaseModel):
     # 代码长度设上限：runner 是执行边界，不能接受无界请求体。
     code: str = Field(min_length=1, max_length=MAX_CODE_CHARS)
     language: str = "python"
-    timeout: int | None = None
+    # 非正数超时没有业务含义；上限由 DockerRunner 按 SANDBOX_TIMEOUT_SECONDS 收敛。
+    timeout: int | None = Field(default=None, ge=1)
 
 
 @app.get("/healthz")
@@ -211,13 +212,35 @@ async def run_sandbox(
             # 本实例并发已满：释放锁后返回繁忙，由 harness 转移到其他 runner。
             return _unavailable("runner 繁忙，请稍后重试")
         try:
+            # 容器启动前先写墓碑：runner 若在执行中途崩溃，锁过期后后续请求看到墓碑
+            # 就直接返回 infra_error，不会把可能已发生的执行再跑一遍。
+            try:
+                started = await dedupe.mark_started(owner, exec_id)
+            except Exception:
+                logger.exception("写入沙箱执行墓碑失败 exec=%s", exec_id)
+                return _unavailable("去重存储不可用")
+            if not started:
+                return SandboxResult(
+                    "infra_error",
+                    stderr="同一执行已开始过，为避免重复执行不再重跑",
+                    backend="none",
+                ).to_dict()
+
             result = await runner.run(payload.code, language=payload.language, timeout=payload.timeout)
         finally:
             # 无论执行成功、失败还是异常都必须归还并发额度，否则容量会被永久泄漏。
             gate.release()
 
-        if result.status in CACHEABLE_STATUSES:
-            # 审计失败不影响执行结果返回；最坏情况是丢了这条执行证据，不能反过来阻断业务。
+        if result.status == "unavailable":
+            # 容器未启动就没有执行痕迹：清墓碑，允许 harness 换 runner 正常重试。
+            try:
+                await dedupe.clear_started(owner, exec_id)
+            except Exception:
+                logger.exception("清理沙箱执行墓碑失败 exec=%s", exec_id)
+
+        if result.status in EXECUTED_STATUSES:
+            # 审记与缓存都失败不影响本次返回：最坏情况是丢证据或后续重试多执行一次，
+            # 不能反过来阻断业务；缓存可确保同一 execution_id 不会被换 runner 重复执行。
             try:
                 await publish_execution_audit(principal, exec_id, payload.code, result)
             except Exception:
@@ -225,7 +248,6 @@ async def run_sandbox(
             try:
                 await dedupe.store(owner, exec_id, result)
             except Exception:
-                # 缓存失败不影响本次返回；最坏情况是后续故障转移重复执行一次。
                 logger.exception("写入沙箱执行结果失败 exec=%s", exec_id)
         return result.to_dict()
     finally:

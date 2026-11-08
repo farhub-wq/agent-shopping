@@ -14,9 +14,10 @@ import re
 import time
 from typing import Any
 
+import requests
 from shop_common.config import ServiceSettings, get_settings
 from shop_common.logging import get_logger
-from shop_common.sandbox import SandboxResult
+from shop_common.sandbox import SandboxResult, clamp_timeout
 
 logger = get_logger(__name__)
 
@@ -194,14 +195,15 @@ class DockerRunner:
         if language != "python":
             # 只支持 python：其他语言需要额外镜像与运行时，当前不静默降级。
             return SandboxResult("error", stderr="当前沙箱仅支持 python", backend="none")
-        limit = timeout or self.settings.sandbox_timeout_seconds
+        # 配置超时是上限：直接调用 runner 的一方也不能靠超大 timeout 长期占用并发槽。
+        limit = clamp_timeout(timeout, self.settings.sandbox_timeout_seconds)
         # Docker SDK 是同步阻塞调用：必须放到线程池，避免卡住事件循环拖垮健康检查。
         return await asyncio.to_thread(self._run_blocking, code, limit)
 
     def _run_blocking(self, code: str, timeout: int) -> SandboxResult:
         started = time.perf_counter()
         try:
-            from docker.errors import ContainerError, ImageNotFound
+            from docker.errors import ContainerError, DockerException, ImageNotFound
             from docker.types import Ulimit
 
             # 显式走配置的端点（生产为 rootless socket），不再隐式使用默认 socket。
@@ -210,6 +212,8 @@ class DockerRunner:
             return SandboxResult("unavailable", stderr=f"docker 不可达: {type(exc).__name__}", backend="docker")
 
         container = None
+        # 标记容器是否真正启动过：启动前的失败可以安全换实例重试，启动后不能。
+        container_started = False
         try:
             # 安全基线：网络模式走配置（默认 none）、只读根文件系统、/tmp 限额可写、
             # 限制 CPU/内存/PID、禁止提权、以 65534 低权用户运行、python -I 隔离用户 site-packages。
@@ -242,7 +246,18 @@ class DockerRunner:
                 create_kwargs["runtime"] = runtime
             container = client.containers.create(self.settings.sandbox_image, **create_kwargs)
             container.start()
-            wait_result = container.wait(timeout=timeout)
+            container_started = True
+            try:
+                wait_result = container.wait(timeout=timeout)
+            except requests.exceptions.ReadTimeout:
+                # wait 超时是脚本超出时间预算，不是基础设施故障；
+                # 必须映射 timeout，否则会被当成脚本失败并固化进结果缓存。
+                return SandboxResult(
+                    "timeout",
+                    stderr=f"执行超过 {timeout}s 已终止",
+                    backend="docker",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                )
             stdout_raw = container.logs(stdout=True, stderr=False)
             stderr_raw = container.logs(stdout=False, stderr=True)
             stdout, truncated = _truncate(stdout_raw)
@@ -258,13 +273,37 @@ class DockerRunner:
                 truncated=truncated,
             )
         except ImageNotFound:
+            # 镜像缺失属于实例级不可用：换一台 runner 可能已有该 digest，必须允许故障转移。
             return SandboxResult(
-                "unavailable", stderr=f"镜像 {self.settings.sandbox_image} 不存在", backend="docker"
+                "unavailable",
+                stderr=f"镜像 {self.settings.sandbox_image} 不存在",
+                backend="docker",
+                duration_ms=int((time.perf_counter() - started) * 1000),
             )
         except ContainerError as exc:
             return SandboxResult(
                 "error", stderr=str(exc)[:MAX_OUTPUT_BYTES], backend="docker",
                 duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except (DockerException, requests.exceptions.RequestException) as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            if container_started:
+                # 容器已启动，代码可能已经执行：既不能换实例重跑（会重复副作用），
+                # 也不能混同成脚本 error，否则会污染脚本错误率并误置 untrusted_output。
+                logger.exception("Docker 沙箱执行阶段失败")
+                return SandboxResult(
+                    "infra_error",
+                    stderr=f"{type(exc).__name__}: {exc}"[:MAX_OUTPUT_BYTES],
+                    backend="docker",
+                    duration_ms=duration_ms,
+                )
+            # 启动前失败（镜像/运行时/端点）是实例级不可用，交给 harness 故障转移。
+            logger.warning("Docker 沙箱不可用: %s", type(exc).__name__)
+            return SandboxResult(
+                "unavailable",
+                stderr=f"docker 不可用: {type(exc).__name__}",
+                backend="docker",
+                duration_ms=duration_ms,
             )
         except Exception as exc:
             logger.exception("Docker 沙箱执行失败")

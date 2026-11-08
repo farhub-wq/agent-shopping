@@ -74,6 +74,26 @@ async def test_enabled_sandbox_calls_runner(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_requested_timeout_is_clamped_to_configured_max(monkeypatch):
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["timeout"])
+        return httpx.Response(200, json={"status": "ok", "stdout": "", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+    monkeypatch.setattr(manager.settings, "sandbox_timeout_seconds", 20)
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    # 配置值是上限：更大的请求被收敛，更小的请求保留，避免调用方长期占用并发槽。
+    await manager.run("print(1)", timeout=3600)
+    await manager.run("print(1)", timeout=5)
+    await manager.run("print(1)", timeout=-3)
+
+    assert seen == [20, 5, 20]
+
+
+@pytest.mark.asyncio
 async def test_enabled_sandbox_fails_closed_when_runner_unreachable(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
@@ -164,6 +184,32 @@ async def test_enabled_sandbox_500_does_not_fail_over(monkeypatch):
     # 500 可能是容器已执行后响应失败：不允许换实例重试，避免重复执行。
     assert result.status == "unavailable"
     assert calls == ["bad.test"]
+
+
+@pytest.mark.asyncio
+async def test_infra_error_is_not_retried_on_another_runner(monkeypatch):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(
+            200, json={"status": "infra_error", "stderr": "APIError: daemon down", "backend": "docker"}
+        )
+
+    manager = _enabled_manager(monkeypatch, handler, "http://bad.test,http://good.test")
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    result = await manager.run("print(1)")
+
+    # 容器已启动后的 runner 故障：执行可能已发生，禁止换实例重跑，如实返回 infra_error。
+    assert result.status == "infra_error"
+    assert calls == ["bad.test"]
+
+
+def test_from_dict_keeps_infra_error_status():
+    result = SandboxResult.from_dict({"status": "infra_error", "stderr": "APIError"})
+    # 跨进程响应必须保留 infra_error，不能被降级成 error。
+    assert result.status == "infra_error"
 
 
 @pytest.mark.asyncio

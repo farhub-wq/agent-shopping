@@ -96,7 +96,8 @@ class SandboxRequest(BaseModel):
     # 长度上限与 runner 侧一致：入口就拒绝，不让超大请求占网络与容器队列。
     code: str = Field(min_length=1, max_length=MAX_CODE_CHARS)
     language: str = "python"
-    timeout: int | None = None
+    # 超时只允许正数；上限在 SandboxManager 内按配置收敛，避免入口直接占满并发槽。
+    timeout: int | None = Field(default=None, ge=1)
 
 
 def _ctx(principal, session_id: str | None) -> ToolContext:

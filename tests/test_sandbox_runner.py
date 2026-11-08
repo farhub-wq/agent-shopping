@@ -4,6 +4,8 @@ import hashlib
 
 import httpx
 import pytest
+import requests
+from docker.errors import APIError
 from sandbox_runner import app as runner_app
 from sandbox_runner.runner import DockerRunner, validate_sandbox_isolation
 from shop_common.auth import Principal, create_token
@@ -27,12 +29,22 @@ class _FakeDedupe:
         self.cached_value: SandboxResult | None = None
         self.store_calls: list[tuple[str, SandboxResult]] = []
         self.lock_obj = _FakeLock()
+        self.mark_started_result = True
+        self.mark_started_calls: list[str] = []
+        self.clear_started_calls: list[str] = []
 
     async def cached(self, owner: str, execution_id: str) -> SandboxResult | None:
         return self.cached_value
 
     async def store(self, owner: str, execution_id: str, result: SandboxResult) -> None:
         self.store_calls.append((execution_id, result))
+
+    async def mark_started(self, owner: str, execution_id: str) -> bool:
+        self.mark_started_calls.append(execution_id)
+        return self.mark_started_result
+
+    async def clear_started(self, owner: str, execution_id: str) -> None:
+        self.clear_started_calls.append(execution_id)
 
     def lock(self, owner: str, execution_id: str) -> _FakeLock:
         return self.lock_obj
@@ -440,6 +452,74 @@ async def test_run_audits_real_execution(monkeypatch, fake_dedupe):
     assert calls == [("u-1", "exec-1", "print(1)")]
 
 
+@pytest.mark.asyncio
+async def test_run_audits_infra_error_and_caches_it(monkeypatch, fake_dedupe):
+    audited: list[SandboxResult] = []
+
+    async def fake_audit(principal, execution_id: str, code: str, result: SandboxResult) -> None:
+        audited.append(result)
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        return SandboxResult("infra_error", stderr="APIError: daemon down", backend="docker")
+
+    monkeypatch.setattr(runner_app, "publish_execution_audit", fake_audit)
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        response = await client.post(
+            "/run", json={"code": "print(1)"}, headers=_headers("operator")
+        )
+
+    # 已发生执行尝试要留审计证据；同时写缓存，保证同一 execution_id 重试不会换 runner 重复执行。
+    assert response.json()["status"] == "infra_error"
+    assert len(audited) == 1
+    assert [(exec_id, r.status) for exec_id, r in fake_dedupe.store_calls] == [
+        ("exec-1", "infra_error")
+    ]
+    # 已启动过的执行不能清墓碑，否则崩溃窗口内仍可能被重跑。
+    assert fake_dedupe.clear_started_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_skips_execution_when_attempt_tombstone_exists(monkeypatch, fake_dedupe):
+    called: list[bool] = []
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        called.append(True)
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+    fake_dedupe.mark_started_result = False
+
+    async with _client() as client:
+        response = await client.post(
+            "/run", json={"code": "print(1)"}, headers=_headers("operator")
+        )
+
+    # 前一次尝试可能已经执行过：直接返回 infra_error，绝不能再开容器。
+    assert response.json()["status"] == "infra_error"
+    assert called == []
+    assert fake_dedupe.store_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_clears_tombstone_when_runner_did_not_execute(monkeypatch, fake_dedupe):
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        return SandboxResult("unavailable", stderr="docker down", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        response = await client.post(
+            "/run", json={"code": "print(1)"}, headers=_headers("operator")
+        )
+
+    # 容器没有启动就没有执行痕迹：清墓碑，允许 harness 正常故障转移。
+    assert response.json()["status"] == "unavailable"
+    assert fake_dedupe.clear_started_calls == ["exec-1"]
+    assert fake_dedupe.store_calls == []
+
+
 def test_prod_rejects_default_docker_socket():
     # 生产未显式配置端点：隐式落到默认 root socket，必须拒绝启动
     with pytest.raises(RuntimeError):
@@ -516,31 +596,39 @@ def test_dev_allows_default_socket_and_runtime():
 
 
 class _FakeContainer:
+    def __init__(self) -> None:
+        self.wait_timeout: int | None = None
+        self.removed = False
+
     def start(self) -> None:
         pass
 
     def wait(self, timeout: int | None = None) -> dict[str, int]:
+        self.wait_timeout = timeout
         return {"StatusCode": 0}
 
     def logs(self, stdout: bool = True, stderr: bool = False) -> bytes:
-        return b"ok" if stdout else b""
+        return b"ok" if stdout and not stderr else b""
 
     def remove(self, force: bool = False) -> None:
-        pass
+        self.removed = True
 
 
 class _FakeContainers:
-    def __init__(self) -> None:
+    def __init__(self, container_factory=_FakeContainer) -> None:
         self.create_kwargs: dict[str, object] = {}
+        self.last_container = None
+        self._container_factory = container_factory
 
     def create(self, image: str, **kwargs: object) -> _FakeContainer:
         self.create_kwargs = {"image": image, **kwargs}
-        return _FakeContainer()
+        self.last_container = self._container_factory()
+        return self.last_container
 
 
 class _FakeDockerClient:
-    def __init__(self) -> None:
-        self.containers = _FakeContainers()
+    def __init__(self, container_factory=_FakeContainer) -> None:
+        self.containers = _FakeContainers(container_factory)
 
     def close(self) -> None:
         pass
@@ -599,6 +687,89 @@ def test_run_applies_container_hardening(monkeypatch):
     assert kwargs["shm_size"] == 16 * 1024 * 1024
     ulimits = kwargs["ulimits"]
     assert [(u.name, u.soft, u.hard) for u in ulimits] == [("nofile", 1024, 1024)]
+
+
+class _WaitTimeoutContainer(_FakeContainer):
+    def wait(self, timeout: int | None = None) -> dict[str, int]:
+        # docker-py 在 wait 超时抛 requests.ReadTimeout，而不是 docker 自己的异常类型
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+
+class _StartBrokenContainer(_FakeContainer):
+    def start(self) -> None:
+        raise APIError("runtime runsc not found")
+
+
+class _WaitBrokenContainer(_FakeContainer):
+    def wait(self, timeout: int | None = None) -> dict[str, int]:
+        raise APIError("daemon down")
+
+
+def test_wait_timeout_maps_to_timeout(monkeypatch):
+    client = _FakeDockerClient(_WaitTimeoutContainer)
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # wait 超时是脚本本身的执行结果：不能被误判成 error，也不能被当基础设施故障转移
+    assert result.status == "timeout"
+    assert "5s" in result.stderr
+    # 超时后仍然必须强制回收容器
+    assert client.containers.last_container.removed is True
+
+
+def test_docker_failure_before_start_maps_to_unavailable(monkeypatch):
+    client = _FakeDockerClient(_StartBrokenContainer)
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 容器未启动就没有副作用，属于实例级不可用，harness 可以安全换 runner
+    assert result.status == "unavailable"
+
+
+def test_docker_failure_after_start_maps_to_infra_error(monkeypatch):
+    client = _FakeDockerClient(_WaitBrokenContainer)
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 启动后的失败可能已经执行了代码：既不能返回 unavailable（会重复执行），
+    # 也不能返回 error（会污染脚本错误率并误置 untrusted_output）。
+    assert result.status == "infra_error"
+
+
+@pytest.mark.asyncio
+async def test_run_clamps_timeout_to_configured_max(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(
+        ServiceSettings(_env_file=None, env="dev", sandbox_timeout_seconds=20), client, monkeypatch
+    )
+
+    await runner.run("print(1)", timeout=3600)
+
+    # 配置值是上限：超大 timeout 不能把并发槽长期占住
+    assert client.containers.last_container.wait_timeout == 20
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_non_positive_timeout(monkeypatch):
+    called: list[bool] = []
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        called.append(True)
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        response = await client.post(
+            "/run", json={"code": "print(1)", "timeout": 0}, headers=_headers("operator")
+        )
+
+    # 0/负数超时在入口直接拒绝，不进入执行与缓存流程
+    assert response.status_code == 422
+    assert called == []
 
 
 def _prod_sandbox(**overrides) -> ServiceSettings:

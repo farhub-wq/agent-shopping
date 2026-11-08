@@ -17,7 +17,7 @@ import httpx
 from shop_common.auth import signed_identity_headers
 from shop_common.config import ServiceSettings, get_settings
 from shop_common.logging import get_logger
-from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult
+from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult, clamp_timeout
 
 logger = get_logger(__name__)
 
@@ -138,7 +138,8 @@ class SandboxManager:
                 stderr=f"代码长度超过上限 {MAX_CODE_CHARS} 字符",
                 backend=self.backend,
             )
-        limit = timeout or self.settings.sandbox_timeout_seconds
+        # 配置超时是上限：调用方只能缩短，不能把并发槽长期占用。
+        limit = clamp_timeout(timeout, self.settings.sandbox_timeout_seconds)
         if self.settings.sandbox_enabled:
             # 生产边界：必须在独立 runner 的容器里执行；runner 不可用直接拒绝，
             # 绝不回退本地子进程——本地进程与宿主同权限，回退等于抹掉安全边界。
@@ -205,6 +206,11 @@ class SandboxManager:
                     self._mark_failure(url)
                     failures.append(f"{url} {result.stderr or 'unavailable'}")
                     continue
+                if result.status == "infra_error":
+                    # 容器已启动但 runner 故障：执行可能已发生，换实例会重复执行；
+                    # 只把该实例标记为失败，后续请求优先走其他 runner，但本次如实返回。
+                    self._mark_failure(url)
+                    return result
                 self._mark_success(url)
                 return result
         logger.error("全部 sandbox-runner 不可用: %s", "; ".join(failures))

@@ -135,6 +135,7 @@ async def _sandbox_run(args: dict[str, Any], ctx: ToolContext) -> Any:
     # 让 registry 在后续写/不可逆动作前强制转人工复核。
     data = result.to_dict()
     data["trust"] = "untrusted_execution_output"
+    # infra_error 是 runner 故障，没有模型可见输出，不置位 untrusted_output。
     if result.status in {"ok", "error", "timeout"}:
         ctx.untrusted_output = True
     return data
@@ -303,7 +304,12 @@ registry.register(
             "properties": {
                 "code": {"type": "string", "maxLength": MAX_CODE_CHARS},
                 "language": {"type": "string", "enum": ["python"]},
-                "timeout": {"type": "integer"},
+                # 超时上限与 SandboxManager 的收敛口径一致，避免模型生成超大值。
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": settings.sandbox_timeout_seconds,
+                },
             },
             "required": ["code"],
         },
