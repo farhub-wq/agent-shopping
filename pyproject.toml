@@ -36,7 +36,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["packages", "services"]
-include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*", "payment*", "audit*"]
+include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulfillment*", "aftersales*", "harness*", "identity*", "payment*", "audit*", "sandbox_runner*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
