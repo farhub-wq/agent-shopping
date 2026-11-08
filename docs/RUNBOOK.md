@@ -194,6 +194,8 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 
 沙箱执行由独立 `sandbox-runner` 承载：只有它挂载 Docker socket 并创建一次性容器，harness 只经内网 HTTP（携带签名身份头）调用。runner 不映射宿主端口、不经 gateway 暴露，任何把它暴露到公网的改动都视为配置事故。
 
+**runner 只持有专用密钥与受限 Redis 凭据**（SBX-15/16）：runner 不接受 Bearer JWT，`Authorization` 头不参与鉴权；harness 用 `RUNNER_SIGNING_SECRET` 签身份头，runner 用同一把专用密钥验签，二者都不得复用 `INTERNAL_SIGNING_SECRET`。runner 的 Redis 连接走 `SANDBOX_REDIS_URL`（受限 ACL 用户 `sandbox-runner`），只允许 `sandbox:exec:*` 与 `shop:events:audit`，不能读业务键。Redis 的 `default` 用户已改为密码认证，业务服务通过 `REDIS_PASSWORD` 注入凭据；runner 容器拿不到该密码，因此无法匿名绕过 ACL。非 dev 下缺任一项 runner 直接拒绝启动。
+
 **生产必须是 rootless dockerd**：runner 被攻破时若连的是默认 `/var/run/docker.sock`（root 守护进程），攻击者等于拿到宿主 root，容器加固全部失效。因此生产 overlay 把 rootless socket 挂到容器内独立路径，并由 runner 启动守卫强制校验：
 
 - `SANDBOX_DOCKER_HOST` 生产必填，且不允许是默认 root socket，否则 runner 拒绝启动；
@@ -268,7 +270,7 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 排查顺序：
 
 1. `curl localhost:8006/sandbox/health` 看 `backend`、`runner_urls` 与 `runners.endpoints` 每台状态；
-2. `docker compose logs sandbox-runner`，并确认 runner 的 `REDIS_URL` 可连通；
+2. `docker compose logs sandbox-runner`，并确认 runner 的 `SANDBOX_REDIS_URL`（受限 ACL 用户）可连通，且不是共享 `REDIS_URL`；
 3. 确认 runner 容器内可访问 Docker 端点并确认是 rootless：`docker compose exec sandbox-runner python -c "import docker;print(docker.DockerClient(base_url='unix:///run/rootless/docker.sock').info()['SecurityOptions'])"`（本地开发用默认 socket 时可省略 `base_url`）。
 
 `POST /api/agents/sandbox/run` 仅供 staff，runner 侧会再校验一次（非 staff 返回 403）；执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
@@ -286,9 +288,14 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 
 **A. 宿主初始化与 `.env`**
 
-- [ ] `sudo make setup-sandbox-host`（等价 `sudo bash infra/rootless-docker/setup.sh`），记录输出的 `SANDBOX_ROOTLESS_SOCKET` 与 `SANDBOX_RUNTIME`。
-- [ ] `.env` 写入 `SANDBOX_ROOTLESS_SOCKET=$ROOTLESS`、`SANDBOX_RUNTIME=runsc`、`ENV=prod`。
+- [ ] `sudo make setup-sandbox-host`（等价 `sudo bash infra/rootless-docker/setup.sh`），记录输出的 `SANDBOX_ROOTLESS_SOCKET`、`SANDBOX_RUNTIME`、`SANDBOX_UID`、`SANDBOX_GID`。
+- [ ] `.env` 写入 `SANDBOX_ROOTLESS_SOCKET=$ROOTLESS`、`SANDBOX_RUNTIME=runsc`、`SANDBOX_UID`、`SANDBOX_GID`、`ENV=prod`。
+- [ ] runner 运行身份与 socket 属主一致：`stat -c '%u %g' $ROOTLESS` 输出的 uid/gid 必须等于 `.env` 中的 `SANDBOX_UID` / `SANDBOX_GID`；不一致时 runner 容器会因 EACCES 无法连接 rootless dockerd。
 - [ ] 生产密钥：`JWT_SECRET`、`INTERNAL_SIGNING_SECRET` 均为 ≥32 字符随机值；identity 另配 `MFA_ENCRYPTION_KEY`，payment 另配 `PAYMENT_WEBHOOK_SECRET`。
+- [ ] runner 专用密钥：`.env` 注入 ≥32 字符的 `RUNNER_SIGNING_SECRET`，且必须与 `INTERNAL_SIGNING_SECRET` 不同；harness 与 runner 都要读取。
+- [ ] 业务 Redis 认证：`.env` 注入 ≥32 字符 `REDIS_PASSWORD`；`REDIS_URL` 可只写 host/db，服务启动时会把密码注入 default 用户。生产 Redis 不应暴露到公网，并定期轮换密码。
+- [ ] runner Redis ACL：注入 `SANDBOX_REDIS_PASSWORD`，并确认 `SANDBOX_REDIS_URL` 使用非 `default` 的受限用户、带密码、不等于共享 `REDIS_URL`。runner 容器不得注入 `REDIS_PASSWORD`，否则它可绕过 ACL 走 default 用户。
+- [ ] runner 容器环境不得包含 `JWT_SECRET` / `INTERNAL_SIGNING_SECRET` / `REDIS_PASSWORD`：`docker compose config --format json` 中 `services.sandbox-runner.environment` 只应有 `RUNNER_SIGNING_SECRET`、`SANDBOX_REDIS_URL` 与隔离类参数。
 - [ ] 确认 harness 侧沙箱开关：`docker compose -f docker-compose.yml -f docker-compose.prod.yml config --format json` 中 `services.harness.environment.SANDBOX_ENABLED` 为 `"true"`。
 
 **B. 镜像（必须与 runner 端点一致）**
@@ -361,7 +368,8 @@ except Exception as exc:
 
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
-| inventory 启动即退出 | Redis 不可达（启动要播种热库存） | `docker compose ps redis`，检查 `REDIS_URL` |
+| inventory 启动即退出 | Redis 不可达（启动要播种热库存） | `docker compose ps redis`，检查 `REDIS_URL` / `REDIS_PASSWORD` |
+| Redis 返回 NOAUTH / 服务启动报「禁止匿名 default 用户」 | `REDIS_PASSWORD` 未注入，或 `REDIS_URL` 仍指向无密码连接 | 按 `.env.example` 注入 `REDIS_PASSWORD`，或让 `REDIS_URL` 自带凭据；确认 redis 容器健康检查带认证 |
 | 下单 401 | 未带 token 或 `JWT_SECRET` 不一致 | 重新登录取 token，确认所有服务同一 secret |
 | 登录返回 429 | 同一手机号+IP 连续失败 5 次，锁定 15 分钟 | 等锁定期满，或清 `login_attempts` 表对应行 |
 | 刷新会话返回 403 | 缺 `X-CSRF-Token` 或与 `shop_csrf` Cookie 不一致 | 从 Cookie 取值回填请求头 |
@@ -382,6 +390,7 @@ except Exception as exc:
 | 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
 | 服务启动即退出并提示「生产环境安全配置不合格」 | `ENV=prod` 但密钥仍是开发默认值/长度不足 | 按 `.env.example` 注入随机密钥，identity/payment 还要各自专属密钥 |
+| sandbox-runner 启动报 `RUNNER_SIGNING_SECRET` / `SANDBOX_REDIS_URL` 不合格 | runner 密钥复用内网密钥，或 Redis 仍用共享/默认用户 | 注入独立的 `RUNNER_SIGNING_SECRET` 与非 `default`、带密码的 `SANDBOX_REDIS_URL` |
 | sandbox-runner 启动报 `SANDBOX_NETWORK`/`SANDBOX_CPU`/`SANDBOX_MEMORY_MB` 不合格 | 生产隔离参数被改回 bridge/host 或资源上限过高 | 恢复 `none` 与 (0, 2.0] 核、(0, 2048] MB；扩容需改代码常量并扩容专用宿主机 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
 | 记忆检索结果差 | 未配真实嵌入，或端点故障回退哈希 | 配 `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` 启用真实向量；换模型/维度后旧向量被维度守卫跳过，需清理或重建 `memory_records` |

@@ -39,6 +39,8 @@
 | SBX-12 | P2 | 冷启动 | 一次一容器无预热池，冷启动直接计入用户等待 | ☐ |
 | SBX-13 | P2 | 参数硬编码 | 结果缓存 TTL 固定 300s、锁 TTL 硬编码推导，未随执行超时配置联动 | ☐ |
 | SBX-14 | P2 | 输入边界 | harness 侧 `SandboxRequest.code` 无长度上限，超限请求要跨网传到 runner 才被拒 | ☑ 2026-11-08 |
+| SBX-15 | P1 | 密钥半径 | runner 同时持有 `JWT_SECRET`/`INTERNAL_SIGNING_SECRET`，并与业务服务共用 Redis 凭据；被攻破后能伪造任意 staff 身份、读写全部业务数据 | ☑ 2026-11-08 |
+| SBX-16 | P1 | 凭据隔离 | Redis `default` 用户为 `nopass +@all`，runner 被攻破后可匿名连接绕过受限 ACL，直接读写全库 | ☑ 2026-11-08 |
 
 ---
 
@@ -149,6 +151,25 @@
 - **已实施（2026-11-08）**：上限收敛为共享常量 `MAX_CODE_CHARS`（[sandbox.py](file:///c:/Users/far/Desktop/git/shop-agent/packages/shop_common/sandbox.py#L9-L10)），harness 入口 Pydantic `max_length`、客户端 `SandboxManager.run` 前置校验、`sandbox_run` 工具 schema `maxLength` 三处统一；空代码同样在本地拒绝，不占用 runner 队列。
 - **验证**：`test_oversized_code_rejected_before_network`、`test_empty_code_rejected_before_network`（断言 mock transport 未被调用）。
 
+### SBX-15 runner 密钥半径（P1，已关闭）
+
+- **原证据**：runner 用通用 [get_principal](file:///c:/Users/far/Desktop/git/shop-agent/packages/shop_common/auth.py) 接受 Bearer JWT 与 `INTERNAL_SIGNING_SECRET` 签名头；[runner app](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/app.py) 用共享 `REDIS_URL` 做去重与审计。任一凭据泄露都能横向越权。
+- **已实施（2026-11-08）**：
+  - **去 Bearer JWT**：runner 新增专属 `get_runner_principal`，只按签名身份头解析身份，`Authorization` 头不参与鉴权；移除 runner 容器的 `JWT_SECRET` 注入。
+  - **独立签名密钥**：新增 `RUNNER_SIGNING_SECRET`，harness 发给 runner 的身份头用它签名，runner 用它验签；非 dev 守卫要求 ≥32 字符、非默认值，且必须与 `INTERNAL_SIGNING_SECRET` 不同。runner 容器不再注入 `INTERNAL_SIGNING_SECRET`。
+  - **Redis ACL**：新增 `SANDBOX_REDIS_URL`，runner 改用受限用户 `sandbox-runner`；ACL 只允许 `sandbox:exec:*`（去重键）与 `shop:events:audit`（审计流），命令限定为 `get/set/del/expire/evalsha/script|load/xadd/ping/client|setinfo`。compose 启动时从模板生成 ACL 文件，密码由 `SANDBOX_REDIS_PASSWORD` 注入。非 dev 守卫要求 URL 带用户名+密码、非 `default` 用户、且不复用共享 `REDIS_URL`。
+- **遗留**：本地 compose 的 `default` Redis 用户匿名问题已由 SBX-16 关闭；生产仍需限制 Redis 网络可达面并定期轮换 `REDIS_PASSWORD` / `SANDBOX_REDIS_PASSWORD`。
+- **验证**：`test_run_rejects_bearer_jwt`、`test_run_rejects_internal_signing_secret`、`test_runner_calls_use_dedicated_signing_secret`、`test_prod_runner_rejects_reused_internal_secret`、`test_prod_runner_rejects_shared_redis_url`、`test_prod_runner_rejects_default_redis_user`、`test_prod_runner_accepts_dedicated_secret_and_acl_redis`。
+
+### SBX-16 Redis 默认用户匿名（P1，已关闭）
+
+- **原证据**：`infra/redis/users.acl.template` 曾声明 `user default on nopass ~* &* +@all`；runner 容器虽只拿到受限 `SANDBOX_REDIS_URL`，但仍可匿名以 `default` 连接同一 Redis，SBX-15 的 ACL 隔离被完全绕过。
+- **已实施（2026-11-08）**：
+  - ACL 中 `default` 用户改为 `>REDIS_PASSWORD`，不再允许 `nopass`；业务服务统一通过 `settings.resolved_redis_url` 注入密码，URL 仍可独立指定 host/db。
+  - 生产守卫（`production_security_issues`）在非 dev 下要求 `REDIS_URL` 自带凭据或注入 `REDIS_PASSWORD`，并拒绝含空白字符的 Redis 密码；所有业务服务启动即校验。
+  - compose 只在业务服务注入 `REDIS_PASSWORD`，runner 容器仍拿不到该密码；Redis 健康检查改为带认证的 `PING`。
+- **验证**：`test_prod_rejects_anonymous_redis`、`test_prod_rejects_whitespace_redis_password`、`test_resolved_redis_url_injects_password`；容器内实测匿名 `PING`/`GET` 被拒，带密码 `default` 与受限 `sandbox-runner` 行为符合预期。
+
 ---
 
 ## 3. 实现难点（设计取舍，不是单点 bug）
@@ -177,7 +198,8 @@
 | 供应链 | `pip install` 恶意包、基础镜像被替换/tag 漂移 | 生产已强制 digest pinning；无镜像白名单；运行期安装被 `network=none` + 只读根文件系统阻断 | 补镜像白名单 | SBX-01、D2 |
 | 资源 DoS | 日志刷爆磁盘、`/dev/shm` 滥用、句柄耗尽、内存/CPU 抢占、并发容器压垮守护进程 | CPU/内存/PID 已限；日志已封顶 1MB/容器；shm 16MB + nofile 1024 已限；生产 CPU/内存有硬上限 | 全局配额 | SBX-02、SBX-06、SBX-11 |
 | 多租户串扰 | 结果缓存/日志/临时卷跨主体可读，exec_id 可复用他人结果 | 结果/锁键绑定 `sha256(tenant+user)`，他人 exec_id 只命中自己的命名空间 | 键绑定主体 + 归属比对 | SBX-07 |
-| 身份伪造 | 默认签名密钥、信任头被上游透传、内网位置即信任 | 非 dev 启动守卫强制强密钥（≥32 且非默认值）；信任头保留但必须带有效签名，无签名/超窗一律拒绝 | 密钥轮换 + 上游不透传 X-User-* | SBX-03 |
+| 身份伪造 | 默认签名密钥、信任头被上游透传、内网位置即信任 | 非 dev 启动守卫强制强密钥（≥32 且非默认值）；信任头保留但必须带有效签名，无签名/超窗一律拒绝；runner 只认专用密钥，不再接受 Bearer JWT | 密钥轮换 + 上游不透传 X-User-* | SBX-03、SBX-15 |
+| 凭据横向越权 | runner 持有 JWT/内网签名密钥，并与业务服务共用 Redis 凭据；Redis default 用户匿名可写 | runner 只持有 `RUNNER_SIGNING_SECRET`；Redis 使用受限 ACL 用户，仅允许沙箱去重键与审计流；default 用户改为密码认证，生产守卫拒绝匿名连接 | 限制 Redis 网络可达面并定期轮换密码 | SBX-15、SBX-16 |
 | 提示注入 | stdout 作为可信内容回灌模型，诱导链式调用高危工具 | 输出带 `trust=untrusted_execution_output`，指令片段经 `neutralize_data` 转义；写操作在污染上下文转人工复核 | 标记不可信 + policy 阻断 | SBX-08 |
 | 审计缺失 | 无持久执行记录，事后无法取证 | 真实执行投递 `audit.sandbox.executed`（主体/镜像/输入输出哈希/耗时），落 180 天审计流 | 落库对接审计流 | SBX-07、D8 |
 
@@ -200,13 +222,16 @@
 
 ## 6. 变更后风险与注意事项
 
-前一轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd + gVisor + digest 镜像 + 日志/健康检查硬约束」；本轮再关闭 SBX-03/05/06，阶段一配置级洞口全部清零；随后关闭 SBX-07/08/14，执行结果按主体隔离、真实执行留持久审计、沙箱输出不再直接驱动写操作。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
+前一轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd + gVisor + digest 镜像 + 日志/健康检查硬约束」；本轮再关闭 SBX-03/05/06，阶段一配置级洞口全部清零；随后关闭 SBX-07/08/14，执行结果按主体隔离、真实执行留持久审计、沙箱输出不再直接驱动写操作；并关闭 SBX-15，runner 不再持有 JWT/内网签名密钥，Redis 凭据收敛到沙箱键与审计流。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
 
 ### 6.1 新增的生产硬前置（不满足就起不来）
 
 | 前置 | 配置 | 缺失后果 |
 |---|---|---|
 | 生产密钥 | `.env` 注入随机 `JWT_SECRET`、`INTERNAL_SIGNING_SECRET`（均 ≥32 字符）；identity 另需 `MFA_ENCRYPTION_KEY`，payment 另需 `PAYMENT_WEBHOOK_SECRET` | 对应服务启动抛错，容器反复重启 |
+| runner 独立密钥 | `.env` 注入 ≥32 字符 `RUNNER_SIGNING_SECRET`，必须与 `INTERNAL_SIGNING_SECRET` 不同；harness 与 runner 都要读取 | harness/runner 启动抛错 |
+| runner Redis ACL | `SANDBOX_REDIS_URL` 使用带密码的非 `default` 用户，且不等于共享 `REDIS_URL`；compose 由 `SANDBOX_REDIS_PASSWORD` 生成 ACL 文件 | runner 启动抛错（拒绝共享凭据） |
+| 业务 Redis 认证 | 注入 ≥32 字符 `REDIS_PASSWORD`（或让 `REDIS_URL` 自带凭据）；compose 由该变量生成 default 用户密码，runner 容器拿不到 | 业务服务启动抛错（拒绝匿名 default） |
 | rootless dockerd | `SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock` | runner 启动抛错，容器反复重启 |
 | gVisor 运行时 | `SANDBOX_RUNTIME=runsc`，且宿主已注册 `runsc` | 启动抛错；注册缺失时 healthz 503 |
 | 镜像 digest | `SANDBOX_IMAGE=repo@sha256:...` 或 `sha256:...` | 启动抛错 |
@@ -219,6 +244,7 @@
 
 - 依赖内核 user namespace + cgroup v2；cgroup v1 的老内核装不上，只能改走「专用沙箱主机 + TLS」路线。
 - rootless 守护进程靠用户 linger 常驻；关闭 linger、切换部署用户、宿主重启后 socket 路径变化，都会让 runner 503，需要重新跑 setup 并更新 `SANDBOX_ROOTLESS_SOCKET`。
+- rootless socket 属主是沙箱用户，runner 容器必须以同一 uid/gid 运行（prod overlay 的 `user: ${SANDBOX_UID}:${SANDBOX_GID}`）。默认容器内是 uid 0，直接挂载 socket 会 EACCES；`setup.sh` 会打印这两个值。
 - 被攻破后的上限是「沙箱用户权限」而非宿主 root，但该用户仍能读写自己的 Docker 数据根（`~/.local/share/docker`）。生产应把沙箱用户数据目录与业务数据分盘，最好独立主机。
 - 不支持绑定 <1024 端口等特权操作；沙箱本身 `network=none`，不受影响。
 
@@ -251,7 +277,8 @@
 
 ### 6.7 仍需记住的未解决项
 
-- 本轮已关闭 SBX-07/08/14；未覆盖：SBX-09 部署机兼容性回归、SBX-10 孤儿容器回收、SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
+- 本轮已关闭 SBX-07/08/14/15/16；未覆盖：SBX-09 部署机兼容性回归、SBX-10 孤儿容器回收、SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
+- Redis 的 ACL 与密码已收敛到凭据层，但网络可达面仍需部署侧限制：生产 Redis 不应暴露到公网，并应定期轮换 `REDIS_PASSWORD` / `SANDBOX_REDIS_PASSWORD`。
 - 沙箱执行的审计证据是 `audit.sandbox.executed` 事件，只含哈希不含明文；事故复盘需要代码或输出原文时，只能靠调用方自己的留存，不要去审计库里找明文。
 - `untrusted_output` 标记只在单次运行内生效：同一次工具循环里会拦住写入，下一轮会话会重新建模。跨轮会话的高危操作仍依赖审批，不能假设标记一直在。
 - 生产 overlay 已把 `ENV=prod` 写进每个服务；不要依赖部署机 `.env` 是否记得设置，那是上一轮最容易漏的地方。
@@ -299,3 +326,5 @@ docker compose config -q
 | 2026-11-08 | SBX-07 关闭：结果/锁键绑定 `sha256(tenant+user)` 主体摘要，杜绝他人 exec_id 串读；真实执行投递 `audit.sandbox.executed`（镜像/输入输出哈希/耗时）落 180 天审计流 |
 | 2026-11-08 | SBX-08 关闭：沙箱输出标记 `untrusted_execution_output`，`ToolContext.untrusted_output` 污染后写/管理权限工具强制转人工复核，审批重放继承标记 |
 | 2026-11-08 | SBX-14 关闭：`MAX_CODE_CHARS` 共享常量，harness Pydantic 入口、客户端本地校验、工具 schema `maxLength` 三处统一；空代码同样本地拒绝 |
+| 2026-11-08 | SBX-15 关闭：runner 移除 Bearer JWT 与内网签名密钥，改用独立 `RUNNER_SIGNING_SECRET`；Redis 改用 `sandbox-runner` ACL 用户（仅沙箱键与审计流），生产守卫拒绝共享凭据 |
+| 2026-11-08 | SBX-16 关闭：Redis `default` 用户改为密码认证，业务服务通过 `REDIS_PASSWORD` 注入凭据；生产守卫拒绝匿名 Redis，runner 仍拿不到业务密码 |
