@@ -126,6 +126,10 @@ class ServiceSettings(BaseSettings):
     # 沙箱容器运行时：生产强制 gVisor（runsc），用用户态内核隔离 syscall，
     # 收敛共享宿主内核的 CVE 面；留空仅用于本地开发，届时回落到 runc。
     sandbox_runtime: str = ""
+    # 沙箱隔离档位：rootless = 同机 rootless dockerd（默认）；
+    # dedicated = 专用沙箱节点上的 rootful dockerd，由「节点独占 + gVisor + digest 镜像」
+    # 补偿 rootful socket 等价节点 root 的权限半径。非法值由 runner 启动守卫拒绝。
+    sandbox_isolation_mode: str = "rootless"
 
     @property
     def resolved_database_url(self) -> str:

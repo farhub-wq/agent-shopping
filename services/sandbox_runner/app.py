@@ -26,7 +26,12 @@ from shop_common.metrics import install_metrics
 from shop_common.sandbox import EXECUTED_STATUSES, MAX_CODE_CHARS, SandboxResult
 
 from .dedupe import ExecutionDedupe, owner_scope
-from .runner import ConcurrencyGate, DockerRunner, validate_sandbox_isolation
+from .runner import (
+    ConcurrencyGate,
+    DockerRunner,
+    isolation_mode,
+    validate_sandbox_isolation,
+)
 
 logger = get_logger(__name__)
 
@@ -60,6 +65,16 @@ async def lifespan(_: FastAPI):
     validate_runner_settings(settings)
     # 配置漂移直接拒绝启动：生产连默认 root socket 或未启用 gVisor 都等于隔离退化。
     validate_sandbox_isolation(settings)
+    # 专用节点的启动期尽力校验：已有非沙箱容器说明节点混部，拒绝启动；
+    # 守护进程暂时不可达不算部署错误（healthz 会持续判死，避免临时故障导致崩溃循环）。
+    if isolation_mode(settings) == "dedicated":
+        try:
+            foreign = runner.foreign_containers()
+        except Exception:
+            logger.warning("启动期无法校验专用节点独占性，交由 healthz 持续探测")
+        else:
+            if foreign:
+                raise RuntimeError(f"专用沙箱节点存在非沙箱容器: {','.join(foreign[:5])}")
     # 审计只发布不消费，不需要 session_factory；独立连接避免与执行锁的 bytes 解码混用。
     audit_redis = create_redis(settings.resolved_sandbox_redis_url)
     audit_bus = EventBus(audit_redis, namespace="shop", session_factory=None)
@@ -110,15 +125,19 @@ class RunRequest(BaseModel):
 @app.get("/healthz")
 async def healthz(response: Response) -> dict[str, Any]:
     runtime = runner.runtime_info()
+    mode = isolation_mode(settings)
     # 密钥仍是开发默认值或 Redis 仍用共享凭据，都意味着 runner 的密钥半径没有收敛。
     security_issues = runner_security_issues(settings)
-    # 不可达、隔离退化、或配置的 runsc 未注册，都按失败处理并返回 503：
-    # compose healthcheck 与 harness 探测都以 HTTP 状态判死，不能只靠 status 字段。
+    # 不可达、隔离退化、档位与守护进程不符、节点混部、或配置的 runsc 未注册，
+    # 任一成立都按失败处理并返回 503：compose healthcheck 与 harness 探测都以
+    # HTTP 状态判死，不能只靠 status 字段。
     healthy = (
         bool(runtime.get("reachable"))
         and not runtime.get("insecure")
         and not runtime.get("insecure_image")
         and bool(runtime.get("runtime_ok", True))
+        and bool(runtime.get("node_exclusive", True))
+        and not runtime.get("mode_mismatch", False)
         and not security_issues
     )
     if not healthy:
@@ -129,6 +148,13 @@ async def healthz(response: Response) -> dict[str, Any]:
         "docker_sdk": runtime.get("docker_sdk", False),
         # 端点形态、是否 rootless、运行时是否注册、镜像是否 digest 固定，供运维直接定位。
         "docker": runtime,
+        "isolation": {
+            "mode": mode,
+            # 专用节点要求运行中容器只属于沙箱栈；rootless 档位不校验，恒为 True。
+            "node_exclusive": runtime.get("node_exclusive", True),
+            "foreign_containers": runtime.get("foreign_containers", []),
+            "mode_mismatch": runtime.get("mode_mismatch", False),
+        },
         "image": settings.sandbox_image,
         "image_pinned": runtime.get("image_pinned", False),
         "network": settings.sandbox_network,

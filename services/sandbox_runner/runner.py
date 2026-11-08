@@ -4,9 +4,10 @@
 丢弃全部 capability、限制 /dev/shm 与 nofile、禁止提权、以 65534 低权用户运行、
 python -I 隔离用户 site-packages。
 
-Docker 端点：留空沿用 SDK 默认 socket 仅供本地开发；生产必须显式指向 rootless
-dockerd（或受限 socket 代理），启动守卫会拒绝默认 root socket——否则 runner 一旦
-被攻破就等价拿到宿主 root，前面所有容器加固都失去意义。
+Docker 端点：留空沿用 SDK 默认 socket 仅供本地开发。生产有两种隔离档位：
+rootless（默认）要求显式指向 rootless dockerd，启动守卫拒绝默认 root socket；
+dedicated 允许 rootful socket，但要求节点只运行沙箱自身容器，并把「节点独占」
+作为执行前置——否则 runner 一旦被攻破就等价拿到宿主 root。
 """
 
 import asyncio
@@ -37,6 +38,14 @@ ROOT_DOCKER_ENDPOINTS = frozenset(
 # 生产允许的隔离运行时：gVisor 在用户态拦截 syscall，逃逸不再直接命中宿主内核。
 ISOLATED_RUNTIMES = frozenset({"runsc"})
 
+# 隔离档位：rootless 是同机 rootless dockerd；dedicated 是专用节点上的 rootful dockerd。
+ISOLATION_MODES = frozenset({"rootless", "dedicated"})
+
+# 专用节点独占判定：运行中容器只有带这些角色标签的才属于沙箱栈，
+# 其余任何容器都意味着节点混部，rootful socket 的风险半径不再可控。
+SANDBOX_CONTAINER_LABEL = "shop.sandbox.role"
+ALLOWED_NODE_ROLES = frozenset({"execution", "runner", "infra"})
+
 # 资源硬上限：配置可以按部署规模上调，但不能无限抬高，否则单个沙箱容器就能压垮宿主。
 MAX_SANDBOX_CPU = 2.0
 MAX_SANDBOX_MEMORY_MB = 2048
@@ -50,18 +59,42 @@ def is_image_pinned(image: str) -> bool:
     return bool(PINNED_IMAGE_RE.fullmatch(image.strip()))
 
 
-def validate_sandbox_isolation(settings: ServiceSettings) -> None:
-    """生产启动守卫：禁止 root Docker socket，并强制 gVisor 运行时。
+def isolation_mode(settings: ServiceSettings) -> str:
+    """规范化隔离档位；非法值由启动守卫拒绝，运行期不做静默回落。"""
+    return settings.sandbox_isolation_mode.strip().lower()
 
-    dev 不做限制，保证本地 Docker Desktop / DOCKER_HOST 与缺省 runc 可用；
-    生产只有 rootless dockerd + runsc 同时成立，才认为隔离档位达标。
+
+def validate_sandbox_isolation(settings: ServiceSettings) -> None:
+    """生产启动守卫：按隔离档位校验端点、运行时、镜像与资源上限。
+
+    dev 不做限制，保证本地 Docker Desktop / DOCKER_HOST 与缺省 runc 可用。
+    rootless 要求显式非默认端点；dedicated 允许 rootful socket，但端点必须是
+    本地 unix socket（空值会回落 SDK 默认，tcp 端点等于远端 root）。
+    节点独占无法只靠配置证明，由启动期与执行边界另行校验。
     """
     if settings.env.strip().lower() == "dev":
         return
-    if settings.sandbox_docker_host.strip() in ROOT_DOCKER_ENDPOINTS:
+    mode = isolation_mode(settings)
+    if mode not in ISOLATION_MODES:
+        # 拼错档位不能静默落回默认，否则隔离预期与实际部署不一致。
         raise RuntimeError(
-            "生产环境禁止 runner 直连默认 Docker socket（等价宿主 root），"
-            "请配置 SANDBOX_DOCKER_HOST 指向 rootless dockerd 或受限代理"
+            f"生产环境 SANDBOX_ISOLATION_MODE 必须是 "
+            f"{'/'.join(sorted(ISOLATION_MODES))}，当前值 "
+            f"{settings.sandbox_isolation_mode!r} 无法识别"
+        )
+    host = settings.sandbox_docker_host.strip()
+    if mode == "rootless":
+        if host in ROOT_DOCKER_ENDPOINTS:
+            raise RuntimeError(
+                "生产环境禁止 runner 直连默认 Docker socket（等价宿主 root），"
+                "请配置 SANDBOX_DOCKER_HOST 指向 rootless dockerd；"
+                "若部署在专用沙箱节点，请设 SANDBOX_ISOLATION_MODE=dedicated"
+            )
+    elif not host.startswith("unix://"):
+        # 专用节点只接受本地 socket：空值无法证明连的哪台守护进程，tcp 等同于远端 root。
+        raise RuntimeError(
+            "dedicated 档位必须显式配置本地 unix socket，"
+            "例如 SANDBOX_DOCKER_HOST=unix:///var/run/docker.sock"
         )
     if settings.sandbox_runtime.strip() not in ISOLATED_RUNTIMES:
         # 共享宿主内核意味着内核 CVE 可直接穿透沙箱，生产不接受 runc 兜底。
@@ -136,8 +169,39 @@ class DockerRunner:
             return docker.from_env()
         return docker.DockerClient(base_url=endpoint)
 
+    def _foreign_containers(self, client) -> list[str]:
+        """列出专用节点上的非沙箱容器；只允许带沙箱角色标签的容器运行。"""
+        foreign: list[str] = []
+        for container in client.containers.list():
+            # 标签缺失即视为业务容器：专用节点不做隐式豁免，宁可误报也不放宽。
+            labels = (container.attrs.get("Config", {}).get("Labels") or {})
+            role = str(labels.get(SANDBOX_CONTAINER_LABEL) or "")
+            if role not in ALLOWED_NODE_ROLES:
+                foreign.append(container.name)
+        return foreign
+
+    def foreign_containers(self) -> list[str]:
+        """启动期入口：守护进程不可达时抛异常，由调用方决定是否阻断启动。"""
+        client = self._client()
+        try:
+            return self._foreign_containers(client)
+        finally:
+            client.close()
+
+    def _node_exclusive(self, client, mode: str) -> tuple[list[str], bool]:
+        """执行/健康检查共用的节点独占判定；非 dedicated 档位不校验。"""
+        if mode != "dedicated":
+            return [], True
+        try:
+            foreign = self._foreign_containers(client)
+        except Exception as exc:
+            # 守护进程 info() 可达但列容器失败：无法证明节点干净，按不独占处理。
+            logger.warning("专用节点独占检查失败: %s", type(exc).__name__)
+            return ["<容器列表读取失败>"], False
+        return foreign, not foreign
+
     def runtime_info(self) -> dict[str, Any]:
-        """探测 Docker 端点：可达性、是否 rootless，供 healthz 暴露。
+        """探测 Docker 端点：可达性、隔离档位、节点独占与镜像状态，供 healthz 暴露。
 
         rootless 判定取自 dockerd 自身上报的 SecurityOptions，而不是客户端路径，
         这样即使把 rootless socket 挂到同名路径也不会误判。
@@ -154,38 +218,48 @@ class DockerRunner:
                 "error": type(exc).__name__,
             }
         try:
-            info = client.info()
-        except Exception as exc:
-            # 守护进程不可达：旧实现对 SDK 可导入就报 ok，会掩盖真实故障。
+            try:
+                info = client.info()
+            except Exception as exc:
+                # 守护进程不可达：旧实现对 SDK 可导入就报 ok，会掩盖真实故障。
+                return {
+                    "docker_sdk": True,
+                    "reachable": False,
+                    "endpoint": endpoint,
+                    "error": type(exc).__name__,
+                }
+            options = info.get("SecurityOptions") or []
+            rootless = any("rootless" in str(option) for option in options)
+            runtime = self.settings.sandbox_runtime.strip()
+            # 配了 runsc 但宿主没注册该运行时，容器会直接起不来；提前在健康检查暴露。
+            runtime_ok = runtime in (info.get("Runtimes") or {}) if runtime else True
+            pinned = is_image_pinned(self.settings.sandbox_image)
+            mode = isolation_mode(self.settings)
+            foreign, node_exclusive = self._node_exclusive(client, mode)
+            non_dev = self.settings.env.strip().lower() != "dev"
             return {
                 "docker_sdk": True,
-                "reachable": False,
+                "reachable": True,
                 "endpoint": endpoint,
-                "error": type(exc).__name__,
+                "rootless": rootless,
+                "runtime": runtime or "runc",
+                "runtime_ok": runtime_ok,
+                "image": self.settings.sandbox_image,
+                "image_pinned": pinned,
+                # 档位声明必须与守护进程实际模式一致：dedicated 却连 rootless 守护进程，
+                # 说明隔离强度低于声明，healthz 需判死。
+                "isolation_mode": mode,
+                "node_exclusive": node_exclusive,
+                "foreign_containers": foreign,
+                "mode_mismatch": mode == "dedicated" and rootless,
+                # rootless 档位连到 root 守护进程属于隔离退化；dedicated 档位本来就
+                # 跑 rootful，退化只体现在档位与守护进程模式不符（mode_mismatch）。
+                "insecure": non_dev and not rootless and mode != "dedicated",
+                # 非 dev 用 tag 镜像等于执行环境可被静默替换，同样视为退化。
+                "insecure_image": non_dev and not pinned,
             }
         finally:
             client.close()
-
-        options = info.get("SecurityOptions") or []
-        rootless = any("rootless" in str(option) for option in options)
-        runtime = self.settings.sandbox_runtime.strip()
-        # 配了 runsc 但宿主没注册该运行时，容器会直接起不来；提前在健康检查暴露。
-        runtime_ok = runtime in (info.get("Runtimes") or {}) if runtime else True
-        pinned = is_image_pinned(self.settings.sandbox_image)
-        return {
-            "docker_sdk": True,
-            "reachable": True,
-            "endpoint": endpoint,
-            "rootless": rootless,
-            "runtime": runtime or "runc",
-            "runtime_ok": runtime_ok,
-            "image": self.settings.sandbox_image,
-            "image_pinned": pinned,
-            # 非 dev 连到 root 守护进程属于隔离退化，必须让健康检查报警。
-            "insecure": self.settings.env.strip().lower() != "dev" and not rootless,
-            # 非 dev 用 tag 镜像等于执行环境可被静默替换，同样视为退化。
-            "insecure_image": self.settings.env.strip().lower() != "dev" and not pinned,
-        }
 
     def docker_available(self) -> bool:
         # 保留布尔快捷方法：真正 ping 守护进程，避免只检查 SDK 导入的假阳性。
@@ -206,7 +280,8 @@ class DockerRunner:
             from docker.errors import ContainerError, DockerException, ImageNotFound
             from docker.types import Ulimit
 
-            # 显式走配置的端点（生产为 rootless socket），不再隐式使用默认 socket。
+            # 显式走配置的端点（生产为 rootless socket 或专用节点 rootful socket），
+            # 不再隐式使用默认 socket。
             client = self._client()
         except Exception as exc:
             return SandboxResult("unavailable", stderr=f"docker 不可达: {type(exc).__name__}", backend="docker")
@@ -215,12 +290,35 @@ class DockerRunner:
         # 标记容器是否真正启动过：启动前的失败可以安全换实例重试，启动后不能。
         container_started = False
         try:
+            # 专用节点的独占性必须在执行边界再校验一次：harness 不读 compose health，
+            # 只要 runner 可达就会派发请求，节点混部时不能把容器交到 rootful socket 上。
+            if isolation_mode(self.settings) == "dedicated":
+                try:
+                    foreign = self._foreign_containers(client)
+                except Exception as exc:
+                    return SandboxResult(
+                        "unavailable",
+                        stderr=f"专用节点独占检查失败: {type(exc).__name__}",
+                        backend="docker",
+                    )
+                if foreign:
+                    return SandboxResult(
+                        "unavailable",
+                        stderr=f"专用节点存在非沙箱容器: {','.join(foreign[:5])}",
+                        backend="docker",
+                    )
             # 安全基线：网络模式走配置（默认 none）、只读根文件系统、/tmp 限额可写、
             # 限制 CPU/内存/PID、禁止提权、以 65534 低权用户运行、python -I 隔离用户 site-packages。
             create_kwargs: dict[str, Any] = {
                 "command": ["python", "-I", "-c", code],
                 "network_mode": self.settings.sandbox_network,
+                # 标签用于专用节点独占判定（忽略执行中的容器），也为后续孤儿回收铺路。
+                "labels": {SANDBOX_CONTAINER_LABEL: "execution"},
                 "mem_limit": f"{self.settings.sandbox_memory_mb}m",
+                # 只设 mem_limit 时 Docker 默认允许同等大小的 swap，脚本可以绕过
+                # 内存上限继续占用宿主 swap（实测 256MB 限制下 400MB 写入成功）；
+                # 设为与 mem_limit 相同即禁用 swap，超限立即 OOM。
+                "memswap_limit": f"{self.settings.sandbox_memory_mb}m",
                 "nano_cpus": int(self.settings.sandbox_cpu * 1_000_000_000),
                 "pids_limit": 64,
                 # 显式丢弃全部 capability：即使存在提权漏洞也无法 mount/keyctl 等，
@@ -249,9 +347,13 @@ class DockerRunner:
             container_started = True
             try:
                 wait_result = container.wait(timeout=timeout)
-            except requests.exceptions.ReadTimeout:
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
                 # wait 超时是脚本超出时间预算，不是基础设施故障；
                 # 必须映射 timeout，否则会被当成脚本失败并固化进结果缓存。
+                # urllib3 2.x 可能把读超时包装成 ConnectionError，只有错误信息
+                # 明确是读超时才按超时处理；其余连接故障重新抛出，走基础设施错误。
+                if isinstance(exc, requests.exceptions.ConnectionError) and "read timed out" not in str(exc).lower():
+                    raise
                 return SandboxResult(
                     "timeout",
                     stderr=f"执行超过 {timeout}s 已终止",

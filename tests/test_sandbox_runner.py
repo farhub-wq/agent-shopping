@@ -681,16 +681,28 @@ class _FakeContainer:
         self.removed = True
 
 
+class _FakeContainerRef:
+    """专用节点独占检查用：只需要 name 与容器标签。"""
+
+    def __init__(self, name: str, labels: dict[str, str] | None) -> None:
+        self.name = name
+        self.attrs = {"Config": {"Labels": labels}}
+
+
 class _FakeContainers:
     def __init__(self, container_factory=_FakeContainer) -> None:
         self.create_kwargs: dict[str, object] = {}
         self.last_container = None
+        self.listed: list[_FakeContainerRef] = []
         self._container_factory = container_factory
 
     def create(self, image: str, **kwargs: object) -> _FakeContainer:
         self.create_kwargs = {"image": image, **kwargs}
         self.last_container = self._container_factory()
         return self.last_container
+
+    def list(self) -> list[_FakeContainerRef]:
+        return self.listed
 
 
 class _FakeDockerClient:
@@ -754,12 +766,25 @@ def test_run_applies_container_hardening(monkeypatch):
     assert kwargs["shm_size"] == 16 * 1024 * 1024
     ulimits = kwargs["ulimits"]
     assert [(u.name, u.soft, u.hard) for u in ulimits] == [("nofile", 1024, 1024)]
+    # 不限制 swap 时脚本可在 mem_limit 之外继续占用宿主内存，必须显式禁用
+    assert kwargs["memswap_limit"] == kwargs["mem_limit"]
 
 
 class _WaitTimeoutContainer(_FakeContainer):
     def wait(self, timeout: int | None = None) -> dict[str, int]:
         # docker-py 在 wait 超时抛 requests.ReadTimeout，而不是 docker 自己的异常类型
         raise requests.exceptions.ReadTimeout("read timed out")
+
+
+class _WaitWrappedTimeoutContainer(_FakeContainer):
+    def wait(self, timeout: int | None = None) -> dict[str, int]:
+        # urllib3 2.x 会把读超时包装成 ConnectionError，错误文本仍带 read timed out
+        raise requests.exceptions.ConnectionError("Read timed out.")
+
+
+class _WaitConnectionBrokenContainer(_FakeContainer):
+    def wait(self, timeout: int | None = None) -> dict[str, int]:
+        raise requests.exceptions.ConnectionError("Connection refused")
 
 
 class _StartBrokenContainer(_FakeContainer):
@@ -783,6 +808,27 @@ def test_wait_timeout_maps_to_timeout(monkeypatch):
     assert "5s" in result.stderr
     # 超时后仍然必须强制回收容器
     assert client.containers.last_container.removed is True
+
+
+def test_wait_wrapped_read_timeout_maps_to_timeout(monkeypatch):
+    client = _FakeDockerClient(_WaitWrappedTimeoutContainer)
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 部署机实测：urllib3 2.x 把读超时包成 ConnectionError，仍必须判成 timeout
+    assert result.status == "timeout"
+    assert client.containers.last_container.removed is True
+
+
+def test_wait_connection_error_maps_to_infra_error(monkeypatch):
+    client = _FakeDockerClient(_WaitConnectionBrokenContainer)
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 非读超时的连接故障是基础设施问题，不能被脚本结果缓存固化
+    assert result.status == "infra_error"
 
 
 def test_docker_failure_before_start_maps_to_unavailable(monkeypatch):
@@ -983,3 +1029,204 @@ def test_dev_runner_allows_shared_redis():
             sandbox_redis_url="",
         )
     )
+
+
+# ---- 专用沙箱节点档位（dedicated）----
+
+
+def _prod_dedicated(**overrides) -> ServiceSettings:
+    # dedicated 档位允许 rootful 默认 socket，但其它生产约束一条不放宽
+    values = {
+        "env": "prod",
+        "sandbox_isolation_mode": "dedicated",
+        "sandbox_docker_host": "unix:///var/run/docker.sock",
+        "sandbox_runtime": "runsc",
+        "sandbox_image": "sha256:" + "a" * 64,
+    }
+    values.update(overrides)
+    return ServiceSettings(_env_file=None, **values)
+
+
+def test_prod_dedicated_accepts_root_socket():
+    # 专用节点允许 rootful socket：安全性由节点独占 + gVisor + digest 镜像承担
+    validate_sandbox_isolation(_prod_dedicated())
+
+
+def test_prod_dedicated_requires_explicit_endpoint():
+    # 空端点会回落 SDK 默认，无法证明连的是哪台守护进程
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_dedicated(sandbox_docker_host=""))
+
+
+def test_prod_dedicated_rejects_tcp_endpoint():
+    # tcp 端点意味着远程 root 守护进程，专用节点只接受本地 unix socket
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(
+            _prod_dedicated(sandbox_docker_host="tcp://docker.example:2375")
+        )
+
+
+def test_prod_dedicated_still_requires_gvisor():
+    # dedicated 只放宽端点来源，不改动 runsc / digest / network / 资源上限
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_dedicated(sandbox_runtime="runc"))
+
+
+def test_prod_rejects_unknown_isolation_mode():
+    # 拼错档位不能静默落回 rootless，否则隔离预期与实际部署不一致
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_dedicated(sandbox_isolation_mode="dedicated-node"))
+
+
+@pytest.mark.asyncio
+async def test_healthz_exposes_dedicated_isolation(monkeypatch):
+    monkeypatch.setattr(
+        runner_app, "settings", _prod_runner(sandbox_isolation_mode="dedicated")
+    )
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///var/run/docker.sock",
+            "rootless": False,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "sha256:" + "a" * 64,
+            "image_pinned": True,
+            "insecure": False,
+            "insecure_image": False,
+            "isolation_mode": "dedicated",
+            "node_exclusive": True,
+            "foreign_containers": [],
+            "mode_mismatch": False,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    # 档位与独占检查结果必须透出，运维才能区分「隔离达标」与「配置漂移」
+    assert response.json()["isolation"]["mode"] == "dedicated"
+    assert response.json()["isolation"]["node_exclusive"] is True
+    assert response.json()["isolation"]["foreign_containers"] == []
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_node_not_exclusive(monkeypatch):
+    monkeypatch.setattr(
+        runner_app, "settings", _prod_runner(sandbox_isolation_mode="dedicated")
+    )
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "rootless": False,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "sha256:" + "a" * 64,
+            "image_pinned": True,
+            "insecure": False,
+            "insecure_image": False,
+            "isolation_mode": "dedicated",
+            "node_exclusive": False,
+            "foreign_containers": ["erp-agent"],
+            "mode_mismatch": False,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 节点混部时 rootful socket 的风险半径不可控，健康检查必须判死
+    assert response.status_code == 503
+    assert response.json()["isolation"]["foreign_containers"] == ["erp-agent"]
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_isolation_mode_mismatches(monkeypatch):
+    monkeypatch.setattr(
+        runner_app, "settings", _prod_runner(sandbox_isolation_mode="dedicated")
+    )
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "rootless": True,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "sha256:" + "a" * 64,
+            "image_pinned": True,
+            "insecure": False,
+            "insecure_image": False,
+            "isolation_mode": "dedicated",
+            "node_exclusive": True,
+            "foreign_containers": [],
+            "mode_mismatch": True,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 声明 dedicated 却连 rootless 守护进程：隔离强度低于声明，必须判死
+    assert response.status_code == 503
+    assert response.json()["isolation"]["mode_mismatch"] is True
+
+
+def test_dedicated_refuses_execution_on_contaminated_node(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [_FakeContainerRef("erp-agent", None)]
+    runner = _runner_with(_prod_dedicated(), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # harness 不读 compose health，执行边界必须自己拦：混部节点上不创建任何容器
+    assert result.status == "unavailable"
+    assert "erp-agent" in result.stderr
+    assert client.containers.create_kwargs == {}
+
+
+def test_dedicated_executes_when_node_is_exclusive(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [
+        _FakeContainerRef("sandbox-runner", {"shop.sandbox.role": "runner"}),
+        _FakeContainerRef("exec-1", {"shop.sandbox.role": "execution"}),
+    ]
+    runner = _runner_with(_prod_dedicated(), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 沙箱栈自身容器（runner / 执行中容器 / infra）不算混部
+    assert result.status == "ok"
+    assert client.containers.create_kwargs["labels"] == {"shop.sandbox.role": "execution"}
+
+
+def test_rootless_mode_skips_node_exclusivity_check(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [_FakeContainerRef("erp-agent", None)]
+    runner = _runner_with(
+        ServiceSettings(_env_file=None, env="dev", sandbox_isolation_mode="rootless"),
+        client,
+        monkeypatch,
+    )
+
+    # rootless 档位的隔离不依赖节点独占，不能因为它白跑失败拦下正常执行
+    assert runner._run_blocking("print(1)", 5).status == "ok"
+
+
+def test_run_labels_execution_container(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(ServiceSettings(_env_file=None, env="dev"), client, monkeypatch)
+
+    runner._run_blocking("print(1)", 5)
+
+    # 执行容器必须带角色标签，否则专用节点独占检查会把它当成业务容器
+    assert client.containers.create_kwargs["labels"] == {"shop.sandbox.role": "execution"}
