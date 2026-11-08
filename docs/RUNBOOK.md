@@ -220,6 +220,12 @@ gVisor 兼容性：Python 标准库与镜像内预装依赖需在部署机跑一
 
 `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` 后，runner 容器内的端点为 `unix:///run/rootless/docker.sock`，与宿主 socket 路径解耦。
 
+**生产密钥是启动硬前置**：`ENV=prod` 下，`JWT_SECRET`、`INTERNAL_SIGNING_SECRET` 必须 ≥32 字符且不得使用仓库里的开发默认值，否则所有服务在启动阶段直接抛错；identity 额外要求 `MFA_ENCRYPTION_KEY`，payment 额外要求 `PAYMENT_WEBHOOK_SECRET`。`TRUST_IDENTITY_HEADERS` 保持开启（gateway 签名转发身份头需要），但签名密钥不合格时信任头不再提供任何安全性。runner `/healthz` 中 `security.secrets_configured=false` 或 `security.issues` 非空，即表示密钥没有真正替换。
+
+**隔离参数生产锁死**：`SANDBOX_NETWORK` 只能为 `none`，`SANDBOX_CPU` ≤ 2.0，`SANDBOX_MEMORY_MB` ≤ 2048；超限 runner 拒绝启动。需要出网时新增 allowlist egress 代理，不要改 `SANDBOX_NETWORK`。
+
+**容器加固**：每次执行都显式 `cap_drop=ALL`、`no-new-privileges`、只读根 + `/tmp` 32MB、`shm_size=16MB`、`nofile=1024`、`pids_limit=64`、uid 65534；`/proc` 敏感路径由 Docker 默认 masked/readonly 列表覆盖，丢弃全部 capability 后无法 remount。
+
 可用性设计：
 
 - harness 的 `SANDBOX_RUNNER_URLS` 支持逗号分隔的多台 runner，按请求轮询；连接失败、429/502/503/504、或 runner 返回「繁忙」时自动换下一台，故障实例进入 30s 冷却。
@@ -284,6 +290,8 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 | 履约单不出现 | fulfillment 未消费 `order.paid` | 查消费者组 `shop:events:order` 与 `shop:dedupe:*` |
 | 售后审批 403 | 用了 customer 账号 | 改用 operator/admin 账号（bootstrap 引导或运营发放） |
 | Agent 对话无输出 | SSE 被代理缓冲 | 确认 nginx `proxy_buffering off`，网关是流式路径 |
+| 服务启动即退出并提示「生产环境安全配置不合格」 | `ENV=prod` 但密钥仍是开发默认值/长度不足 | 按 `.env.example` 注入随机密钥，identity/payment 还要各自专属密钥 |
+| sandbox-runner 启动报 `SANDBOX_NETWORK`/`SANDBOX_CPU`/`SANDBOX_MEMORY_MB` 不合格 | 生产隔离参数被改回 bridge/host 或资源上限过高 | 恢复 `none` 与 (0, 2.0] 核、(0, 2048] MB；扩容需改代码常量并扩容专用宿主机 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
 | 记忆检索结果差 | 未配真实嵌入，或端点故障回退哈希 | 配 `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` 启用真实向量；换模型/维度后旧向量被维度守卫跳过，需清理或重建 `memory_records` |
 
@@ -291,7 +299,7 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 
 已执行：
 
-- `pytest -q` → **68 passed**
+- `pytest -q` → **268 passed**
 - `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
 - `cd web && npm install && npm run build` → **构建成功**

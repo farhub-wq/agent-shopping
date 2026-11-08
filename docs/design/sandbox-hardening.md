@@ -17,7 +17,7 @@
 - 执行失败 fail-closed，不回退本地子进程；`SANDBOX_ENABLED=false` 仅限本地演示。
 - 已具备：`network=none`、只读根、`/tmp` 32MB tmpfs、CPU/内存/PID 限制、`no-new-privileges`、uid 65534、`python -I`、输出 8KB 截断、跨实例执行去重、all-staff 鉴权。
 
-**判断**：工程完成度较高，但隔离档位偏中，且存在若干可直接利用的资源耗尽面与供应链缺口。
+**判断**：阶段一的配置级洞口（SBX-01/02/03/05/06）已全部关闭；剩余集中在审计归属、提示注入、全局配额与 gVisor 部署验证。
 
 ---
 
@@ -27,10 +27,10 @@
 |---|---|---|---|---|
 | SBX-01 | P0 | 供应链 | 沙箱镜像未固定 digest，仅用 `:latest` tag | ☑ 2026-11-08 |
 | SBX-02 | P0 | 资源耗尽 | 容器日志无上限，恶意脚本可写爆宿主磁盘 | ☑ 2026-11-08 |
-| SBX-03 | P0 | 身份/密钥 | `INTERNAL_SIGNING_SECRET` 与 `TRUST_IDENTITY_HEADERS` 有 dev 默认值 | ☐ |
+| SBX-03 | P0 | 身份/密钥 | `INTERNAL_SIGNING_SECRET` 与 `TRUST_IDENTITY_HEADERS` 有 dev 默认值 | ☑ 2026-11-08 |
 | SBX-04 | P1 | 宿主逃逸 | runner 持有全权限 docker.sock，被攻破等价宿主 root | ☑ 2026-11-08 |
-| SBX-05 | P1 | 隔离可漂移 | `SANDBOX_NETWORK` 等隔离参数可被环境变量改成 `bridge`/`host` | ☐ |
-| SBX-06 | P1 | 容器加固 | 未显式 `cap_drop=ALL`；`/dev/shm`、nofile 未限；敏感路径未 mask | ☐ |
+| SBX-05 | P1 | 隔离可漂移 | `SANDBOX_NETWORK` 等隔离参数可被环境变量改成 `bridge`/`host` | ☑ 2026-11-08 |
+| SBX-06 | P1 | 容器加固 | 未显式 `cap_drop=ALL`；`/dev/shm`、nofile 未限；敏感路径未 mask | ☑ 2026-11-08 |
 | SBX-07 | P1 | 审计/串读 | 执行结果只在 Redis 存 5 分钟，缓存键无主体归属，无法取证 | ☐ |
 | SBX-08 | P1 | 提示注入 | stdout 作为低信任数据直接回灌模型，未做标记与隔离 | ☐ |
 | SBX-09 | P2 | 隔离升级 | 未启用 gVisor（`runsc`），共享内核 CVE 面未收敛 | ◐ 2026-11-08 |
@@ -65,7 +65,13 @@
 - **证据**：[docker-compose.yml](file:///c:/Users/far/Desktop/git/shop-agent/docker-compose.yml#L145-L146) `INTERNAL_SIGNING_SECRET: ${INTERNAL_SIGNING_SECRET:-dev-internal-signing-secret}`、`TRUST_IDENTITY_HEADERS: ${TRUST_IDENTITY_HEADERS:-true}`。
 - **风险**：生产沿用默认密钥即可伪造任意 staff 身份头直连 runner；信任头若被反向代理透传，外部可伪造身份。
 - **方案**：启动期校验——`ENV != dev` 且密钥命中默认值/长度不足 → 拒绝启动（fail-fast）；`TRUST_IDENTITY_HEADERS` 在生产强制 `false` 并只接受网关签名头；`/healthz` 暴露校验结果。
-- **验证**：新增单测覆盖「prod + 默认密钥 → 启动失败」，并在 RUNBOOK 增补密钥轮换说明。
+- **已实施（2026-11-08）**：
+  - 新增共享守卫 [config.py](file:///c:/Users/far/Desktop/git/shop-agent/packages/shop_common/config.py#L127-L179) 的 `production_security_issues` / `validate_production_settings`：非 dev 下 `JWT_SECRET`、`INTERNAL_SIGNING_SECRET` 不得为空、不得是仓库公开默认值、长度不低于 32；identity 额外校验 `MFA_ENCRYPTION_KEY`，payment 额外校验 `PAYMENT_WEBHOOK_SECRET`；`AUTH_DEV_MODE`、`PAYMENT_MOCK_MODE` 在生产必须关闭。
+  - 11 个服务的 lifespan 首行调用守卫，不满足即拒绝启动；runner 的 `/healthz` 新增 `security.secrets_configured` 与问题清单，并在异常时返回 503。
+  - **与原方案的偏差**：没有全局强制 `TRUST_IDENTITY_HEADERS=false`。现有架构是 gateway 校验客户端身份后签名并转发 `X-User-*`，下游必须信任签名头才能拿到 staff 身份；全局关闭会让所有后台操作退化为访客。实际做法是保留信任头，但把签名密钥强度作为启动硬前置；无签名、超时间窗、摘要不匹配仍一律拒绝（[auth.py](file:///c:/Users/far/Desktop/git/shop-agent/packages/shop_common/auth.py#L122-L154)）。
+  - `docker-compose.prod.yml` 把 `ENV=prod` 写进每个服务的 overlay，避免部署机漏设 `ENV` 时 dev 默认值静默生效；compose 仍保留 dev 默认密钥，仅用于本地启动。
+  - runner 的 compose 环境补上 `JWT_SECRET`：runner 同样接受 Bearer JWT，缺密钥时默认值会让人伪造 staff 身份执行代码。
+- **验证**：`tests/test_production_config.py` 覆盖「prod 默认密钥 / 短密钥 / 开发开关 → 启动失败」「身份头与强密钥共存 → 通过」「MFA 与支付回调密钥只由对应服务校验」；`test_healthz_returns_503_when_secrets_are_dev_defaults` 断言健康检查判死。
 
 ### SBX-04 docker.sock 全权限（P1）
 
@@ -85,18 +91,26 @@
 - **证据**：[config.py](file:///c:/Users/far/Desktop/git/shop-agent/packages/shop_common/config.py#L98-L111) 的 `sandbox_network`、`sandbox_cpu`、`sandbox_memory_mb` 均可配置。
 - **风险**：为装依赖临时改 `bridge`，或为跑大脚本抬高内存，隔离退化后无人感知；配置即安全边界，当前没有守卫。
 - **方案**：`network` 生产固定 `none`，仅 `ENV=dev` 可覆盖并在健康检查中标红；内存/CPU 设硬上限（配置超过阈值直接拒绝启动）；出网需求走 allowlist egress 代理，不开原生网络。
-- **验证**：配置校验单测（prod + `bridge` → 启动失败）。
+- **已实施（2026-11-08）**：`validate_sandbox_isolation` 在非 dev 下追加三条硬校验——`SANDBOX_NETWORK` 必须为 `none`；`SANDBOX_CPU` 必须在 `(0, 2.0]`；`SANDBOX_MEMORY_MB` 必须在 `(0, 2048]`。阈值以常量写在 [runner.py](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/runner.py#L35-L40)，扩容沙箱主机时才允许改代码，不接受环境变量悄悄抬高。
+- **验证**：`test_prod_rejects_network_bridge`、`test_prod_rejects_excessive_cpu`、`test_prod_rejects_excessive_memory`、`test_dev_allows_relaxed_sandbox_params`。
 
 ### SBX-06 容器加固缺口（P1）
 
-- **现状**：[runner.py](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/runner.py#L85-L97) 已有 `read_only`、`no-new-privileges`、uid 65534、`pids_limit=64`，但缺：
+- **原现状**：[runner.py](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/runner.py#L85-L97) 已有 `read_only`、`no-new-privileges`、uid 65534、`pids_limit=64`，但缺：
   - 未显式 `cap_drop=["ALL"]`（依赖镜像默认能力集）；
   - 未限制 `ulimit nofile`（可耗尽宿主文件句柄）；
   - 未限制 `/dev/shm`（默认 64MB 可写）；
   - 未配置 `masked_paths` / `readonly_paths` 加固 `/proc` 敏感入口；
   - 未启用 userns-remap / user namespace 隔离。
 - **方案**：按上述逐项补齐；seccomp 保留默认 profile，另加自定义 deny 列表（`keyctl`、`unshare`、`mount` 等）。
-- **验证**：单测断言 create 参数；容器内探测用例（`cat /proc/1/...`、`ulimit -n`）在 CI 可选执行。
+- **已实施（2026-11-08）**：
+  - `cap_drop=["ALL"]`：不依赖镜像默认能力集，镜像换代不会让能力悄悄漂移；`mount`/`keyctl` 等需要 capability 的 syscall 直接失效。
+  - `shm_size=16MB`：把默认 64MB 的 `/dev/shm` 压到 16MB，防止用它放大内存占用。
+  - `ulimits nofile=1024`：限制单容器文件句柄数，避免耗尽宿主 nofile 配额。
+  - `no-new-privileges`、只读根、`/tmp` 32MB tmpfs、`pids_limit=64`、uid 65534 保持不变。
+  - **未显式注入 masked/readonly paths**：docker-py 7.2 的 `HostConfig` 不支持这两个字段；Docker 默认已 mask `/proc/kcore`、`/proc/keys`、`/sys/firmware` 等敏感入口，且 `cap_drop=ALL` 后无法 remount `/proc`。userns 隔离由 rootless dockerd 提供（SBX-04），不再单列。
+  - **seccomp**：保留 Docker 默认 profile；`keyctl`/`mount`/`unshare` 的阻断由默认 profile + 丢弃 capability 共同覆盖，自定义 deny 列表留待后续按实际逃逸面评估。
+- **验证**：`test_run_applies_container_hardening` 断言 create 参数含 `cap_drop=ALL`、`shm_size`、`nofile`；容器内探测（`ulimit -n`、`/dev/shm` 容量）可部署后在部署机复跑。
 
 ### SBX-07 结果无归属、无持久审计（P1）
 
@@ -145,11 +159,11 @@
 | 威胁面 | 具体泄露点 | 现状 | 目标 | 对应条目 |
 |---|---|---|---|---|
 | 宿主逃逸 | 共享内核 CVE、runc/Docker 漏洞、docker.sock 等价 root、privileged、host path 挂载、cgroup v1 逃逸 | 已切 rootless dockerd + 生产强制 runsc，启动守卫与 healthz 双重校验（待宿主兼容性回归） | rootless + gVisor 已完成代码侧收敛 | SBX-04、SBX-09 |
-| 网络外泄 | 内网服务探测、云元数据 `169.254.169.254`、DNS 外带、SSRF、DDoS 跳板 | `network=none` 默认生效 | 硬锁 none + allowlist egress 代理 | SBX-05 |
+| 网络外泄 | 内网服务探测、云元数据 `169.254.169.254`、DNS 外带、SSRF、DDoS 跳板 | 生产硬锁 `none`，非 dev 改成 `bridge`/`host` 直接拒绝启动 | 硬锁 none + allowlist egress 代理 | SBX-05 |
 | 供应链 | `pip install` 恶意包、基础镜像被替换/tag 漂移 | 生产已强制 digest pinning；无镜像白名单；运行期安装被 `network=none` + 只读根文件系统阻断 | 补镜像白名单 | SBX-01、D2 |
-| 资源 DoS | 日志刷爆磁盘、`/dev/shm` 滥用、句柄耗尽、内存/CPU 抢占、并发容器压垮守护进程 | CPU/内存/PID 已限；日志已封顶 1MB/容器；shm 与 nofile 未限 | shm tmpfs + nofile + 全局配额 | SBX-02、SBX-06、SBX-11 |
+| 资源 DoS | 日志刷爆磁盘、`/dev/shm` 滥用、句柄耗尽、内存/CPU 抢占、并发容器压垮守护进程 | CPU/内存/PID 已限；日志已封顶 1MB/容器；shm 16MB + nofile 1024 已限；生产 CPU/内存有硬上限 | 全局配额 | SBX-02、SBX-06、SBX-11 |
 | 多租户串扰 | 结果缓存/日志/临时卷跨主体可读，exec_id 可复用他人结果 | 键无主体前缀、无归属校验 | 键绑定主体 + 归属比对 | SBX-07 |
-| 身份伪造 | 默认签名密钥、信任头被上游透传、内网位置即信任 | staff 二次校验已做，密钥有 dev 默认值 | fail-fast 校验 + 生产禁信任头 | SBX-03 |
+| 身份伪造 | 默认签名密钥、信任头被上游透传、内网位置即信任 | 非 dev 启动守卫强制强密钥（≥32 且非默认值）；信任头保留但必须带有效签名，无签名/超窗一律拒绝 | 密钥轮换 + 上游不透传 X-User-* | SBX-03 |
 | 提示注入 | stdout 作为可信内容回灌模型，诱导链式调用高危工具 | 结果原样返回 | 标记不可信 + policy 阻断 | SBX-08 |
 | 审计缺失 | 无持久执行记录，事后无法取证 | 5 分钟 Redis 缓存 | 落库对接审计流 | SBX-07、D8 |
 
@@ -172,12 +186,13 @@
 
 ## 6. 变更后风险与注意事项
 
-本轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd + gVisor + digest 镜像 + 日志/健康检查硬约束」。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
+前一轮已关闭 SBX-01/02/04、把 SBX-09 推进到代码就绪，隔离档位从「容器级 + 全权限 socket」变为「rootless dockerd + gVisor + digest 镜像 + 日志/健康检查硬约束」；本轮再关闭 SBX-03/05/06，阶段一配置级洞口全部清零。这些改动同时引入了新的部署前置条件和失败模式，后续运维与开发必须知道。
 
 ### 6.1 新增的生产硬前置（不满足就起不来）
 
 | 前置 | 配置 | 缺失后果 |
 |---|---|---|
+| 生产密钥 | `.env` 注入随机 `JWT_SECRET`、`INTERNAL_SIGNING_SECRET`（均 ≥32 字符）；identity 另需 `MFA_ENCRYPTION_KEY`，payment 另需 `PAYMENT_WEBHOOK_SECRET` | 对应服务启动抛错，容器反复重启 |
 | rootless dockerd | `SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock` | runner 启动抛错，容器反复重启 |
 | gVisor 运行时 | `SANDBOX_RUNTIME=runsc`，且宿主已注册 `runsc` | 启动抛错；注册缺失时 healthz 503 |
 | 镜像 digest | `SANDBOX_IMAGE=repo@sha256:...` 或 `sha256:...` | 启动抛错 |
@@ -218,8 +233,9 @@
 
 ### 6.7 仍需记住的未解决项
 
-- 本轮未覆盖：SBX-03 密钥默认值、SBX-05 网络参数漂移、SBX-06 `cap_drop`/shm/nofile、SBX-07 审计归属、SBX-08 提示注入、SBX-11 全局配额、SBX-12 冷启动。
-- SBX-05 最容易被忽略：`SANDBOX_NETWORK` 仍能被环境变量改成 `bridge`/`host`，部署层必须在 `.env` 锁死并在评审中检查。
+- 本轮未覆盖：SBX-07 审计归属、SBX-08 提示注入、SBX-09 部署机兼容性回归、SBX-10 孤儿容器回收、SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动、SBX-14 输入边界。
+- 生产 overlay 已把 `ENV=prod` 写进每个服务；不要依赖部署机 `.env` 是否记得设置，那是上一轮最容易漏的地方。
+- 密钥轮换后必须整栈重启：JWT 与内网签名密钥不热更新，旧进程会继续用旧密钥验签。
 - 沙箱调用方仍是 staff，不是面向外部租户的多租户隔离；若未来开放给商家/租户，需要重新评估隔离档位与配额模型。
 
 ### 6.8 回滚
@@ -256,3 +272,6 @@ docker compose config -q
 | 2026-11-08 | SBX-02 关闭：沙箱容器固定 json-file 日志上限 1MB，刷屏脚本无法写爆宿主磁盘 |
 | 2026-11-08 | SBX-01 关闭：生产强制 digest 固定镜像，tag 拒绝启动；新增 build-sandbox-image 输出镜像 ID |
 | 2026-11-08 | 新增「变更后风险与注意事项」：生产硬前置、rootless/gVisor 边界、digest 运维、日志与 503 语义、未解决项、回滚口径 |
+| 2026-11-08 | SBX-03 关闭：非 dev 启动守卫强制强密钥（≥32 且非默认值），identity/payment 分别校验 MFA 与回调密钥；信任头保留但依赖强签名密钥；prod overlay 逐服务写死 ENV=prod |
+| 2026-11-08 | SBX-05 关闭：生产硬锁 `SANDBOX_NETWORK=none`，CPU/内存设硬上限（2 核 / 2048MB），超限拒绝启动 |
+| 2026-11-08 | SBX-06 关闭：容器显式 `cap_drop=ALL`、`shm_size=16MB`、`nofile=1024`；masked/readonly paths 依赖 Docker 默认值并在文档记录取舍 |
