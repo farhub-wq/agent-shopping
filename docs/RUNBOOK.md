@@ -57,7 +57,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 ```
 
-当前结果：`68 passed`。
+当前结果：`270 passed`。
 
 只启动不依赖 Redis 的服务做冒烟：
 
@@ -235,19 +235,26 @@ gVisor 兼容性：Python 标准库与镜像内预装依赖需在部署机跑一
 - **真正抗主机故障要求每台沙箱主机各部署一个 runner**；`docker compose --scale sandbox-runner=2` 只能抗进程崩溃，同宿主副本仍共享同一个 Docker 守护进程，后者仍是单点。
 
 本地演示/测试（`SANDBOX_ENABLED=false`）走本地子进程，不是安全边界，不能用于生产。
+`docker-compose.prod.yml` 已强制 `SANDBOX_ENABLED=true`；harness 启动守卫在非 dev 下缺该开关会直接拒绝启动，避免请求落回与 harness 同权限的本地子进程。
 
 启用 Docker 沙箱：
 
 ```bash
-# 构建并输出内容寻址的 SANDBOX_IMAGE（形如 sha256:...），写入部署机 .env
-make build-sandbox-image
-# .env 设置 SANDBOX_ENABLED=true 与上一步输出的 SANDBOX_IMAGE；
-# compose 已给 harness 注入 SANDBOX_RUNNER_URLS=http://sandbox-runner:8000
-docker compose up -d --build sandbox-runner harness
+# 1) 构建并输出内容寻址的 SANDBOX_IMAGE（形如 sha256:...）。
+#    生产必须构建进 runner 实际连接的 rootless dockerd，否则 runner 会一直 ImageNotFound：
+#    SANDBOX_DOCKER_HOST 填 setup.sh 打印的宿主 socket（SANDBOX_ROOTLESS_SOCKET）
+SANDBOX_DOCKER_HOST=unix:///run/user/<uid>/docker.sock make build-sandbox-image
+#    本地开发直接 make build-sandbox-image 即可（走 Docker Desktop 默认端点）
+# 2) 把上一步输出的 SANDBOX_IMAGE 写入部署机 .env（禁止保留 :latest）
+# 3) 确认镜像在 runner 端点可见后再重启
+docker -H unix:///run/user/<uid>/docker.sock image inspect <输出的 sha256:...> >/dev/null \
+  && echo "镜像已就绪"
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build sandbox-runner harness
+# 4) 端到端验证：/sandbox/health 的 runners 全 ok，且 POST /sandbox/run 返回 status=ok
 # 多主机：SANDBOX_RUNNER_URLS=http://runner-a:8000,http://runner-b:8000
 ```
 
-**生产镜像必须 digest 固定**：`SANDBOX_IMAGE` 只接受 `repo@sha256:...`（registry 推送后获取）或 `sha256:...`（本地构建的镜像 ID）。`:latest` 等 tag 会在 runner 启动守卫处直接拒绝，避免执行环境被静默替换。换镜像时重新构建并更新 `.env` 后重启 runner。
+**生产镜像必须 digest 固定**：`SANDBOX_IMAGE` 只接受 `repo@sha256:...`（registry 推送后获取）或 `sha256:...`（本地构建的镜像 ID）。`:latest` 等 tag 会在 runner 启动守卫处直接拒绝，避免执行环境被静默替换。换镜像时重新构建、更新 `.env`、确认 runner 端点已有该 digest 后重启 runner，三步缺一不可。
 
 本地裸进程调试可分别启动：
 
@@ -265,6 +272,90 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 3. 确认 runner 容器内可访问 Docker 端点并确认是 rootless：`docker compose exec sandbox-runner python -c "import docker;print(docker.DockerClient(base_url='unix:///run/rootless/docker.sock').info()['SecurityOptions'])"`（本地开发用默认 socket 时可省略 `base_url`）。
 
 `POST /api/agents/sandbox/run` 仅供 staff，runner 侧会再校验一次（非 staff 返回 403）；执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
+
+### 5.1 部署机待办与验证清单（待执行）
+
+> 本地代码侧通过不等于部署机可用。以下每一项都必须在部署机执行并回填结果；全部完成前，沙箱不得标记为可上线。
+> 约定：`$ROOTLESS` 为 `setup.sh` 打印的宿主 socket（如 `/run/user/1000/docker.sock`），`$TOKEN` 为 §4.1 登录得到的 staff access token。
+
+**环境前提（不满足则停止）**
+
+- [ ] 内核为 cgroup v2：`stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`。
+- [ ] 支持非特权 user namespace（rootless Docker 硬前提）。
+- [ ] 仅 Debian/Ubuntu，具备 root/sudo。
+
+**A. 宿主初始化与 `.env`**
+
+- [ ] `sudo make setup-sandbox-host`（等价 `sudo bash infra/rootless-docker/setup.sh`），记录输出的 `SANDBOX_ROOTLESS_SOCKET` 与 `SANDBOX_RUNTIME`。
+- [ ] `.env` 写入 `SANDBOX_ROOTLESS_SOCKET=$ROOTLESS`、`SANDBOX_RUNTIME=runsc`、`ENV=prod`。
+- [ ] 生产密钥：`JWT_SECRET`、`INTERNAL_SIGNING_SECRET` 均为 ≥32 字符随机值；identity 另配 `MFA_ENCRYPTION_KEY`，payment 另配 `PAYMENT_WEBHOOK_SECRET`。
+- [ ] 确认 harness 侧沙箱开关：`docker compose -f docker-compose.yml -f docker-compose.prod.yml config --format json` 中 `services.harness.environment.SANDBOX_ENABLED` 为 `"true"`。
+
+**B. 镜像（必须与 runner 端点一致）**
+
+- [ ] 在 rootless 端点构建：`SANDBOX_DOCKER_HOST=unix://$ROOTLESS make build-sandbox-image`，记录输出的 `SANDBOX_IMAGE=sha256:...`。
+- [ ] 写入 `.env` 的 `SANDBOX_IMAGE`，并确认镜像在 runner 端点可见：
+  `docker -H unix://$ROOTLESS image inspect <digest>` 成功返回。
+- [ ] 启动生产 overlay：`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build sandbox-runner harness`。
+- [ ] `docker compose ps sandbox-runner` 持续 `healthy`，无反复重启（重启通常表示镜像未固定或 runsc 未注册）。
+
+**C. 健康与隔离档位**
+
+- [ ] runner 健康检查：`docker compose exec sandbox-runner curl -fsS http://localhost:8000/healthz`，期望 `status=ok`、`docker.rootless=true`、`docker.runtime_ok=true`、`image_pinned=true`、`security.secrets_configured=true`。
+- [ ] harness：`docker compose exec harness curl -fsS http://localhost:8000/sandbox/health`，期望 `enabled=true`、`backend=remote`、`runners.status=ok`。
+- [ ] 实际运行时为 runsc：先提交一段 `import time; time.sleep(5)`，在另一终端执行
+  `docker -H unix://$ROOTLESS ps -q | xargs -r docker -H unix://$ROOTLESS inspect --format '{{.HostConfig.Runtime}} {{.Config.Image}}'`
+  期望输出 `runsc sha256:...`。
+
+**D. 端到端功能与隔离探针**
+
+- [ ] 基本执行：`POST localhost:8080/api/agents/sandbox/run`，body `{"code":"print(6*7)"}`，期望 `status=ok`、`stdout=42`、`backend=docker`。
+- [ ] 隔离探针（同一次调用执行以下代码），期望 `UID=65534`、`NETWORK_BLOCKED`、`READONLY_OK`：
+
+```python
+import os, socket
+print("UID", os.getuid())
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=2)
+    print("NETWORK_OPEN")
+except Exception as exc:
+    print("NETWORK_BLOCKED", type(exc).__name__)
+try:
+    open("/etc/hostname", "a").write("x")
+    print("READONLY_BROKEN")
+except Exception as exc:
+    print("READONLY_OK", type(exc).__name__)
+```
+
+- [ ] 超时：`{"code":"import time; time.sleep(30)","timeout":3}`，记录实际 `status`。
+  **已知差异**：当前超时会被归到 `status=error`（P1 待修），此项先记录实际值，不算功能失败。
+- [ ] 内存炸弹：`{"code":"b = bytearray(1024 * 1024 * 1024)"}`，期望容器被内存限制终止（exit 137 或 unavailable），宿主保持稳定。
+- [ ] 输出刷屏：`{"code":"while True: print('x' * 1024)"}`，期望超时结束；检查单容器 json-file ≤1MB，`docker -H unix://$ROOTLESS ps -a` 无残留容器，宿主磁盘无明显增长。
+- [ ] fail-closed：`docker compose stop sandbox-runner` 后再执行沙箱，期望 `status=unavailable`；`docker compose logs harness` 中不得出现「本地子进程执行」。
+- [ ] （多 runner 时）停掉一台，请求仍成功，且同一 `X-Execution-Id` 只真正执行一次。
+
+**E. gVisor 兼容性回归（SBX-09）**
+
+- [ ] 标准库回归：`import json, re, hashlib, datetime, collections, ipaddress, uuid, math, statistics` 全部可用。
+- [ ] 业务计划预装依赖（如 numpy/pandas）逐个执行；失败先判断是「镜像没装依赖」还是「runsc syscall 不兼容」，前者需增肥镜像，后者记录 syscall 报错。
+- [ ] 全部通过后，把 [sandbox-hardening.md](file:///c:/Users/far/Desktop/git/shop-agent/docs/design/sandbox-hardening.md) 的 SBX-09 勾选为 ☑ 并写明日期与镜像 digest。
+
+**F. 观测与运维**
+
+- [ ] runner `/healthz` 返回 503 时（可临时停 rootless dockerd 模拟），确认 Prometheus/告警能发现，且 harness 沙箱调用 fail-closed。
+- [ ] 确认镜像清理任务排除当前 `SANDBOX_IMAGE` digest（`docker image prune` 不应删除该镜像）。
+- [ ] `docker compose logs sandbox-runner` 无刷屏；宿主磁盘与内存无异常增长。
+
+**结果记录**
+
+| 日期 | 分组 | 命令/用例 | 实际结果 | 结论 |
+|---|---|---|---|---|
+|  | A | setup.sh + `.env` |  |  |
+|  | B | 构建/镜像可见/healthy |  |  |
+|  | C | healthz + runsc 探测 |  |  |
+|  | D | 端到端 + 隔离探针 + fail-closed |  |  |
+|  | E | gVisor 兼容性 |  |  |
+|  | F | 告警与运维 |  |  |
 
 ## 6. 故障排查
 
@@ -299,12 +390,14 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 
 已执行：
 
-- `pytest -q` → **268 passed**
+- `pytest -q` → **270 passed**
 - `ruff check packages services tests` → **All checks passed**
 - `python -m compileall` → **通过**
 - `cd web && npm install && npm run build` → **构建成功**
 - `docker compose -f docker-compose.yml -f docker-compose.prod.yml config` → **通过**（生产配置仅 gateway:8080 / web:5173 对外）
+- prod overlay 实际生效值 → `harness.SANDBOX_ENABLED=true`、`sandbox-runner.SANDBOX_RUNTIME=runsc`、`sandbox-runner.SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock`
 
 未执行：
 
 - `docker compose up` 端到端（当前环境 Docker daemon 未运行，且启动守护进程属于需用户确认的系统操作）
+- 部署机沙箱上线验证：按 §5.1 清单逐项执行（rootless 构建端点、镜像可见性、runsc 实际生效、隔离探针、gVisor 兼容性、fail-closed、告警）

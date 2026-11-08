@@ -196,6 +196,7 @@
 | rootless dockerd | `SANDBOX_DOCKER_HOST=unix:///run/rootless/docker.sock` | runner 启动抛错，容器反复重启 |
 | gVisor 运行时 | `SANDBOX_RUNTIME=runsc`，且宿主已注册 `runsc` | 启动抛错；注册缺失时 healthz 503 |
 | 镜像 digest | `SANDBOX_IMAGE=repo@sha256:...` 或 `sha256:...` | 启动抛错 |
+| 沙箱启用 | `SANDBOX_ENABLED=true`（prod overlay 已写死） | harness 启动抛错，禁止回退本地子进程 |
 | 宿主初始化 | `sudo make setup-sandbox-host` | 以上三项无法成立 |
 
 这是有意的 breaking change：宁可 runner 起不来，也不让隔离静默退回共享内核或 root socket。沙箱不可用期间 `sandbox_run` 返回 `unavailable`（fail-closed）；订单、支付等主链路不经过沙箱，不受影响。
@@ -209,13 +210,16 @@
 
 ### 6.3 gVisor 兼容性
 
-- 在部署机完成回归前，不能认为 SBX-09 已完成；当前状态是「代码 + 部署就绪，待兼容性验证」。
+- 在部署机完成回归前，不能认为 SBX-09 已完成；当前状态是「代码 + 部署就绪，待兼容性验证」。部署机验收步骤见 [RUNBOOK §5.1](file:///c:/Users/far/Desktop/git/shop-agent/docs/RUNBOOK.md#L276)。
 - runsc 不支持个别 syscall（部分 io_uring/perf/`/proc` 特性），表现是脚本执行失败，不会静默回落 runc。
 - 若为兼容性放宽运行时，必须显式修改 `ISOLATED_RUNTIMES` 并留变更记录，不要靠环境变量绕过守卫。
 
 ### 6.4 digest 与镜像运维
 
-- 换镜像流程固定为：`make build-sandbox-image` → 更新 `.env` 的 `SANDBOX_IMAGE` → 重启 runner，三步缺一不可。
+- 构建端点必须与 runner 连接的守护进程一致：生产 runner 走 rootless dockerd（独立镜像存储），用默认 root 守护进程构建会得到「runner 侧镜像不存在 → 永久 unavailable」。构建时显式指定宿主 socket：
+  `SANDBOX_DOCKER_HOST=unix:///run/user/<uid>/docker.sock make build-sandbox-image`（值即 setup.sh 打印的 `SANDBOX_ROOTLESS_SOCKET`）。
+- 换镜像流程固定为：在 runner 端点构建 → 更新 `.env` 的 `SANDBOX_IMAGE` → `docker -H <rootless socket> image inspect <digest>` 确认可见 → 重启 runner，四步缺一不可。
+- 上线前必须做一次端到端验证：`/sandbox/health` 的 runners 全 `ok`，且 `POST /sandbox/run` 返回 `status=ok`；只看到容器 healthy 不代表镜像真的可用。
 - 本地镜像 ID 是内容寻址，重新构建会得到新 ID；旧 ID 被 `docker image prune` 清掉后 runner 会报镜像不存在（`unavailable`）。
 - 镜像清理任务必须排除当前 `SANDBOX_IMAGE`；不要把 `:latest` 写进部署配置。
 
@@ -275,3 +279,4 @@ docker compose config -q
 | 2026-11-08 | SBX-03 关闭：非 dev 启动守卫强制强密钥（≥32 且非默认值），identity/payment 分别校验 MFA 与回调密钥；信任头保留但依赖强签名密钥；prod overlay 逐服务写死 ENV=prod |
 | 2026-11-08 | SBX-05 关闭：生产硬锁 `SANDBOX_NETWORK=none`，CPU/内存设硬上限（2 核 / 2048MB），超限拒绝启动 |
 | 2026-11-08 | SBX-06 关闭：容器显式 `cap_drop=ALL`、`shm_size=16MB`、`nofile=1024`；masked/readonly paths 依赖 Docker 默认值并在文档记录取舍 |
+| 2026-11-08 | P0 阻塞项补齐：非 dev 强制 `SANDBOX_ENABLED`（harness 启动守卫 + 运行时 fail-closed + prod overlay 写死）；镜像构建支持 `SANDBOX_DOCKER_HOST` 指向 rootless 端点，并在 RUNBOOK 增加端点校验与端到端验收 |
