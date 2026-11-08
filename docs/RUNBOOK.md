@@ -192,7 +192,33 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 
 ## 5. 沙箱
 
-沙箱执行由独立 `sandbox-runner` 承载：只有它挂载 `/var/run/docker.sock` 并创建一次性容器，harness 只经内网 HTTP（携带签名身份头）调用。runner 不映射宿主端口、不经 gateway 暴露，任何把它暴露到公网的改动都视为配置事故。
+沙箱执行由独立 `sandbox-runner` 承载：只有它挂载 Docker socket 并创建一次性容器，harness 只经内网 HTTP（携带签名身份头）调用。runner 不映射宿主端口、不经 gateway 暴露，任何把它暴露到公网的改动都视为配置事故。
+
+**生产必须是 rootless dockerd**：runner 被攻破时若连的是默认 `/var/run/docker.sock`（root 守护进程），攻击者等于拿到宿主 root，容器加固全部失效。因此生产 overlay 把 rootless socket 挂到容器内独立路径，并由 runner 启动守卫强制校验：
+
+- `SANDBOX_DOCKER_HOST` 生产必填，且不允许是默认 root socket，否则 runner 拒绝启动；
+- `SANDBOX_RUNTIME` 生产强制 `runsc`（gVisor），共享宿主内核的 runc 被启动守卫拒绝；
+- `/healthz` 在不可达、隔离退化或 runsc 未注册时返回 **HTTP 503**，并暴露 `docker.rootless` / `docker.insecure` / `docker.runtime_ok` 供定位。
+
+宿主侧初始化已脚本化（Debian/Ubuntu，root 执行，幂等）：
+
+```bash
+sudo make setup-sandbox-host
+# 等价于：sudo bash infra/rootless-docker/setup.sh
+```
+
+脚本会创建专用用户、开启 linger、安装 rootless dockerd 与 gVisor（runsc）、把 runsc 写入该用户的 `daemon.json`，最后打印：
+
+```
+SANDBOX_ROOTLESS_SOCKET=/run/user/<uid>/docker.sock
+SANDBOX_RUNTIME=runsc
+```
+
+把这两行写入部署机 `.env`。之后 runner 只接受 rootless dockerd + runsc 的组合。
+
+gVisor 兼容性：Python 标准库与镜像内预装依赖需在部署机跑一遍真实脚本回归。runsc 不支持个别 syscall，表现为沙箱执行失败（fail-closed，不会静默回落 runc）；这也是生产强制它的代价。
+
+`docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` 后，runner 容器内的端点为 `unix:///run/rootless/docker.sock`，与宿主 socket 路径解耦。
 
 可用性设计：
 
@@ -207,11 +233,15 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 启用 Docker 沙箱：
 
 ```bash
-docker build -t shop-agent-sandbox:latest infra/sandbox
-# .env 设置 SANDBOX_ENABLED=true；compose 已给 harness 注入 SANDBOX_RUNNER_URLS=http://sandbox-runner:8000
+# 构建并输出内容寻址的 SANDBOX_IMAGE（形如 sha256:...），写入部署机 .env
+make build-sandbox-image
+# .env 设置 SANDBOX_ENABLED=true 与上一步输出的 SANDBOX_IMAGE；
+# compose 已给 harness 注入 SANDBOX_RUNNER_URLS=http://sandbox-runner:8000
 docker compose up -d --build sandbox-runner harness
 # 多主机：SANDBOX_RUNNER_URLS=http://runner-a:8000,http://runner-b:8000
 ```
+
+**生产镜像必须 digest 固定**：`SANDBOX_IMAGE` 只接受 `repo@sha256:...`（registry 推送后获取）或 `sha256:...`（本地构建的镜像 ID）。`:latest` 等 tag 会在 runner 启动守卫处直接拒绝，避免执行环境被静默替换。换镜像时重新构建并更新 `.env` 后重启 runner。
 
 本地裸进程调试可分别启动：
 
@@ -226,7 +256,7 @@ SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
 
 1. `curl localhost:8006/sandbox/health` 看 `backend`、`runner_urls` 与 `runners.endpoints` 每台状态；
 2. `docker compose logs sandbox-runner`，并确认 runner 的 `REDIS_URL` 可连通；
-3. 确认 runner 容器内可访问 socket：`docker compose exec sandbox-runner ls -l /var/run/docker.sock`。
+3. 确认 runner 容器内可访问 Docker 端点并确认是 rootless：`docker compose exec sandbox-runner python -c "import docker;print(docker.DockerClient(base_url='unix:///run/rootless/docker.sock').info()['SecurityOptions'])"`（本地开发用默认 socket 时可省略 `base_url`）。
 
 `POST /api/agents/sandbox/run` 仅供 staff，runner 侧会再校验一次（非 staff 返回 403）；执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
 
