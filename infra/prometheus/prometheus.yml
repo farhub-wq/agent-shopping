@@ -23,6 +23,7 @@ scrape_configs:
           - fulfillment:8000
           - aftersales:8000
           - harness:8000
+          - sandbox-runner:8000
           - identity:8000
           - payment:8000
           - audit:8000
