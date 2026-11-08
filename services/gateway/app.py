@@ -100,7 +100,7 @@ async def lifespan(_: FastAPI):
     configure_logging("gateway")
     # 网关签发内网身份头：签名密钥为默认值时，下游所有 staff 鉴权都形同虚设。
     validate_production_settings(settings)
-    redis = create_redis(settings.redis_url)
+    redis = create_redis(settings.resolved_redis_url)
     yield
     await redis.close()
 

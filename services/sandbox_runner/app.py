@@ -7,17 +7,17 @@
 import hashlib
 import re
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, Response
+from fastapi import Depends, FastAPI, Header, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import publish_audit
-from shop_common.auth import Principal, PrincipalDep
+from shop_common.auth import Principal, principal_from_signed_headers
 from shop_common.config import (
     get_settings,
-    production_security_issues,
-    validate_production_settings,
+    runner_security_issues,
+    validate_runner_settings,
 )
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
@@ -38,7 +38,8 @@ runner = DockerRunner()
 # 每个 uvicorn 进程一份并发闸门；多 worker 时总并发 = 闸门上限 × worker 数。
 gate = ConcurrencyGate(settings.sandbox_max_concurrency, settings.sandbox_queue_timeout_seconds)
 # 去重状态放 Redis 而不是进程内存：多 runner 必须共享同一份执行状态才能跨实例生效。
-redis_client = Redis.from_url(settings.redis_url, decode_responses=False)
+# 连接使用受限 ACL 用户：即使 runner 被攻破，凭据也只能读写沙箱键与审计流，碰不到业务数据。
+redis_client = Redis.from_url(settings.resolved_sandbox_redis_url, decode_responses=False)
 dedupe = ExecutionDedupe(
     redis_client,
     # 锁 TTL 覆盖单次容器执行；执行期间心跳续租，runner 崩溃后才按 TTL 自动过期。
@@ -54,12 +55,13 @@ audit_bus: EventBus | None = None
 async def lifespan(_: FastAPI):
     global audit_redis, audit_bus
     configure_logging("sandbox-runner")
-    # runner 接受 Bearer JWT 与签名身份头：密钥不合格时任何人都能伪造 staff 身份执行代码。
-    validate_production_settings(settings)
+    # runner 只接受专用签名密钥签发的身份头，且 Redis 必须使用受限 ACL 凭据；
+    # 这两项不达标等于密钥半径仍覆盖全系统，直接拒绝启动。
+    validate_runner_settings(settings)
     # 配置漂移直接拒绝启动：生产连默认 root socket 或未启用 gVisor 都等于隔离退化。
     validate_sandbox_isolation(settings)
     # 审计只发布不消费，不需要 session_factory；独立连接避免与执行锁的 bytes 解码混用。
-    audit_redis = create_redis(settings.redis_url)
+    audit_redis = create_redis(settings.resolved_sandbox_redis_url)
     audit_bus = EventBus(audit_redis, namespace="shop", session_factory=None)
     yield
     await redis_client.aclose()
@@ -70,6 +72,31 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="sandbox-runner", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "sandbox-runner")
 install_metrics(app, "sandbox-runner")
+
+
+async def get_runner_principal(
+    x_user_id: Annotated[str | None, Header()] = None,
+    x_user_role: Annotated[str | None, Header()] = None,
+    x_tenant: Annotated[str | None, Header()] = None,
+    x_internal_signature: Annotated[str | None, Header()] = None,
+    x_request_id: Annotated[str | None, Header()] = None,
+) -> Principal:
+    """runner 专属鉴权：只接受平台专用密钥签名的身份头，明确不接受 Bearer JWT。
+
+    JWT 由 gateway/identity 使用；runner 不持有 JWT 密钥，前端令牌泄露也无法直接执行代码。
+    """
+    return principal_from_signed_headers(
+        user_id=x_user_id,
+        role=x_user_role,
+        tenant=x_tenant,
+        signature=x_internal_signature,
+        request_id=x_request_id,
+        secret=settings.resolved_runner_signing_secret,
+        trusted=settings.trust_identity_headers,
+    )
+
+
+RunnerPrincipalDep = Annotated[Principal, Depends(get_runner_principal)]
 
 
 class RunRequest(BaseModel):
@@ -83,8 +110,8 @@ class RunRequest(BaseModel):
 @app.get("/healthz")
 async def healthz(response: Response) -> dict[str, Any]:
     runtime = runner.runtime_info()
-    # 密钥仍是开发默认值等同身份可伪造；启动守卫已在 prod 拦下，这里再暴露一次便于运维定位。
-    security_issues = production_security_issues(settings)
+    # 密钥仍是开发默认值或 Redis 仍用共享凭据，都意味着 runner 的密钥半径没有收敛。
+    security_issues = runner_security_issues(settings)
     # 不可达、隔离退化、或配置的 runsc 未注册，都按失败处理并返回 503：
     # compose healthcheck 与 harness 探测都以 HTTP 状态判死，不能只靠 status 字段。
     healthy = (
@@ -109,6 +136,8 @@ async def healthz(response: Response) -> dict[str, Any]:
             "env": settings.env,
             "secrets_configured": not security_issues,
             "issues": security_issues,
+            # 鉴权口径固定为签名身份头：不接受 Bearer JWT，避免再引入一套令牌密钥。
+            "auth": "signed_headers_only",
         },
         "max_concurrency": gate.limit,
         "dedupe": "redis",
@@ -159,7 +188,7 @@ async def publish_execution_audit(
 @app.post("/run")
 async def run_sandbox(
     payload: RunRequest,
-    principal: PrincipalDep,
+    principal: RunnerPrincipalDep,
     execution_id: str = Header(default="", alias="X-Execution-Id"),
 ) -> dict[str, Any]:
     # 与 harness 的 /sandbox/run 同一权限口径：沙箱执行只对 staff 开放。

@@ -85,7 +85,7 @@ async def lifespan(_: FastAPI):
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
         # 单测关闭后台任务，避免测试进程连接 Redis 常驻消费
-        redis = create_redis(settings.redis_url)
+        redis = create_redis(settings.resolved_redis_url)
         bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         tasks = [asyncio.create_task(bus.run_consumer("audit", "audit-svc", "audit-1", handle_audit_event))]
     try:

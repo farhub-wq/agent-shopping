@@ -120,7 +120,7 @@ async def lifespan(_: FastAPI):
     # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
     validate_production_settings(settings)
     await init_models()
-    redis = create_redis(settings.redis_url)
+    redis = create_redis(settings.resolved_redis_url)
     bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     relay = OutboxRelay(get_session_factory(), bus)
     tasks = [

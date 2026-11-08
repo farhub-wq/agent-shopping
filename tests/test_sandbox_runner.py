@@ -8,9 +8,12 @@ import requests
 from docker.errors import APIError
 from sandbox_runner import app as runner_app
 from sandbox_runner.runner import DockerRunner, validate_sandbox_isolation
-from shop_common.auth import Principal, create_token
-from shop_common.config import ServiceSettings
+from shop_common.auth import Principal, create_token, signed_identity_headers
+from shop_common.config import ServiceSettings, validate_runner_settings
 from shop_common.sandbox import SandboxResult
+
+RUNNER_SECRET = "r" * 40
+INTERNAL_SECRET = "i" * 40
 
 
 class _FakeLock:
@@ -63,6 +66,22 @@ def fake_dedupe(monkeypatch) -> _FakeDedupe:
     return fake
 
 
+@pytest.fixture(autouse=True)
+def runner_settings(monkeypatch):
+    # runner 默认配置只够本地演示；测试固定为「信任签名头 + 专用密钥」的真实口径。
+    monkeypatch.setattr(
+        runner_app,
+        "settings",
+        ServiceSettings(
+            _env_file=None,
+            env="dev",
+            trust_identity_headers=True,
+            runner_signing_secret=RUNNER_SECRET,
+            internal_signing_secret=INTERNAL_SECRET,
+        ),
+    )
+
+
 def _client() -> httpx.AsyncClient:
     # ASGITransport 直接调用 FastAPI 应用，不需要起真实端口。
     return httpx.AsyncClient(
@@ -72,8 +91,9 @@ def _client() -> httpx.AsyncClient:
 
 
 def _headers(role: str, execution_id: str = "exec-1", user: str = "u-1") -> dict[str, str]:
+    # runner 只接受专用签名密钥签发的身份头，不再接受 Bearer JWT。
     return {
-        "Authorization": f"Bearer {create_token(user_id=user, role=role)}",
+        **signed_identity_headers(user, role, "acme", secret=RUNNER_SECRET),
         "X-Execution-Id": execution_id,
     }
 
@@ -93,6 +113,53 @@ async def test_run_rejects_non_staff(monkeypatch):
 
     # 客户角色即使能进内网也不允许执行代码；权限由 runner 再做一次校验。
     assert response.status_code == 403
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_bearer_jwt(monkeypatch):
+    called: list[bool] = []
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        called.append(True)
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    async with _client() as client:
+        response = await client.post(
+            "/run",
+            json={"code": "print(1)"},
+            headers={
+                "Authorization": f"Bearer {create_token(user_id='u-1', role='operator')}",
+                "X-Execution-Id": "exec-1",
+            },
+        )
+
+    # runner 不再接受 Bearer JWT：前端令牌不能替代 runner 专用签名，避免多一套可伪造的身份来源。
+    assert response.status_code == 403
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_internal_signing_secret(monkeypatch):
+    called: list[bool] = []
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        called.append(True)
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    # 用业务内网密钥签名：runner 只认自己的专用密钥，泄露内网密钥也不等于能执行代码。
+    headers = {
+        **signed_identity_headers("u-1", "operator", "acme", secret=INTERNAL_SECRET),
+        "X-Execution-Id": "exec-1",
+    }
+    async with _client() as client:
+        response = await client.post("/run", json={"code": "print(1)"}, headers=headers)
+
+    assert response.status_code == 401
     assert called == []
 
 
@@ -814,7 +881,11 @@ def test_dev_allows_relaxed_sandbox_params():
 
 @pytest.mark.asyncio
 async def test_healthz_returns_503_when_secrets_are_dev_defaults(monkeypatch):
-    monkeypatch.setattr(runner_app, "settings", ServiceSettings(_env_file=None, env="prod"))
+    monkeypatch.setattr(
+        runner_app,
+        "settings",
+        ServiceSettings(_env_file=None, env="prod", trust_identity_headers=True),
+    )
     monkeypatch.setattr(
         runner_app.runner,
         "runtime_info",
@@ -834,7 +905,81 @@ async def test_healthz_returns_503_when_secrets_are_dev_defaults(monkeypatch):
     async with _client() as client:
         response = await client.get("/healthz")
 
-    # 隔离与镜像都达标，但密钥仍是开发默认值：身份可伪造，必须判死
+    # 隔离与镜像都达标，但 runner 专用密钥未注入：身份可伪造，必须判死
     assert response.status_code == 503
     assert response.json()["security"]["secrets_configured"] is False
-    assert "JWT_SECRET" in response.json()["security"]["issues"][0]
+    assert "RUNNER_SIGNING_SECRET" in response.json()["security"]["issues"][0]
+
+
+def _prod_runner(**overrides) -> ServiceSettings:
+    values = {
+        "env": "prod",
+        "trust_identity_headers": True,
+        # 两个密钥必须不同：runner 密钥独立于网关内网密钥
+        "runner_signing_secret": RUNNER_SECRET,
+        "internal_signing_secret": INTERNAL_SECRET,
+        # 受限 ACL 用户：只能读写沙箱键与审计流
+        "sandbox_redis_url": "redis://sandbox-runner:" + "p" * 32 + "@redis:6379/0",
+        "redis_url": "redis://redis:6379/0",
+    }
+    values.update(overrides)
+    return ServiceSettings(_env_file=None, **values)
+
+
+def test_prod_runner_rejects_reused_internal_secret():
+    # 与网关共用一把钥匙等于没有收敛半径：泄露内网密钥就能执行代码
+    with pytest.raises(RuntimeError):
+        validate_runner_settings(_prod_runner(runner_signing_secret=INTERNAL_SECRET))
+
+
+def test_prod_runner_rejects_shared_redis_url():
+    # 回落业务共享 REDIS_URL 时 runner 凭据能读写全部业务数据
+    with pytest.raises(RuntimeError):
+        validate_runner_settings(_prod_runner(sandbox_redis_url=""))
+
+
+def test_prod_runner_rejects_default_redis_user():
+    with pytest.raises(RuntimeError):
+        validate_runner_settings(
+            _prod_runner(sandbox_redis_url="redis://default:" + "p" * 32 + "@redis:6379/0")
+        )
+
+
+def test_prod_runner_rejects_whitespace_redis_password():
+    # ACL 文件按空格分隔字段，含空白的密码会让受限用户加载失败，宁可启动期就拒绝。
+    with pytest.raises(RuntimeError):
+        validate_runner_settings(
+            _prod_runner(
+                sandbox_redis_url="redis://sandbox-runner:"
+                + "p" * 16
+                + "%20"
+                + "p" * 8
+                + "@redis:6379/0"
+            )
+        )
+
+
+def test_prod_runner_rejects_dev_sandbox_redis_password():
+    # compose 默认密码公开可见，生产沿用等于 runner 的 ACL 隔离形同虚设。
+    with pytest.raises(RuntimeError):
+        validate_runner_settings(
+            _prod_runner(
+                sandbox_redis_url="redis://sandbox-runner:dev-sandbox-redis-password@redis:6379/0"
+            )
+        )
+
+
+def test_prod_runner_accepts_dedicated_secret_and_acl_redis():
+    validate_runner_settings(_prod_runner())
+
+
+def test_dev_runner_allows_shared_redis():
+    # 本地开发零配置：ACL 与独立密钥只在非 dev 强制
+    validate_runner_settings(
+        ServiceSettings(
+            _env_file=None,
+            env="dev",
+            runner_signing_secret=RUNNER_SECRET,
+            sandbox_redis_url="",
+        )
+    )

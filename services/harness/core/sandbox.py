@@ -158,8 +158,13 @@ class SandboxManager:
         if not targets:
             # 没配 runner 就拒绝执行，绝不用本地进程顶替生产沙箱。
             return SandboxResult("unavailable", stderr="未配置 SANDBOX_RUNNER_URLS", backend="remote")
-        # 身份头必须现签：runner 会再次校验 staff 权限，沙箱能力不能靠内网位置默认放行。
-        headers = signed_identity_headers(user_id, role, tenant)
+        # 身份头必须现签，且使用 runner 专用密钥：业务内网密钥泄露也不等于能驱动沙箱。
+        headers = signed_identity_headers(
+            user_id,
+            role,
+            tenant,
+            secret=self.settings.resolved_runner_signing_secret,
+        )
         # execution_id 在整次故障转移中保持不变：换 runner 只是换执行者，
         # 由 runner 用 Redis 去重保证同一段代码最多真正跑一次。
         headers["X-Execution-Id"] = uuid.uuid4().hex

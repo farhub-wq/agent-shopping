@@ -536,7 +536,7 @@ async def handle_event(event: dict[str, Any]) -> None:
 async def _startup() -> list[asyncio.Task]:
     global redis, bus, idem
     await init_models()
-    redis = create_redis(settings.redis_url)
+    redis = create_redis(settings.resolved_redis_url)
     bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
     idem = IdempotencyStore(redis, namespace="shop")
     relay = OutboxRelay(get_session_factory(), bus)

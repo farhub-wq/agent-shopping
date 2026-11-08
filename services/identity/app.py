@@ -75,7 +75,7 @@ async def lifespan(_: FastAPI):
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
         # 管理员登录审计走 outbox 投递；单测关闭后台任务避免依赖 Redis
-        redis = create_redis(settings.redis_url)
+        redis = create_redis(settings.resolved_redis_url)
         bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         relay = OutboxRelay(get_session_factory(), bus)
         tasks = [asyncio.create_task(relay.run_forever())]

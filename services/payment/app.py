@@ -92,7 +92,7 @@ async def lifespan(_: FastAPI):
     await init_models()
     tasks: list[asyncio.Task] = []
     if settings.background_tasks:
-        redis = create_redis(settings.redis_url)
+        redis = create_redis(settings.resolved_redis_url)
         bus = EventBus(redis, namespace="shop", session_factory=get_session_factory())
         relay = OutboxRelay(get_session_factory(), bus)
         # outbox 投递与超时关单随应用生命周期统一启动

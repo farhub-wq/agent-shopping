@@ -3,8 +3,12 @@ import json
 import httpx
 import pytest
 from harness.core.sandbox import SandboxManager, SandboxResult, validate_sandbox_production
+from shop_common.auth import verify_internal_signature
 from shop_common.config import ServiceSettings
 from shop_common.sandbox import MAX_CODE_CHARS
+
+RUNNER_SECRET = "r" * 40
+INTERNAL_SECRET = "i" * 40
 
 
 def _enabled_manager(monkeypatch, handler, urls: str = "http://runner.test") -> SandboxManager:
@@ -71,6 +75,35 @@ async def test_enabled_sandbox_calls_runner(monkeypatch):
     assert seen["user"] == "ops-1"
     # 每次调用必须带 execution_id，runner 依赖它做跨实例去重。
     assert isinstance(seen["execution_id"], str) and seen["execution_id"]
+
+
+@pytest.mark.asyncio
+async def test_runner_calls_use_dedicated_signing_secret(monkeypatch):
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update({key.lower(): value for key, value in request.headers.items()})
+        return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
+
+    manager = _enabled_manager(monkeypatch, handler)
+    monkeypatch.setattr(manager.settings, "runner_signing_secret", RUNNER_SECRET)
+    monkeypatch.setattr(manager.settings, "internal_signing_secret", INTERNAL_SECRET)
+    monkeypatch.setattr(manager, "_run_local", _no_local)
+
+    await manager.run("print(1)", user_id="ops-1", role="operator", tenant="acme")
+
+    # 发给 runner 的身份头必须用 runner 专用密钥签名，业务内网密钥无效；
+    # 同时不再携带 Bearer 令牌，runner 侧也已移除该鉴权分支。
+    assert "authorization" not in seen
+    arguments = {
+        "user_id": "ops-1",
+        "role": "operator",
+        "tenant": "acme",
+        "request_id": seen["x-request-id"],
+    }
+    signature = seen["x-internal-signature"]
+    assert verify_internal_signature(signature, secret=RUNNER_SECRET, **arguments)
+    assert not verify_internal_signature(signature, secret=INTERNAL_SECRET, **arguments)
 
 
 @pytest.mark.asyncio
