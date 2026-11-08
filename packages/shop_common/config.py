@@ -96,6 +96,14 @@ class ServiceSettings(BaseSettings):
 
     # 沙箱
     sandbox_enabled: bool = False
+    # 独立 sandbox-runner 列表（逗号分隔）：生产按沙箱主机数量列全，harness 做故障转移。
+    # 单机默认只指向本地 runner；多主机部署形如 http://runner-a:8000,http://runner-b:8000。
+    sandbox_runner_urls: str = "http://localhost:8011"
+    # 每个 runner 进程允许同时执行的沙箱容器数；超过即排队，排队超时按繁忙拒绝。
+    sandbox_max_concurrency: int = 4
+    sandbox_queue_timeout_seconds: int = 10
+    # 同一 execution_id 在其他 runner 执行中时，本实例等待结果复用的时长
+    sandbox_dedupe_wait_seconds: int = 5
     sandbox_image: str = "shop-agent-sandbox:latest"
     sandbox_cpu: float = 0.5
     sandbox_memory_mb: int = 256
