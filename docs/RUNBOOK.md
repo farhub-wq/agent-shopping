@@ -192,14 +192,43 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 
 ## 5. 沙箱
 
-默认 `SANDBOX_ENABLED=false`，走本地子进程（仅防误操作）。启用 Docker 沙箱：
+沙箱执行由独立 `sandbox-runner` 承载：只有它挂载 `/var/run/docker.sock` 并创建一次性容器，harness 只经内网 HTTP（携带签名身份头）调用。runner 不映射宿主端口、不经 gateway 暴露，任何把它暴露到公网的改动都视为配置事故。
+
+可用性设计：
+
+- harness 的 `SANDBOX_RUNNER_URLS` 支持逗号分隔的多台 runner，按请求轮询；连接失败、429/502/503/504、或 runner 返回「繁忙」时自动换下一台，故障实例进入 30s 冷却。
+- 单台 runner 通过 `SANDBOX_MAX_CONCURRENCY` 限制并发容器数，超出先排队（`SANDBOX_QUEUE_TIMEOUT_SECONDS`），排队超时返回「繁忙」并触发 harness 转移。
+- **跨 runner 重复执行防护**：harness 每次沙箱调用生成一个 `X-Execution-Id`，整个故障转移过程复用；runner 用 Redis 做「执行锁 + 结果缓存」——同一 execution_id 只真正执行一次，转移后优先复用第一次的结果。去重存储不可用时 runner 直接拒绝执行（fail-closed），因此 `sandbox-runner` 依赖 Redis。
+- 500 不转移：可能是容器已执行后响应序列化失败，换实例重试会造成重复执行。
+- **真正抗主机故障要求每台沙箱主机各部署一个 runner**；`docker compose --scale sandbox-runner=2` 只能抗进程崩溃，同宿主副本仍共享同一个 Docker 守护进程，后者仍是单点。
+
+本地演示/测试（`SANDBOX_ENABLED=false`）走本地子进程，不是安全边界，不能用于生产。
+
+启用 Docker 沙箱：
 
 ```bash
 docker build -t shop-agent-sandbox:latest infra/sandbox
-# .env 中设置 SANDBOX_ENABLED=true 后重启 harness
+# .env 设置 SANDBOX_ENABLED=true；compose 已给 harness 注入 SANDBOX_RUNNER_URLS=http://sandbox-runner:8000
+docker compose up -d --build sandbox-runner harness
+# 多主机：SANDBOX_RUNNER_URLS=http://runner-a:8000,http://runner-b:8000
 ```
 
-`POST /api/agents/sandbox/run` 仅供 staff，执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
+本地裸进程调试可分别启动：
+
+```bash
+make dev-sandbox-runner   # 需要本机 Docker 守护进程
+SANDBOX_ENABLED=true SANDBOX_RUNNER_URLS=http://localhost:8011 make dev-harness
+```
+
+启用后为 fail-closed：全部 runner 不可达、Docker SDK、守护进程或镜像任一不可用，`sandbox_run` 直接返回 `unavailable`，**绝不回退本地子进程**。
+
+排查顺序：
+
+1. `curl localhost:8006/sandbox/health` 看 `backend`、`runner_urls` 与 `runners.endpoints` 每台状态；
+2. `docker compose logs sandbox-runner`，并确认 runner 的 `REDIS_URL` 可连通；
+3. 确认 runner 容器内可访问 socket：`docker compose exec sandbox-runner ls -l /var/run/docker.sock`。
+
+`POST /api/agents/sandbox/run` 仅供 staff，runner 侧会再校验一次（非 staff 返回 403）；执行受 `SANDBOX_TIMEOUT_SECONDS`、CPU、内存、PID 与 `network=none` 限制。
 
 ## 6. 故障排查
 

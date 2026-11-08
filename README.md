@@ -30,13 +30,15 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
     ├── catalog(8001)    ├── harness(8006)
     ├── inventory(8002)  │     ├─ SKILL 准入 + 信任分级
     ├── order(8003)      │     ├─ 工具网关 + 人工审批
-    ├── fulfillment(8004)│     ├─ 沙箱 + MCP + 三层记忆
+    ├── fulfillment(8004)│     ├─ 沙箱（内网调用 sandbox-runner）+ MCP + 三层记忆
     └── aftersales(8005) │     └─ 证据账本 TraceLedger
                          │
               Redis Streams（订单 / 履约 / 售后事件）
               MySQL 8（每服务独立 DB）
               MongoDB 7（Harness 记忆与运行轨迹）
 ```
+
+沙箱执行经内网调用独立 `sandbox-runner`（不映射宿主端口），全系统只有它持有 Docker socket；支持配置多台 runner 做轮询与故障转移。
 
 生产目标拓扑：两台应用主机跑 Compose 栈，LB 终止 TLS，MySQL/MongoDB/Redis 托管；新增 `identity`（账号）、`payment`（支付/退款/总账/对账）、`audit`（审计）、`notify`（通知）四个服务，且只暴露 gateway 与 web。
 
@@ -49,6 +51,7 @@ gateway (8080) ── 鉴权 / 限流 / BFF 聚合 / 反向代理 / SSE / 审计
 | fulfillment | 8004 | 履约单、部分发货、SLA 超时扫描、发货/签收 | fulfillment_db | 已实现 |
 | aftersales | 8005 | 售后单、政策引擎、风险评分、行级退款审批 | aftersales_db | 已实现 |
 | harness | 8006 | 技能准入、工具权限、沙箱、MCP、记忆、Trace | MongoDB `shop_harness` | 已实现 |
+| sandbox-runner | 内网 8000 | 唯一持有 Docker socket，执行一次性沙箱容器；多实例轮询、故障转移与 execution_id 去重 | Redis 去重状态 | 已实现 |
 | identity | 8007 | 注册、登录、refresh 轮换、角色授予 | identity_db | 已实现（M1） |
 | payment | 8008 | 支付单、退款、复式总账、回调幂等、日终对账 | payment_db | 已实现（M2，Mock 渠道） |
 | audit | 8009 | 长期审计、查询、导出 | audit_db | 规划（M3） |
@@ -259,7 +262,8 @@ services/order/           订单状态机、支付、退款、Saga 补偿、事�
 services/fulfillment/     履约单、SLA 超时扫描、发货/签收
 services/aftersales/      售后单、政策引擎、风险评分、审批
 services/gateway/         鉴权、限流、BFF、反向代理、SSE、审计
-services/harness/         技能准入、策略、工具、沙箱、MCP、记忆、Runtime、Trace
+services/harness/         技能准入、策略、工具、沙箱调用、MCP、记忆、Runtime、Trace
+services/sandbox_runner/  独立沙箱执行服务，全系统唯一持有 Docker socket
 services/identity/        账号与权限（M1）
 services/payment/         支付、退款、复式总账、回调幂等、对账（M2）
 services/audit/           长期审计（规划，M3）
