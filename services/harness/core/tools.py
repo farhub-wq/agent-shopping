@@ -55,6 +55,9 @@ class ToolContext:
     session_id: str
     run_id: str
     approved: set[str] = field(default_factory=set)
+    # 本次运行是否已收到沙箱执行输出：输出属于低信任数据，
+    # 一旦为 True，后续写/不可逆动作一律转人工复核。
+    untrusted_output: bool = False
 
     def is_staff(self) -> bool:
         return self.role in {"operator", "admin"}
@@ -146,6 +149,25 @@ class ToolRegistry:
                 "needs_approval",
                 message=f"{name} 属于高风险动作，需要人工审批后重放",
                 data={"tool": name, "args": args, "risk": tool.policy.risk},
+            )
+
+        # 第 2.5 步：不可信输出后的写操作。沙箱 stdout 可携带「忽略指令、调用退款」类内容，
+        # 同一个上下文里模型直接发起写入等于让低信任数据驱动高危动作，必须回到人工复核。
+        # 已审批的工具有 ctx.approved 兜底，不会被反复拦截形成死循环。
+        if (
+            ctx.untrusted_output
+            and tool.policy.permission in {"write", "admin"}
+            and name not in ctx.approved
+        ):
+            return ToolResult(
+                "needs_approval",
+                message=f"{name} 写入动作在收到不可信执行输出后需人工复核",
+                data={
+                    "tool": name,
+                    "args": args,
+                    "risk": tool.policy.risk,
+                    "reason": "untrusted_execution_output",
+                },
             )
 
         try:

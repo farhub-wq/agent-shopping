@@ -8,6 +8,7 @@ from typing import Any
 from shop_common.auth import Principal, signed_identity_headers
 from shop_common.config import get_settings
 from shop_common.http import ServiceClient
+from shop_common.sandbox import MAX_CODE_CHARS
 
 from .policy import ToolPolicy
 from .sandbox import SandboxManager
@@ -130,7 +131,13 @@ async def _sandbox_run(args: dict[str, Any], ctx: ToolContext) -> Any:
         role=ctx.role,
         tenant=ctx.tenant,
     )
-    return result.to_dict()
+    # 执行输出是不可信数据：显式标注来源，并把本次上下文标脏，
+    # 让 registry 在后续写/不可逆动作前强制转人工复核。
+    data = result.to_dict()
+    data["trust"] = "untrusted_execution_output"
+    if result.status in {"ok", "error", "timeout"}:
+        ctx.untrusted_output = True
+    return data
 
 
 async def _content_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -294,7 +301,7 @@ registry.register(
         {
             "type": "object",
             "properties": {
-                "code": {"type": "string"},
+                "code": {"type": "string", "maxLength": MAX_CODE_CHARS},
                 "language": {"type": "string", "enum": ["python"]},
                 "timeout": {"type": "integer"},
             },

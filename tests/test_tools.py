@@ -72,6 +72,42 @@ async def test_execute_redacts_structured_output():
 
 
 @pytest.mark.asyncio
+async def test_write_tool_after_untrusted_output_requires_approval():
+    registry = ToolRegistry()
+    executed: list[str] = []
+
+    async def write(args, ctx):
+        executed.append("write")
+        return {"done": True}
+
+    async def read(args, ctx):
+        return {"ok": True}
+
+    registry.register(
+        Tool("refund_write", "d", {"type": "object"}, write, ToolPolicy("refund_write", permission="write"))
+    )
+    registry.register(
+        Tool("stock_read", "d", {"type": "object"}, read, ToolPolicy("stock_read", permission="read"))
+    )
+    ctx = ToolContext(user_id="u1", role="operator", tenant="t", session_id="s", run_id="r")
+    ctx.untrusted_output = True
+
+    # 收到沙箱输出后，同一上下文的写操作必须先人工复核
+    blocked = await registry.execute("refund_write", {}, ctx, trust="certified")
+    assert blocked.status == "needs_approval"
+    assert blocked.data["reason"] == "untrusted_execution_output"
+    assert executed == []
+
+    # 读取类动作不受影响，业务仍可继续查证
+    assert (await registry.execute("stock_read", {}, ctx, trust="certified")).ok
+
+    # 人工审批后重放：已加入 approved 的同一个工具不再被反复拦截
+    ctx.approved.add("refund_write")
+    assert (await registry.execute("refund_write", {}, ctx, trust="certified")).ok
+    assert executed == ["write"]
+
+
+@pytest.mark.asyncio
 async def test_execute_neutralizes_injection_in_tool_output():
     registry = ToolRegistry()
 

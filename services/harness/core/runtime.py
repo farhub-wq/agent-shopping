@@ -488,6 +488,8 @@ class AgentRuntime:
             session_id=payload["ctx"]["session_id"],
             run_id=run_id,
             approved=set(payload["ctx"].get("approved", [])),
+            # 续跑必须继承「已收到不可信沙箱输出」的标记，否则审批边界会被重放抹掉。
+            untrusted_output=bool(payload["ctx"].get("untrusted_output", False)),
         )
         # 审批只解锁「被拦的那一个工具」：加进 approved 白名单，信任等级仍是
         # manifest.trust——续跑绝不能借 certified 把整个计划的权限面放大。
