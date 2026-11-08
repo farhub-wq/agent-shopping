@@ -23,10 +23,16 @@ dev-harness:
 dev-sandbox-runner:
 	PYTHONPATH=. uvicorn sandbox_runner.app:app --reload --port 8011
 
+# 构建端点必须与 runner 连接的守护进程一致：生产 runner 走 rootless dockerd（独立镜像存储），
+# 镜像构建进默认 root 守护进程时 runner 会一直 ImageNotFound，因此允许显式指定端点。
+SANDBOX_DOCKER_HOST ?=
+DOCKER_CMD = docker $(if $(SANDBOX_DOCKER_HOST),-H $(SANDBOX_DOCKER_HOST),)
+
 # 构建沙箱镜像并打印内容寻址的 SANDBOX_IMAGE；生产必须用输出值替换 :latest
 build-sandbox-image:
-	docker build -t shop-agent-sandbox:latest infra/sandbox
-	@echo "SANDBOX_IMAGE=$$(docker image inspect --format '{{.Id}}' shop-agent-sandbox:latest)"
+	$(DOCKER_CMD) build -t shop-agent-sandbox:latest infra/sandbox
+	@echo "构建端点：$(if $(SANDBOX_DOCKER_HOST),$(SANDBOX_DOCKER_HOST),docker 默认端点)"
+	@echo "SANDBOX_IMAGE=$$($(DOCKER_CMD) image inspect --format '{{.Id}}' shop-agent-sandbox:latest)"
 
 # 宿主侧一次性初始化：rootless dockerd + gVisor（需 root，仅 Debian/Ubuntu，幂等）
 setup-sandbox-host:

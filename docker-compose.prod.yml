@@ -60,7 +60,10 @@ services:
   harness:
     restart: unless-stopped
     ports: !reset []
-    environment: *prod-env
+    environment:
+      <<: *prod-env
+      # 生产必须走远程 runner：漏配会让沙箱请求在 harness 容器内本地执行，隔离整体失效
+      SANDBOX_ENABLED: "true"
     deploy:
       resources:
         limits: { cpus: "1.0", memory: 512M }
