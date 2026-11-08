@@ -3,7 +3,9 @@
 import httpx
 import pytest
 from sandbox_runner import app as runner_app
+from sandbox_runner.runner import DockerRunner, validate_sandbox_isolation
 from shop_common.auth import create_token
+from shop_common.config import ServiceSettings
 from shop_common.sandbox import SandboxResult
 
 
@@ -218,7 +220,21 @@ async def test_run_waits_for_inflight_execution(monkeypatch, fake_dedupe):
 
 @pytest.mark.asyncio
 async def test_healthz_exposes_runtime_state(monkeypatch):
-    monkeypatch.setattr(runner_app.runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///run/rootless/docker.sock",
+            "rootless": True,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "sha256:" + "c" * 64,
+            "image_pinned": True,
+            "insecure": False,
+        },
+    )
 
     async with _client() as client:
         response = await client.get("/healthz")
@@ -226,4 +242,249 @@ async def test_healthz_exposes_runtime_state(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["docker_sdk"] is True
+    # rootless 端点信息必须透出，供运维判断隔离档位是否退化
+    assert response.json()["docker"]["rootless"] is True
+    assert response.json()["image_pinned"] is True
     assert response.json()["max_concurrency"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_insecure_docker_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///var/run/docker.sock",
+            "rootless": False,
+            "runtime": "runc",
+            "runtime_ok": True,
+            "insecure": True,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 非 dev 连到 root 守护进程等于隔离退化，必须用 503 让探测直接判死
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_image_not_pinned(monkeypatch):
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///run/rootless/docker.sock",
+            "rootless": True,
+            "runtime": "runsc",
+            "runtime_ok": True,
+            "image": "shop-agent-sandbox:latest",
+            "image_pinned": False,
+            "insecure": False,
+            "insecure_image": True,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 生产用 tag 镜像等于执行环境可被静默替换
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["image_pinned"] is False
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_docker_unreachable(monkeypatch):
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": False,
+            "endpoint": "sdk-default",
+            "error": "DockerException",
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_healthz_returns_503_when_runtime_not_registered(monkeypatch):
+    monkeypatch.setattr(
+        runner_app.runner,
+        "runtime_info",
+        lambda: {
+            "docker_sdk": True,
+            "reachable": True,
+            "endpoint": "unix:///run/rootless/docker.sock",
+            "rootless": True,
+            "runtime": "runsc",
+            "runtime_ok": False,
+            "insecure": False,
+        },
+    )
+
+    async with _client() as client:
+        response = await client.get("/healthz")
+
+    # 配了 runsc 但宿主没注册，执行必然失败，健康检查不能报 ok
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
+def test_prod_rejects_default_docker_socket():
+    # 生产未显式配置端点：隐式落到默认 root socket，必须拒绝启动
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(
+            ServiceSettings(env="prod", sandbox_docker_host="", sandbox_runtime="runsc")
+        )
+
+
+def test_prod_rejects_explicit_root_socket():
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(
+            ServiceSettings(
+                env="prod",
+                sandbox_docker_host="unix:///var/run/docker.sock",
+                sandbox_runtime="runsc",
+            )
+        )
+
+
+def test_prod_rejects_missing_gvisor_runtime():
+    # rootless 只解决「被攻破不等于宿主 root」，共享内核 CVE 面仍需 gVisor 兜底
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(
+            ServiceSettings(
+                env="prod",
+                sandbox_docker_host="unix:///run/rootless/docker.sock",
+                sandbox_runtime="",
+            )
+        )
+
+
+def test_prod_accepts_rootless_with_gvisor():
+    # rootless dockerd + runsc + digest 镜像三者同时成立，才认为生产隔离档位达标
+    validate_sandbox_isolation(
+        ServiceSettings(
+            env="prod",
+            sandbox_docker_host="unix:///run/rootless/docker.sock",
+            sandbox_runtime="runsc",
+            sandbox_image="shop-agent-sandbox@sha256:" + "a" * 64,
+        )
+    )
+
+
+def test_prod_accepts_local_image_id():
+    # 本地构建的镜像用镜像 ID 固定内容，同样属于内容寻址
+    validate_sandbox_isolation(
+        ServiceSettings(
+            env="prod",
+            sandbox_docker_host="unix:///run/rootless/docker.sock",
+            sandbox_runtime="runsc",
+            sandbox_image="sha256:" + "b" * 64,
+        )
+    )
+
+
+def test_prod_rejects_tagged_image():
+    # tag（含 :latest）可被覆盖，等于执行环境可被静默替换
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(
+            ServiceSettings(
+                env="prod",
+                sandbox_docker_host="unix:///run/rootless/docker.sock",
+                sandbox_runtime="runsc",
+                sandbox_image="shop-agent-sandbox:latest",
+            )
+        )
+
+
+def test_dev_allows_default_socket_and_runtime():
+    # 本地开发保留 Docker Desktop / DOCKER_HOST 与缺省 runc 的行为
+    validate_sandbox_isolation(
+        ServiceSettings(env="dev", sandbox_docker_host="", sandbox_runtime="")
+    )
+
+
+class _FakeContainer:
+    def start(self) -> None:
+        pass
+
+    def wait(self, timeout: int | None = None) -> dict[str, int]:
+        return {"StatusCode": 0}
+
+    def logs(self, stdout: bool = True, stderr: bool = False) -> bytes:
+        return b"ok" if stdout else b""
+
+    def remove(self, force: bool = False) -> None:
+        pass
+
+
+class _FakeContainers:
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, object] = {}
+
+    def create(self, image: str, **kwargs: object) -> _FakeContainer:
+        self.create_kwargs = {"image": image, **kwargs}
+        return _FakeContainer()
+
+
+class _FakeDockerClient:
+    def __init__(self) -> None:
+        self.containers = _FakeContainers()
+
+    def close(self) -> None:
+        pass
+
+
+def _runner_with(settings: ServiceSettings, client: _FakeDockerClient, monkeypatch) -> DockerRunner:
+    runner = DockerRunner()
+    monkeypatch.setattr(runner, "settings", settings)
+    monkeypatch.setattr(runner, "_client", lambda: client)
+    return runner
+
+
+def test_run_passes_gvisor_runtime_to_container(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(ServiceSettings(env="dev", sandbox_runtime="runsc"), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    assert result.status == "ok"
+    # 生产必须真正以 runsc 创建容器，而不是只在校验里写配置
+    assert client.containers.create_kwargs["runtime"] == "runsc"
+
+
+def test_run_omits_runtime_when_not_configured(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(ServiceSettings(env="dev", sandbox_runtime=""), client, monkeypatch)
+
+    runner._run_blocking("print(1)", 5)
+
+    # 留空时不能传空 runtime，否则本地默认 runc 会被覆盖成非法值
+    assert "runtime" not in client.containers.create_kwargs
+
+
+def test_run_caps_container_log_size(monkeypatch):
+    client = _FakeDockerClient()
+    runner = _runner_with(ServiceSettings(env="dev"), client, monkeypatch)
+
+    runner._run_blocking("print(1)", 5)
+
+    log_config = client.containers.create_kwargs["log_config"]
+    assert isinstance(log_config, dict)
+    # stdout 落在宿主 json-file，只读根文件系统挡不住刷屏，必须单容器封顶
+    assert log_config["Config"] == {"max-size": "1m", "max-file": "1"}

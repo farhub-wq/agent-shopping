@@ -8,7 +8,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Response
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.auth import PrincipalDep
@@ -19,7 +19,7 @@ from shop_common.metrics import install_metrics
 from shop_common.sandbox import SandboxResult
 
 from .dedupe import CACHEABLE_STATUSES, ExecutionDedupe
-from .runner import ConcurrencyGate, DockerRunner
+from .runner import ConcurrencyGate, DockerRunner, validate_sandbox_isolation
 
 logger = get_logger(__name__)
 
@@ -42,6 +42,8 @@ dedupe = ExecutionDedupe(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging("sandbox-runner")
+    # 配置漂移直接拒绝启动：生产连默认 root socket 或未启用 gVisor 都等于隔离退化。
+    validate_sandbox_isolation(settings)
     yield
     await redis_client.aclose()
 
@@ -59,12 +61,26 @@ class RunRequest(BaseModel):
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, Any]:
+async def healthz(response: Response) -> dict[str, Any]:
+    runtime = runner.runtime_info()
+    # 不可达、隔离退化、或配置的 runsc 未注册，都按失败处理并返回 503：
+    # compose healthcheck 与 harness 探测都以 HTTP 状态判死，不能只靠 status 字段。
+    healthy = (
+        bool(runtime.get("reachable"))
+        and not runtime.get("insecure")
+        and not runtime.get("insecure_image")
+        and bool(runtime.get("runtime_ok", True))
+    )
+    if not healthy:
+        response.status_code = 503
     return {
-        "status": "ok" if runner.docker_available() else "unavailable",
+        "status": "ok" if healthy else "unavailable",
         "service": "sandbox-runner",
-        "docker_sdk": runner.docker_available(),
+        "docker_sdk": runtime.get("docker_sdk", False),
+        # 端点形态、是否 rootless、运行时是否注册、镜像是否 digest 固定，供运维直接定位。
+        "docker": runtime,
         "image": settings.sandbox_image,
+        "image_pinned": runtime.get("image_pinned", False),
         "network": settings.sandbox_network,
         "max_concurrency": gate.limit,
         "dedupe": "redis",

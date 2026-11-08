@@ -109,6 +109,13 @@ class ServiceSettings(BaseSettings):
     sandbox_memory_mb: int = 256
     sandbox_timeout_seconds: int = 20
     sandbox_network: str = "none"
+    # 沙箱 runner 连接的 Docker 端点：留空沿用 SDK 默认 socket（仅本地开发）。
+    # 生产必须显式指向 rootless dockerd（如 unix:///run/rootless/docker.sock），
+    # 指向默认 root socket 会被 runner 启动守卫直接拒绝，避免被攻破后等价宿主 root。
+    sandbox_docker_host: str = ""
+    # 沙箱容器运行时：生产强制 gVisor（runsc），用用户态内核隔离 syscall，
+    # 收敛共享宿主内核的 CVE 面；留空仅用于本地开发，届时回落到 runc。
+    sandbox_runtime: str = ""
 
     @property
     def resolved_database_url(self) -> str:

@@ -55,6 +55,24 @@ services:
         limits: { cpus: "1.0", memory: 512M }
     logging: *logging
 
+  sandbox-runner:
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      ENV: prod
+      # 生产必须接 rootless dockerd：容器内用独立路径挂载，runner 启动守卫据此
+      # 拒绝默认 /var/run/docker.sock，避免被攻破后等价宿主 root
+      SANDBOX_DOCKER_HOST: unix:///run/rootless/docker.sock
+      # 生产强制 gVisor：共享宿主内核的逃逸面不可接受
+      SANDBOX_RUNTIME: runsc
+    volumes: !override
+      # 宿主侧 rootless socket：默认 uid 1000，按实际部署用户覆盖 SANDBOX_ROOTLESS_SOCKET
+      - ${SANDBOX_ROOTLESS_SOCKET:-/run/user/1000/docker.sock}:/run/rootless/docker.sock
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
   identity:
     restart: unless-stopped
     ports: !reset []

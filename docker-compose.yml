@@ -152,12 +152,17 @@ services:
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-none}
       SANDBOX_MAX_CONCURRENCY: ${SANDBOX_MAX_CONCURRENCY:-4}
       SANDBOX_QUEUE_TIMEOUT_SECONDS: ${SANDBOX_QUEUE_TIMEOUT_SECONDS:-10}
+      # Docker 端点：留空走默认 socket（本地开发）；生产由 prod overlay 指向 rootless socket
+      SANDBOX_DOCKER_HOST: ${SANDBOX_DOCKER_HOST:-}
+      # 容器运行时：留空走 runc（本地开发）；生产强制 runsc（gVisor）
+      SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-}
       # 跨 runner 的执行去重靠 Redis 共享状态；不可用时 runner 直接拒绝执行
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       SANDBOX_DEDUPE_WAIT_SECONDS: ${SANDBOX_DEDUPE_WAIT_SECONDS:-5}
     volumes:
       # 全系统唯一持有 Docker socket 的组件；不映射宿主端口、不经 gateway 暴露。
-      - /var/run/docker.sock:/var/run/docker.sock
+      # 宿主侧 socket 路径可覆盖：生产指向 rootless dockerd 的 socket（见 prod overlay）。
+      - ${SANDBOX_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     depends_on:
       redis: { condition: service_healthy }
     healthcheck: *healthcheck
