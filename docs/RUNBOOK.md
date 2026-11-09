@@ -211,7 +211,7 @@ curl -s localhost:8080/api/agents/runs/$RUN_ID/evidence -H "Authorization: Beare
 
 **dedicated 档位为什么可以接受 rootful**：`rootless + runsc` 在部分内核/发行版上不可用（systemd cgroup manager 需要系统总线授权，改 cgroupfs 驱动又会撞 `cgroup.subtree_control` 权限），实测 rootful + runsc 正常。于是把风险从「进程权限」转移到「节点边界」：Docker 守护进程只服务沙箱，节点不承载任何业务容器与数据，失陷上限是可整机重建的节点本身；gVisor 继续收敛内核 CVE 面。**这条前提不可协商**——`dedicated` 节点上出现任何非沙箱容器时，runner 在每次执行前拒绝（返回 `unavailable`）并让 healthz 503。
 
-节点独占靠容器标签 `shop.sandbox.role` 判定：`runner`（runner 自身）、`execution`（沙箱执行容器，runner 自动打标）、`infra`（节点上的沙箱配套容器，如本地 Redis，由 compose 显式声明）。其它标签或没有标签的容器一律视为混部。
+节点独占按两条依据判定容器是否属于沙箱栈：① 容器标签 `shop.sandbox.role`——`runner`（runner 自身）、`execution`（沙箱执行容器，runner 自动打标）、`infra`（节点上的沙箱配套容器）；② 容器属于 `SANDBOX_NODE_COMPOSE_PROJECTS` 配置的 compose 项目（默认 `shop-agent-sandbox`，由 compose 自动注入 `com.docker.compose.project`，配套容器无需手工打标）。两条都不满足的容器一律视为混部。
 
 宿主侧初始化已脚本化（Debian/Ubuntu，root 执行，幂等）：
 
@@ -383,8 +383,8 @@ except Exception as exc:
 
 **E. gVisor 兼容性回归（SBX-09）**
 
-- [ ] 标准库回归：`import json, re, hashlib, datetime, collections, ipaddress, uuid, math, statistics` 全部可用。
-- [ ] 业务计划预装依赖（如 numpy/pandas）逐个执行；失败先判断是「镜像没装依赖」还是「runsc syscall 不兼容」，前者需增肥镜像，后者记录 syscall 报错。
+- [ ] 控制面执行：`SANDBOX_RUNNER_URLS=http://<runner>:8000 RUNNER_SIGNING_SECRET=<runner 专用密钥> make sandbox-gvisor-regression`。脚本先校验该 runner 的 healthz 为 `runtime=runsc`，再跑标准库、线程、子进程、文件+sqlite、浮点统计探针；任一失败退出码非 0。
+- [ ] 业务计划预装依赖用 `SANDBOX_PROBE_MODULES=numpy,pandas` 追加。失败信息含 `ModuleNotFoundError` 时是「镜像没装依赖」，需增肥 [Dockerfile](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/Dockerfile)；其余多为 runsc syscall 不兼容，记录报错。
 - [ ] 全部通过后，把 [sandbox-hardening.md](file:///c:/Users/far/Desktop/git/shop-agent/docs/design/sandbox-hardening.md) 的 SBX-09 勾选为 ☑ 并写明日期与镜像 digest。
 
 **F. 观测与运维**
@@ -411,7 +411,7 @@ except Exception as exc:
 
 **环境前提（不满足则停止）**
 
-- [x] 节点仅运行沙箱栈：`docker ps --format '{{.Names}} {{.Label "shop.sandbox.role"}}'` 只出现带 `runner` / `execution` / `infra` 标签的容器。
+- [x] 节点仅运行沙箱栈：`docker ps --format '{{.Names}} {{.Label "shop.sandbox.role"}} {{.Label "com.docker.compose.project"}}'` 中的容器要么带 `runner` / `execution` / `infra` 角色标签，要么属于 `SANDBOX_NODE_COMPOSE_PROJECTS` 配置的沙箱 compose 项目。
 - [x] 节点不承载业务数据：无 MySQL / Mongo / 业务 Redis 容器，无业务库挂载。
 - [x] 节点私网可达 harness，且公网只放行运维 SSH；8000 不对公网开放。
 
@@ -457,7 +457,8 @@ except Exception as exc:
 
 - [ ] healthz 503 能被告警发现；节点容器清单可作为「混部」巡检项。
 - [x] `docker compose logs sandbox-runner` 无刷屏；节点可整机重建（重建后只需 `.env` + 镜像 digest + compose 文件）。
-- [ ] gVisor 兼容性回归（SBX-09）在 dedicated 档位重跑一遍，结果回填 sandbox-hardening。
+- [ ] 孤儿回收：在节点执行 `docker run -d --label shop.sandbox.role=execution --name orphan-probe alpine:3.20 sleep 3600`，等待 `SANDBOX_TIMEOUT_SECONDS + 30` 秒后最多再等一个回收周期（60s），确认容器被删除且 `docker ps -a --filter label=shop.sandbox.role=execution` 为空；同时确认执行中的容器（sleep 脚本跑着时）不会被回收。
+- [x] gVisor 兼容性回归（SBX-09）在 dedicated 档位实测（2026-11-09）：runner 为 `runtime=runsc`、镜像 digest 固定时，`make sandbox-gvisor-regression` 的 5 项探针 stdlib / threads / subprocess / files / math 全部 PASS，审计流写入 5 条 `audit.sandbox.executed`，无执行容器残留。业务依赖（numpy/pandas）未预装，`ModuleNotFoundError` 属镜像缺依赖，需按实际脚本需求增肥镜像。
 
 **结果记录**
 
@@ -469,6 +470,7 @@ except Exception as exc:
 | 2026-11-08 | D | 混部容器 → 503 + unavailable | healthz→503 且 `foreign_containers=["mixed-probe"]`；`/run`→`unavailable`，无新建容器；删除后 healthz→200 | 通过 |
 | 2026-11-08 | E | 端到端 + 探针 + 端口面 | `42`；`uid=65534`；`NETWORK_BLOCKED`；`ROOTFS_READONLY`；`runtime=runsc`、`network=none`、`capdrop=[ALL]`、`shm=16MB`；timeout 20s→`status=timeout`；同 execution_id 第二次耗时一致；20KB→`truncated=true`；400MB 写入→`exit_code=137` | 通过（修复 2 处缺陷） |
 | 2026-11-08 | F | 告警、重建与 gVisor 回归 | 日志无刷屏；8000 仅 127.0.0.1；告警未验证（节点无 Prometheus）；SBX-09 兼容性未跑 | 部分通过 |
+| 2026-11-09 | F | gVisor 回归（SBX-09） | 节点临时栈（`runtime=runsc`、digest 固定）跑 `gvisor_regression.py`：stdlib/threads/subprocess/files/math 全 PASS；审计流 5 条；无执行容器残留 | 通过（业务依赖缺失另行跟踪） |
 
 **验收中发现并修复的缺陷（2026-11-08）**
 
@@ -506,7 +508,7 @@ except Exception as exc:
 | sandbox-runner 启动报 `SANDBOX_NETWORK`/`SANDBOX_CPU`/`SANDBOX_MEMORY_MB` 不合格 | 生产隔离参数被改回 bridge/host 或资源上限过高 | 恢复 `none` 与 (0, 2.0] 核、(0, 2048] MB；扩容需改代码常量并扩容专用宿主机 |
 | sandbox-runner 启动报 `SANDBOX_ISOLATION_MODE` 无法识别 | 档位值拼错（如 `dedicated-node`） | 只能是 `rootless` 或 `dedicated`；拼错不回落默认，避免隔离预期与部署不一致 |
 | dedicated 档位启动报端点不合格 | `SANDBOX_DOCKER_HOST` 为空或写成 `tcp://` | 专用节点必须显式 `unix:///var/run/docker.sock`（本地 socket，不接受远端守护进程） |
-| dedicated 档位 healthz 503 且 `isolation.foreign_containers` 非空 | 节点混部：存在无 `shop.sandbox.role` 标签（或标签不在 `execution/runner/infra`）的容器 | 移走业务容器；临时维护容器加 `shop.sandbox.role=infra` 标签后重启 runner |
+| dedicated 档位 healthz 503 且 `isolation.foreign_containers` 非空 | 节点混部：容器既无 `shop.sandbox.role ∈ execution/runner/infra` 标签，也不属于 `SANDBOX_NODE_COMPOSE_PROJECTS` 中的 compose 项目 | 移走业务容器；临时维护容器加 `shop.sandbox.role=infra` 标签后重启 runner；用 `-p` 改过项目名时同步 `SANDBOX_NODE_COMPOSE_PROJECTS` |
 | dedicated 档位 healthz 503 且 `isolation.mode_mismatch=true` | 声明 dedicated 却连到 rootless 守护进程 | 按专用节点重新执行 `setup-sandbox-node`；或改回 `rootless` 档位与 rootless socket |
 | 沙箱返回 `unavailable` 且 stderr 提示「专用节点存在非沙箱容器」 | 执行边界独占检查拦截（节点混部） | 清理非沙箱容器；这是预期 fail-closed，不会回退 runc 或本地进程 |
 | 沙箱返回 `unavailable` | 镜像不存在或 Docker 不可达 | 构建 `infra/sandbox`，或接受本地降级 |
