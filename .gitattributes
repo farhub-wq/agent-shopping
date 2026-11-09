@@ -1,0 +1,11 @@
+# 以下文件会被挂载进 Linux 容器执行/解析，或由 make/docker compose 解析，必须保持 LF：
+# core.autocrlf=true 会把它们 checkout 成 CRLF，导致 dash 脚本 / redis ACL 解析失败。
+*.sh        text eol=lf
+*.template  text eol=lf
+*.conf      text eol=lf
+*.js        text eol=lf
+*.sql       text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
