@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host setup-sandbox-node build-sandbox-image
+.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host setup-sandbox-node build-sandbox-image sandbox-gvisor-regression
 
 up:
 	docker compose up --build -d
@@ -42,6 +42,11 @@ setup-sandbox-host:
 # 用 -E 透传 SANDBOX_SETUP_MODE，脚本据此走 dedicated 分支；可选 DOCKER_REGISTRY_MIRRORS。
 setup-sandbox-node:
 	SANDBOX_SETUP_MODE=dedicated sudo -E bash infra/rootless-docker/setup.sh
+
+# gVisor 兼容性回归：逐个 runner 校验 runsc 后跑标准库/线程/子进程/文件等探针。
+# 需要 SANDBOX_RUNNER_URLS（逗号分隔）与 RUNNER_SIGNING_SECRET；可选 SANDBOX_PROBE_MODULES=numpy,pandas
+sandbox-gvisor-regression:
+	python infra/sandbox/gvisor_regression.py
 
 dev-web:
 	cd web && npm install && npm run dev
