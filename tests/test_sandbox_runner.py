@@ -1,6 +1,7 @@
 """sandbox-runner 服务契约测试：鉴权、执行去重、结果映射与 fail-closed 语义。"""
 
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -682,11 +683,17 @@ class _FakeContainer:
 
 
 class _FakeContainerRef:
-    """专用节点独占检查用：只需要 name 与容器标签。"""
+    """独占检查与孤儿回收用：需要 name、标签、创建时间与删除能力。"""
 
-    def __init__(self, name: str, labels: dict[str, str] | None) -> None:
+    def __init__(
+        self, name: str, labels: dict[str, str] | None, created: str = ""
+    ) -> None:
         self.name = name
-        self.attrs = {"Config": {"Labels": labels}}
+        self.attrs = {"Config": {"Labels": labels}, "Created": created}
+        self.removed = False
+
+    def remove(self, force: bool = False) -> None:
+        self.removed = True
 
 
 class _FakeContainers:
@@ -694,6 +701,8 @@ class _FakeContainers:
         self.create_kwargs: dict[str, object] = {}
         self.last_container = None
         self.listed: list[_FakeContainerRef] = []
+        self.list_kwargs: dict[str, object] = {}
+        self.list_error: Exception | None = None
         self._container_factory = container_factory
 
     def create(self, image: str, **kwargs: object) -> _FakeContainer:
@@ -701,7 +710,10 @@ class _FakeContainers:
         self.last_container = self._container_factory()
         return self.last_container
 
-    def list(self) -> list[_FakeContainerRef]:
+    def list(self, **kwargs: object) -> list[_FakeContainerRef]:
+        self.list_kwargs = kwargs
+        if self.list_error is not None:
+            raise self.list_error
         return self.listed
 
 
@@ -1207,6 +1219,103 @@ def test_dedicated_executes_when_node_is_exclusive(monkeypatch):
     # 沙箱栈自身容器（runner / 执行中容器 / infra）不算混部
     assert result.status == "ok"
     assert client.containers.create_kwargs["labels"] == {"shop.sandbox.role": "execution"}
+
+
+def test_dedicated_allows_compose_managed_aux_container(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [
+        _FakeContainerRef(
+            "shop-agent-sandbox-redis-1",
+            {"com.docker.compose.project": "shop-agent-sandbox"},
+        ),
+    ]
+    runner = _runner_with(_prod_dedicated(), client, monkeypatch)
+
+    # compose 自动注入项目标签：配套容器漏打角色标签也不该被判成混部
+    assert runner._run_blocking("print(1)", 5).status == "ok"
+
+
+def test_dedicated_allows_custom_compose_project(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [
+        _FakeContainerRef("sandbox-redis", {"com.docker.compose.project": "sandbox-prod"}),
+    ]
+    runner = _runner_with(
+        _prod_dedicated(sandbox_node_compose_projects="shop-agent-sandbox, sandbox-prod"),
+        client,
+        monkeypatch,
+    )
+
+    # 用 -p 改了项目名时，允许列表要能按配置放行沙箱栈自己的容器
+    assert runner._run_blocking("print(1)", 5).status == "ok"
+
+
+def test_dedicated_rejects_other_compose_project(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [
+        _FakeContainerRef("shop-agent-gateway-1", {"com.docker.compose.project": "shop-agent"}),
+    ]
+    runner = _runner_with(_prod_dedicated(), client, monkeypatch)
+
+    # 业务栈的 compose 容器仍必须判成混部，项目标签豁免只对沙箱栈生效
+    result = runner._run_blocking("print(1)", 5)
+    assert result.status == "unavailable"
+    assert "shop-agent-gateway-1" in result.stderr
+
+
+def test_dedicated_project_exemption_can_be_disabled(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [
+        _FakeContainerRef("sandbox-redis", {"com.docker.compose.project": "shop-agent-sandbox"}),
+    ]
+    runner = _runner_with(
+        _prod_dedicated(sandbox_node_compose_projects=""), client, monkeypatch
+    )
+
+    # 允许列表留空即退回只认角色标签的严格口径，配置项本身不做隐式默认豁免
+    assert runner._run_blocking("print(1)", 5).status == "unavailable"
+
+
+def _created_ago(seconds: float) -> str:
+    # 与 Docker 一致按 RFC3339 构造创建时间，供孤儿回收的年龄判定使用。
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+
+def test_reconcile_removes_only_stale_execution_containers(monkeypatch):
+    client = _FakeDockerClient()
+    stale = _FakeContainerRef(
+        "exec-orphan", {"shop.sandbox.role": "execution"}, _created_ago(600)
+    )
+    fresh = _FakeContainerRef(
+        "exec-running", {"shop.sandbox.role": "execution"}, _created_ago(10)
+    )
+    unknown = _FakeContainerRef("exec-unknown", {"shop.sandbox.role": "execution"})
+    client.containers.listed = [stale, fresh, unknown]
+    runner = _runner_with(
+        ServiceSettings(env="dev", sandbox_timeout_seconds=20), client, monkeypatch
+    )
+
+    removed = runner.reconcile_orphans()
+
+    # 超龄容器回收；执行窗口内和时间不可读的容器保守保留，避免误杀仍在跑的实例。
+    assert removed == ["exec-orphan"]
+    assert stale.removed is True
+    assert fresh.removed is False
+    assert unknown.removed is False
+    # 已退出/停止的容器也要扫：崩溃遗留的退出态容器不会出现在默认运行中列表里。
+    assert client.containers.list_kwargs == {
+        "all": True,
+        "filters": {"label": "shop.sandbox.role=execution"},
+    }
+
+
+def test_reconcile_swallows_docker_failures(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.list_error = RuntimeError("daemon down")
+    runner = _runner_with(ServiceSettings(env="dev"), client, monkeypatch)
+
+    # 回收是兜底能力：守护进程抖动不能打断请求处理与启动流程。
+    assert runner.reconcile_orphans() == []
 
 
 def test_rootless_mode_skips_node_exclusivity_check(monkeypatch):

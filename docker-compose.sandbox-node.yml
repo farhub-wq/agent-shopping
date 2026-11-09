@@ -26,6 +26,9 @@ services:
       # dedicated：允许 rootful socket，但仍强制 runsc / digest 镜像 / network=none /
       # 资源上限，并且每次执行前校验「节点无其他业务容器」。
       SANDBOX_ISOLATION_MODE: dedicated
+      # 沙箱栈的 compose 项目名：配套容器（如节点本地 Redis）由 compose 自动注入项目标签，
+      # 不会因为漏打 shop.sandbox.role 被误判成混部；用 -p 改项目名时需同步该变量。
+      SANDBOX_NODE_COMPOSE_PROJECTS: ${COMPOSE_PROJECT_NAME:-shop-agent-sandbox}
       SANDBOX_DOCKER_HOST: unix:///var/run/docker.sock
       SANDBOX_RUNTIME: runsc
       # 镜像留空默认值：缺省即被 runner 启动守卫拒绝（digest 校验），不会静默跑 :latest。

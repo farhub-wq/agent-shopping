@@ -4,9 +4,10 @@
 调用方必须携带平台签名的身份头与 execution_id，且只允许运营/管理员触发。
 """
 
+import asyncio
 import hashlib
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, Response
@@ -27,6 +28,7 @@ from shop_common.sandbox import EXECUTED_STATUSES, MAX_CODE_CHARS, SandboxResult
 
 from .dedupe import ExecutionDedupe, owner_scope
 from .runner import (
+    ORPHAN_RECONCILE_INTERVAL_SECONDS,
     ConcurrencyGate,
     DockerRunner,
     isolation_mode,
@@ -56,6 +58,17 @@ audit_redis: Redis | None = None
 audit_bus: EventBus | None = None
 
 
+async def _reconcile_orphans_loop() -> None:
+    """后台兜底回收：正常执行由 finally 删除容器，这里只处理 runner 崩溃遗留。"""
+    while True:
+        await asyncio.sleep(ORPHAN_RECONCILE_INTERVAL_SECONDS)
+        try:
+            # Docker SDK 是同步阻塞调用：放线程池，避免拖慢执行与健康检查。
+            await asyncio.to_thread(runner.reconcile_orphans)
+        except Exception:
+            logger.warning("定时孤儿容器回收失败", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global audit_redis, audit_bus
@@ -78,10 +91,20 @@ async def lifespan(_: FastAPI):
     # 审计只发布不消费，不需要 session_factory；独立连接避免与执行锁的 bytes 解码混用。
     audit_redis = create_redis(settings.resolved_sandbox_redis_url)
     audit_bus = EventBus(audit_redis, namespace="shop", session_factory=None)
-    yield
-    await redis_client.aclose()
-    if audit_redis is not None:
-        await audit_redis.aclose()
+    # 孤儿回收兜底：runner 崩溃时 finally 无法执行，遗留容器会持续占用节点资源；
+    # 启动先扫一次，之后按固定间隔后台回收。回收失败只告警，不能阻断启动。
+    await asyncio.to_thread(runner.reconcile_orphans)
+    reconcile_task = asyncio.create_task(_reconcile_orphans_loop())
+    try:
+        yield
+    finally:
+        # 先停回收任务再关 Redis，避免关闭后仍有任务发起 Docker 调用。
+        reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reconcile_task
+        await redis_client.aclose()
+        if audit_redis is not None:
+            await audit_redis.aclose()
 
 
 app = FastAPI(title="sandbox-runner", version="0.1.0", lifespan=lifespan)

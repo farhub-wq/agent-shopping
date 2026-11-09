@@ -130,6 +130,9 @@ class ServiceSettings(BaseSettings):
     # dedicated = 专用沙箱节点上的 rootful dockerd，由「节点独占 + gVisor + digest 镜像」
     # 补偿 rootful socket 等价节点 root 的权限半径。非法值由 runner 启动守卫拒绝。
     sandbox_isolation_mode: str = "rootless"
+    # 专用节点独占判定时，视为沙箱栈成员的 compose 项目名（逗号分隔）。
+    # compose 会自动给容器注入 com.docker.compose.project，配套容器无需手工打角色标签。
+    sandbox_node_compose_projects: str = "shop-agent-sandbox"
 
     @property
     def resolved_database_url(self) -> str:
