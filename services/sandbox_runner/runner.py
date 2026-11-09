@@ -13,6 +13,7 @@ dedicated 允许 rootful socket，但要求节点只运行沙箱自身容器，�
 import asyncio
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 import requests
@@ -41,10 +42,34 @@ ISOLATED_RUNTIMES = frozenset({"runsc"})
 # 隔离档位：rootless 是同机 rootless dockerd；dedicated 是专用节点上的 rootful dockerd。
 ISOLATION_MODES = frozenset({"rootless", "dedicated"})
 
-# 专用节点独占判定：运行中容器只有带这些角色标签的才属于沙箱栈，
-# 其余任何容器都意味着节点混部，rootful socket 的风险半径不再可控。
+# 专用节点独占判定：容器属于沙箱栈有两条依据——
+# 1) 带沙箱角色标签（runner 自身、runner 创建的执行容器）；
+# 2) 属于沙箱栈的 compose 项目，compose 自动注入项目标签，配套容器无需手工打标。
+# 两条都不满足才视为混部，避免新增配套容器漏打角色标签时被误判。
 SANDBOX_CONTAINER_LABEL = "shop.sandbox.role"
 ALLOWED_NODE_ROLES = frozenset({"execution", "runner", "infra"})
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+
+# 孤儿容器回收：正常执行由 finally 删除容器，只有 runner 崩溃才会遗留。
+# 宽限覆盖「超时 + 容器创建/删除开销」，超过该年龄仍存活即可判定为遗留。
+ORPHAN_GRACE_SECONDS = 30
+ORPHAN_RECONCILE_INTERVAL_SECONDS = 60
+
+# Docker 的 Created 是纳秒精度 RFC3339；datetime 只稳定接受微秒，多出的位数先截断。
+_RFC3339_NS_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def _created_epoch(attrs: dict[str, Any]) -> float | None:
+    """解析容器创建时间；拿不到时间时返回 None，调用方按「不确定不删」处理。"""
+    raw = str(attrs.get("Created") or "").strip()
+    if not raw:
+        return None
+    try:
+        normalized = _RFC3339_NS_RE.sub(r"\1", raw).replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
+
 
 # 资源硬上限：配置可以按部署规模上调，但不能无限抬高，否则单个沙箱容器就能压垮宿主。
 MAX_SANDBOX_CPU = 2.0
@@ -62,6 +87,15 @@ def is_image_pinned(image: str) -> bool:
 def isolation_mode(settings: ServiceSettings) -> str:
     """规范化隔离档位；非法值由启动守卫拒绝，运行期不做静默回落。"""
     return settings.sandbox_isolation_mode.strip().lower()
+
+
+def allowed_compose_projects(settings: ServiceSettings) -> frozenset[str]:
+    """解析沙箱栈允许的 compose 项目名；空值表示不按项目豁免，只认角色标签。"""
+    return frozenset(
+        item.strip()
+        for item in settings.sandbox_node_compose_projects.split(",")
+        if item.strip()
+    )
 
 
 def validate_sandbox_isolation(settings: ServiceSettings) -> None:
@@ -170,14 +204,23 @@ class DockerRunner:
         return docker.DockerClient(base_url=endpoint)
 
     def _foreign_containers(self, client) -> list[str]:
-        """列出专用节点上的非沙箱容器；只允许带沙箱角色标签的容器运行。"""
+        """列出专用节点上的非沙箱容器。
+
+        两条豁免依据：带白名单角色标签，或属于配置的沙箱 compose 项目。
+        都不满足即视为混部——不做隐式豁免，宁可误报也不放宽；这样新增
+        配套容器即使漏打角色标签，只要仍由沙箱 compose 管理就不会被误判。
+        """
+        projects = allowed_compose_projects(self.settings)
         foreign: list[str] = []
         for container in client.containers.list():
-            # 标签缺失即视为业务容器：专用节点不做隐式豁免，宁可误报也不放宽。
             labels = (container.attrs.get("Config", {}).get("Labels") or {})
             role = str(labels.get(SANDBOX_CONTAINER_LABEL) or "")
-            if role not in ALLOWED_NODE_ROLES:
-                foreign.append(container.name)
+            project = str(labels.get(COMPOSE_PROJECT_LABEL) or "").strip()
+            if role in ALLOWED_NODE_ROLES:
+                continue
+            if project and project in projects:
+                continue
+            foreign.append(container.name)
         return foreign
 
     def foreign_containers(self) -> list[str]:
@@ -187,6 +230,45 @@ class DockerRunner:
             return self._foreign_containers(client)
         finally:
             client.close()
+
+    def reconcile_orphans(self) -> list[str]:
+        """回收遗留的沙箱执行容器，返回被删除的容器名。
+
+        判定只看「创建时间是否超过 timeout + 宽限」，不看本进程是否在跑：
+        多实例共享同一 Docker 端点时，用进程内状态会误删其他实例正在执行的容器，
+        而正常执行一定会被超时与 finally 收尾，超过时间上界仍存在的只能是遗留物。
+        """
+        client = None
+        removed: list[str] = []
+        try:
+            client = self._client()
+            max_age = max(1, self.settings.sandbox_timeout_seconds + ORPHAN_GRACE_SECONDS)
+            now = time.time()
+            # 已退出的容器也要列出来：正常执行不会留下退出态容器，它们同样是遗留物。
+            containers = client.containers.list(
+                all=True, filters={"label": f"{SANDBOX_CONTAINER_LABEL}=execution"}
+            )
+            for container in containers:
+                created = _created_epoch(container.attrs)
+                # 时间不可信时不删：宁可留一个孤儿，也不能杀掉可能仍在执行的容器。
+                if created is None or now - created <= max_age:
+                    continue
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    # 已被其他实例回收或刚好自行退出：属于正常竞态，无需告警。
+                    logger.debug("孤儿容器删除失败: %s", container.name)
+                    continue
+                removed.append(container.name)
+        except Exception:
+            # 回收是兜底能力，守护进程暂时不可达不应让调用方失败。
+            logger.warning("孤儿容器回收扫描失败", exc_info=True)
+        finally:
+            if client is not None:
+                client.close()
+        if removed:
+            logger.warning("已回收沙箱孤儿容器: %s", ",".join(removed[:10]))
+        return removed
 
     def _node_exclusive(self, client, mode: str) -> tuple[list[str], bool]:
         """执行/健康检查共用的节点独占判定；非 dedicated 档位不校验。"""
