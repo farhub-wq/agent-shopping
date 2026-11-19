@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host setup-sandbox-node build-sandbox-image sandbox-gvisor-regression
+.PHONY: up down logs test lint seed dev-harness dev-sandbox-runner dev-web setup-sandbox-host setup-sandbox-node build-sandbox-image sandbox-gvisor-regression sandbox-coldstart-bench
 
 up:
 	docker compose up --build -d
@@ -47,6 +47,11 @@ setup-sandbox-node:
 # 需要 SANDBOX_RUNNER_URLS（逗号分隔）与 RUNNER_SIGNING_SECRET；可选 SANDBOX_PROBE_MODULES=numpy,pandas
 sandbox-gvisor-regression:
 	python infra/sandbox/gvisor_regression.py
+
+# 冷启动延迟基线（SBX-12 决策前置）：串行跑 N 次空/依赖脚本，统计 runner 侧 duration_ms 分位。
+# 需要 SANDBOX_RUNNER_URLS 与 RUNNER_SIGNING_SECRET；可选 COLDSTART_SAMPLES=30、SANDBOX_PROBE_MODULES=numpy,pandas
+sandbox-coldstart-bench:
+	python infra/sandbox/coldstart_bench.py
 
 dev-web:
 	cd web && npm install && npm run dev
