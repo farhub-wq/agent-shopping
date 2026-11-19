@@ -142,7 +142,7 @@
 
 ### SBX-09~13（P2，待排期）
 
-- **SBX-09 gVisor（☑ 2026-11-09）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。回归脚本 [gvisor_regression.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/gvisor_regression.py) 通过 runner 真实执行链路跑标准库/线程/子进程/文件+sqlite/浮点探针，并支持 `SANDBOX_PROBE_MODULES` 追加业务依赖。**2026-11-09 实测**：节点 `runtime=runsc`、镜像 digest `sha256:e73edb37…` 时 5 项探针全 PASS，审计流写入 5 条、无执行容器残留。注意：沙箱镜像未预装 numpy/pandas，业务依赖需按实际脚本需求增肥镜像（`ModuleNotFoundError` 归为镜像缺依赖，不是 gVisor 不兼容）。
+- **SBX-09 gVisor（☑ 2026-11-09）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。回归脚本 [gvisor_regression.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/gvisor_regression.py) 通过 runner 真实执行链路跑标准库/线程/子进程/文件+sqlite/浮点探针，并支持 `SANDBOX_PROBE_MODULES` 追加业务依赖。**2026-11-09 实测**：节点 `runtime=runsc`、镜像 digest `sha256:e73edb37…` 时 5 项探针全 PASS，审计流写入 5 条、无执行容器残留。注意：沙箱镜像已预装 numpy 2.1.3 / pandas 2.2.3（2026-11-19，重新构建并固定新 digest 后生效）；其他业务依赖需按实际脚本需求增肥镜像（`ModuleNotFoundError` 归为镜像缺依赖，不是 gVisor 不兼容）。
 - **SBX-10 孤儿容器回收（已实施 2026-11-09）**：执行容器带 `shop.sandbox.role=execution` 标签；runner 启动期与每 60s 后台任务扫描**全部**（含已退出）带该标签的容器，删除「创建时间 > `SANDBOX_TIMEOUT_SECONDS + 30s`」的遗留。用创建时间而非进程内状态判定，避免多实例共享端点时误删其他实例正在执行的容器；时间不可读时不删（保守）。回收失败只告警，不阻断启动或请求。**待办**：在专用节点按 RUNBOOK 5.2 F 验证后勾选 ☑。
 - **SBX-11 全局配额**：多 worker 下并发上限除以 worker 数，或引入 Redis 全局信号量；按租户加权配额。
 - **SBX-12 预热池**：镜像分层 + 容器池 / microVM snapshot；先量 P95 冷启动再决定是否投入。
@@ -287,7 +287,7 @@
 
 ### 6.3 gVisor 兼容性
 
-- SBX-09 已于 2026-11-09 在 dedicated 节点完成兼容性回归（5 项探针全 PASS）；沙箱镜像的业务依赖（如 numpy/pandas）仍未预装，需按实际技能脚本需求增肥镜像，部署验收步骤见 [RUNBOOK §5.1](file:///c:/Users/far/Desktop/git/shop-agent/docs/RUNBOOK.md#L276)。
+- SBX-09 已于 2026-11-09 在 dedicated 节点完成兼容性回归（5 项探针全 PASS）；沙箱镜像自 2026-11-19 起预装 numpy 2.1.3 / pandas 2.2.3，需重新构建并固定新 digest 后在节点复跑回归，其他业务依赖仍按实际技能脚本需求增肥镜像，部署验收步骤见 [RUNBOOK §5.1](file:///c:/Users/far/Desktop/git/shop-agent/docs/RUNBOOK.md#L276)。
 - runsc 不支持个别 syscall（部分 io_uring/perf/`/proc` 特性），表现是脚本执行失败，不会静默回落 runc。
 - 若为兼容性放宽运行时，必须显式修改 `ISOLATED_RUNTIMES` 并留变更记录，不要靠环境变量绕过守卫。
 

@@ -384,7 +384,7 @@ except Exception as exc:
 **E. gVisor 兼容性回归（SBX-09）**
 
 - [ ] 控制面执行：`SANDBOX_RUNNER_URLS=http://<runner>:8000 RUNNER_SIGNING_SECRET=<runner 专用密钥> make sandbox-gvisor-regression`。脚本先校验该 runner 的 healthz 为 `runtime=runsc`，再跑标准库、线程、子进程、文件+sqlite、浮点统计探针；任一失败退出码非 0。
-- [ ] 业务计划预装依赖用 `SANDBOX_PROBE_MODULES=numpy,pandas` 追加。失败信息含 `ModuleNotFoundError` 时是「镜像没装依赖」，需增肥 [Dockerfile](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/Dockerfile)；其余多为 runsc syscall 不兼容，记录报错。
+- [ ] 业务依赖探针用 `SANDBOX_PROBE_MODULES=numpy,pandas` 追加（镜像已预装 numpy 2.1.3 / pandas 2.2.3）。其他模块报 `ModuleNotFoundError` 时是「镜像没装该依赖」，需按需增肥 [Dockerfile](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/Dockerfile) 并重新固定 digest；其余多为 runsc syscall 不兼容，记录报错。
 - [ ] 全部通过后，把 [sandbox-hardening.md](file:///c:/Users/far/Desktop/git/shop-agent/docs/design/sandbox-hardening.md) 的 SBX-09 勾选为 ☑ 并写明日期与镜像 digest。
 
 **F. 观测与运维**
@@ -458,7 +458,7 @@ except Exception as exc:
 - [ ] healthz 503 能被告警发现；节点容器清单可作为「混部」巡检项。
 - [x] `docker compose logs sandbox-runner` 无刷屏；节点可整机重建（重建后只需 `.env` + 镜像 digest + compose 文件）。
 - [ ] 孤儿回收：在节点执行 `docker run -d --label shop.sandbox.role=execution --name orphan-probe alpine:3.20 sleep 3600`，等待 `SANDBOX_TIMEOUT_SECONDS + 30` 秒后最多再等一个回收周期（60s），确认容器被删除且 `docker ps -a --filter label=shop.sandbox.role=execution` 为空；同时确认执行中的容器（sleep 脚本跑着时）不会被回收。
-- [x] gVisor 兼容性回归（SBX-09）在 dedicated 档位实测（2026-11-09）：runner 为 `runtime=runsc`、镜像 digest 固定时，`make sandbox-gvisor-regression` 的 5 项探针 stdlib / threads / subprocess / files / math 全部 PASS，审计流写入 5 条 `audit.sandbox.executed`，无执行容器残留。业务依赖（numpy/pandas）未预装，`ModuleNotFoundError` 属镜像缺依赖，需按实际脚本需求增肥镜像。
+- [x] gVisor 兼容性回归（SBX-09）在 dedicated 档位实测（2026-11-09）：runner 为 `runtime=runsc`、镜像 digest 固定时，`make sandbox-gvisor-regression` 的 5 项探针 stdlib / threads / subprocess / files / math 全部 PASS，审计流写入 5 条 `audit.sandbox.executed`，无执行容器残留。本轮之后镜像已预装 numpy 2.1.3 / pandas 2.2.3（2026-11-19，需重新构建并固定新 digest 后生效）；其他业务依赖仍按实际脚本需求增肥镜像，`ModuleNotFoundError` 属镜像缺依赖。
 
 **结果记录**
 
