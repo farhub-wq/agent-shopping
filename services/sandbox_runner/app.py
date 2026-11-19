@@ -10,7 +10,7 @@ import re
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, Response
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
@@ -180,6 +180,7 @@ app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 
 
 async def get_runner_principal(
+    request: Request,
     x_user_id: Annotated[str | None, Header()] = None,
     x_user_role: Annotated[str | None, Header()] = None,
     x_tenant: Annotated[str | None, Header()] = None,
@@ -189,7 +190,11 @@ async def get_runner_principal(
     """runner 专属鉴权：只接受平台专用密钥签名的身份头，明确不接受 Bearer JWT。
 
     JWT 由 gateway/identity 使用；runner 不持有 JWT 密钥，前端令牌泄露也无法直接执行代码。
+    签名必须绑定请求体：harness 与 runner 之间是明文 HTTP，只签身份头无法阻止
+    中间人把 code 换掉后重放（签名仍然有效）。
     """
+    # 必须拿原始字节做摘要：重新序列化 JSON 会改变字节序，导致与发送方摘要不一致。
+    body_sha256 = hashlib.sha256(await request.body()).hexdigest()
     return principal_from_signed_headers(
         user_id=x_user_id,
         role=x_user_role,
@@ -198,6 +203,7 @@ async def get_runner_principal(
         request_id=x_request_id,
         secret=settings.resolved_runner_signing_secret,
         trusted=settings.trust_identity_headers,
+        body_sha256=body_sha256,
     )
 
 

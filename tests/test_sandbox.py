@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import httpx
@@ -88,6 +89,7 @@ async def test_runner_calls_use_dedicated_signing_secret(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update({key.lower(): value for key, value in request.headers.items()})
+        seen["_body"] = request.content
         return httpx.Response(200, json={"status": "ok", "stdout": "42", "backend": "docker"})
 
     manager = _enabled_manager(monkeypatch, handler)
@@ -106,9 +108,23 @@ async def test_runner_calls_use_dedicated_signing_secret(monkeypatch):
         "tenant": "acme",
         "request_id": seen["x-request-id"],
     }
+    body_sha256 = hashlib.sha256(seen["_body"]).hexdigest()
     signature = seen["x-internal-signature"]
-    assert verify_internal_signature(signature, secret=RUNNER_SECRET, **arguments)
-    assert not verify_internal_signature(signature, secret=INTERNAL_SECRET, **arguments)
+    assert verify_internal_signature(
+        signature, secret=RUNNER_SECRET, body_sha256=body_sha256, **arguments
+    )
+    assert not verify_internal_signature(
+        signature, secret=INTERNAL_SECRET, body_sha256=body_sha256, **arguments
+    )
+    # 签名必须绑定请求体：换一份 body 摘要后原签名立即失效
+    assert not verify_internal_signature(
+        signature,
+        secret=RUNNER_SECRET,
+        body_sha256=hashlib.sha256(b'{"code":"print(2)"}').hexdigest(),
+        **arguments,
+    )
+    # 不带摘要的旧式校验也不能通过（防止退回到不绑定 body 的签名）
+    assert not verify_internal_signature(signature, secret=RUNNER_SECRET, **arguments)
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import json
 import shutil
 import sys
 import time
@@ -175,23 +176,27 @@ class SandboxManager:
         if not targets:
             # 没配 runner 就拒绝执行，绝不用本地进程顶替生产沙箱。
             return SandboxResult("unavailable", stderr="未配置 SANDBOX_RUNNER_URLS", backend="remote")
+        # 先把 payload 固化成字节：签名覆盖 body 摘要，发送必须与签名用的是同一份字节。
+        payload = {"code": code, "language": "python", "timeout": timeout}
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         # 身份头必须现签，且使用 runner 专用密钥：业务内网密钥泄露也不等于能驱动沙箱。
         headers = signed_identity_headers(
             user_id,
             role,
             tenant,
             secret=self.settings.resolved_runner_signing_secret,
+            body=body,
         )
         # execution_id 在整次故障转移中保持不变：换 runner 只是换执行者，
         # 由 runner 用 Redis 去重保证同一段代码最多真正跑一次。
         headers["X-Execution-Id"] = uuid.uuid4().hex
-        payload = {"code": code, "language": "python", "timeout": timeout}
+        headers["Content-Type"] = "application/json"
         failures: list[str] = []
         client_timeout = self._runner_budget(timeout)
         async with httpx.AsyncClient(timeout=client_timeout, transport=self.transport) as client:
             for url in targets:
                 try:
-                    response = await client.post(f"{url}/run", json=payload, headers=headers)
+                    response = await client.post(f"{url}/run", content=body, headers=headers)
                 except Exception as exc:
                     self._mark_failure(url)
                     failures.append(f"{url} 不可达({type(exc).__name__})")

@@ -1,6 +1,7 @@
 """sandbox-runner 服务契约测试：鉴权、执行去重、结果映射与 fail-closed 语义。"""
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -91,12 +92,32 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-def _headers(role: str, execution_id: str = "exec-1", user: str = "u-1") -> dict[str, str]:
-    # runner 只接受专用签名密钥签发的身份头，不再接受 Bearer JWT。
+def _body(payload: dict) -> bytes:
+    # httpx 的 json= 用紧凑分隔符且不转义非 ASCII；签名必须绑定与发送完全一致的字节
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _headers(
+    role: str, execution_id: str = "exec-1", user: str = "u-1", body: bytes = b""
+) -> dict[str, str]:
+    # runner 只接受专用签名密钥签发的身份头，且签名必须覆盖请求体
     return {
-        **signed_identity_headers(user, role, "acme", secret=RUNNER_SECRET),
+        **signed_identity_headers(user, role, "acme", secret=RUNNER_SECRET, body=body),
         "X-Execution-Id": execution_id,
     }
+
+
+async def _post(
+    client: httpx.AsyncClient,
+    payload: dict,
+    *,
+    role: str = "operator",
+    execution_id: str = "exec-1",
+    user: str = "u-1",
+):
+    body = _body(payload)
+    headers = {**_headers(role, execution_id, user, body), "Content-Type": "application/json"}
+    return await client.post("/run", content=body, headers=headers)
 
 
 @pytest.mark.asyncio
@@ -110,7 +131,7 @@ async def test_run_rejects_non_staff(monkeypatch):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=_headers("customer"))
+        response = await _post(client, {"code": "print(1)"}, role="customer")
 
     # 客户角色即使能进内网也不允许执行代码；权限由 runner 再做一次校验。
     assert response.status_code == 403
@@ -186,12 +207,37 @@ async def test_run_rejects_internal_signing_secret(monkeypatch):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     # 用业务内网密钥签名：runner 只认自己的专用密钥，泄露内网密钥也不等于能执行代码。
+    body = _body({"code": "print(1)"})
     headers = {
-        **signed_identity_headers("u-1", "operator", "acme", secret=INTERNAL_SECRET),
+        **signed_identity_headers(
+            "u-1", "operator", "acme", secret=INTERNAL_SECRET, body=body
+        ),
         "X-Execution-Id": "exec-1",
+        "Content-Type": "application/json",
     }
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=headers)
+        response = await client.post("/run", content=body, headers=headers)
+
+    assert response.status_code == 401
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_tampered_body(monkeypatch):
+    called: list[bool] = []
+
+    async def fake_run(code: str, *, language: str = "python", timeout: int | None = None):
+        called.append(True)
+        return SandboxResult("ok", stdout="42", backend="docker")
+
+    monkeypatch.setattr(runner_app.runner, "run", fake_run)
+
+    # 签名绑定的是另一份 body：harness→runner 是明文 HTTP，改包后签名必须失效
+    signed_body = _body({"code": "print('benign')"})
+    tampered_body = _body({"code": "print('evil')"})
+    headers = {**_headers("operator", body=signed_body), "Content-Type": "application/json"}
+    async with _client() as client:
+        response = await client.post("/run", content=tampered_body, headers=headers)
 
     assert response.status_code == 401
     assert called == []
@@ -208,9 +254,11 @@ async def test_run_requires_execution_id(monkeypatch):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        headers = _headers("operator")
+        body = _body({"code": "print(1)"})
+        headers = _headers("operator", body=body)
         headers.pop("X-Execution-Id")
-        response = await client.post("/run", json={"code": "print(1)"}, headers=headers)
+        headers["Content-Type"] = "application/json"
+        response = await client.post("/run", content=body, headers=headers)
 
     # 没有 execution_id 就无法做跨实例去重，必须拒绝而不是退化成可重复执行。
     assert response.status_code == 400
@@ -228,10 +276,8 @@ async def test_run_returns_execution_result(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post(
-            "/run",
-            json={"code": "print(42)", "language": "python", "timeout": 5},
-            headers=_headers("operator"),
+        response = await _post(
+            client, {"code": "print(42)", "language": "python", "timeout": 5}
         )
 
     assert response.status_code == 200
@@ -255,7 +301,7 @@ async def test_run_reuses_cached_result_without_executing(monkeypatch, fake_dedu
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+        response = await _post(client, {"code": "print(1)"})
 
     # 命中缓存直接复用第一次的真实结果，绝不再执行一遍。
     assert response.status_code == 200
@@ -271,7 +317,7 @@ async def test_run_reports_docker_unavailable(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+        response = await _post(client, {"code": "print(1)"})
 
     # runner 自身可达但 Docker 不可用时，如实返回 unavailable，由调用方 fail-closed。
     assert response.status_code == 200
@@ -297,7 +343,7 @@ async def test_run_reports_busy_when_queue_full(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+        response = await _post(client, {"code": "print(1)"})
 
     # 并发打满时不执行代码，返回 unavailable 让 harness 转移到其他 runner。
     assert response.status_code == 200
@@ -326,7 +372,7 @@ async def test_run_waits_for_inflight_execution(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+        response = await _post(client, {"code": "print(1)"})
 
     # 另一台 runner 正在执行时，拿不到结果就报「进行中」，绝不重复执行。
     assert response.status_code == 200
@@ -481,14 +527,10 @@ async def test_run_scopes_cached_result_to_principal(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-1"))
+        await _post(client, {"code": "print(1)"}, user="u-1")
         # 另一个 staff 拿到同一个 execution_id：键绑定主体，必须重新执行而不是读到他人结果
-        other = await client.post(
-            "/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-2")
-        )
-        repeat = await client.post(
-            "/run", json={"code": "print(1)"}, headers=_headers("operator", user="u-1")
-        )
+        other = await _post(client, {"code": "print(1)"}, user="u-2")
+        repeat = await _post(client, {"code": "print(1)"}, user="u-1")
 
     assert other.json()["stdout"] == "secret"
     assert executed == ["print(1)", "print(1)"]
@@ -547,7 +589,7 @@ async def test_run_audits_real_execution(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        await client.post("/run", json={"code": "print(1)"}, headers=_headers("operator"))
+        await _post(client, {"code": "print(1)"})
 
     # 真正跑过容器的执行必须留审计记录，且归属到发起该次执行的主体
     assert calls == [("u-1", "exec-1", "print(1)")]
@@ -567,9 +609,7 @@ async def test_run_audits_infra_error_and_caches_it(monkeypatch, fake_dedupe):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post(
-            "/run", json={"code": "print(1)"}, headers=_headers("operator")
-        )
+        response = await _post(client, {"code": "print(1)"})
 
     # 已发生执行尝试要留审计证据；同时写缓存，保证同一 execution_id 重试不会换 runner 重复执行。
     assert response.json()["status"] == "infra_error"
@@ -593,9 +633,7 @@ async def test_run_skips_execution_when_attempt_tombstone_exists(monkeypatch, fa
     fake_dedupe.mark_started_result = False
 
     async with _client() as client:
-        response = await client.post(
-            "/run", json={"code": "print(1)"}, headers=_headers("operator")
-        )
+        response = await _post(client, {"code": "print(1)"})
 
     # 前一次尝试可能已经执行过：直接返回 infra_error，绝不能再开容器。
     assert response.json()["status"] == "infra_error"
@@ -611,9 +649,7 @@ async def test_run_clears_tombstone_when_runner_did_not_execute(monkeypatch, fak
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post(
-            "/run", json={"code": "print(1)"}, headers=_headers("operator")
-        )
+        response = await _post(client, {"code": "print(1)"})
 
     # 容器没有启动就没有执行痕迹：清墓碑，允许 harness 正常故障转移。
     assert response.json()["status"] == "unavailable"
@@ -921,9 +957,7 @@ async def test_run_rejects_non_positive_timeout(monkeypatch):
     monkeypatch.setattr(runner_app.runner, "run", fake_run)
 
     async with _client() as client:
-        response = await client.post(
-            "/run", json={"code": "print(1)", "timeout": 0}, headers=_headers("operator")
-        )
+        response = await _post(client, {"code": "print(1)", "timeout": 0})
 
     # 0/负数超时在入口直接拒绝，不进入执行与缓存流程
     assert response.status_code == 422

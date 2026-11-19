@@ -47,14 +47,34 @@ def decode_token(token: str) -> dict[str, Any]:
         raise ApiError("UNAUTHORIZED", "登录凭证无效或已过期") from exc
 
 
-def create_internal_signature(*, user_id: str, role: str, tenant: str, ts: str, request_id: str, secret: str) -> str:
-    """网关给下游的签名：把身份五元组用 HMAC-SHA256 摘要，防内网身份头被篡改。"""
+def create_internal_signature(
+    *,
+    user_id: str,
+    role: str,
+    tenant: str,
+    ts: str,
+    request_id: str,
+    secret: str,
+    body_sha256: str | None = None,
+) -> str:
+    """网关给下游的签名：把身份五元组用 HMAC-SHA256 摘要，防内网身份头被篡改。
+
+    传入 `body_sha256` 时把请求体摘要一并纳入签名：服务间是明文 HTTP，
+    只签身份头的话中间人可以在保持签名有效的前提下改写 body（例如换掉沙箱代码）。
+    """
     msg = f"{user_id}|{role}|{tenant}|{ts}|{request_id}"
+    if body_sha256:
+        msg = f"{msg}|{body_sha256}"
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 
 def signed_identity_headers(
-    user_id: str, role: str, tenant: str = "default", *, secret: str | None = None
+    user_id: str,
+    role: str,
+    tenant: str = "default",
+    *,
+    secret: str | None = None,
+    body: bytes | None = None,
 ) -> dict[str, str]:
     """服务间调用使用的身份头：现签时间戳 + 请求号，下游按签名校验身份。
 
@@ -71,6 +91,8 @@ def signed_identity_headers(
         ts=ts,
         request_id=request_id,
         secret=key,
+        # 有请求体时必须绑定摘要，否则签名不覆盖 payload
+        body_sha256=hashlib.sha256(body).hexdigest() if body is not None else None,
     )
     return {
         "X-User-Id": user_id,
@@ -90,6 +112,7 @@ def verify_internal_signature(
     request_id: str,
     secret: str,
     max_skew_seconds: int = 30,
+    body_sha256: str | None = None,
 ) -> bool:
     """校验 `ts.hmac` 形式的签名；超出时间窗或摘要不一致都判无效。"""
     try:
@@ -99,7 +122,15 @@ def verify_internal_signature(
         return False
     if skew > max_skew_seconds:
         return False
-    expected = create_internal_signature(user_id=user_id, role=role, tenant=tenant, ts=ts, request_id=request_id, secret=secret)
+    expected = create_internal_signature(
+        user_id=user_id,
+        role=role,
+        tenant=tenant,
+        ts=ts,
+        request_id=request_id,
+        secret=secret,
+        body_sha256=body_sha256,
+    )
     return hmac.compare_digest(sig, expected)
 
 
@@ -132,6 +163,7 @@ def principal_from_signed_headers(
     request_id: str | None,
     secret: str,
     trusted: bool,
+    body_sha256: str | None = None,
 ) -> Principal:
     """只按签名身份头解析主体：供 runner 等不接收 Bearer JWT 的服务复用。"""
     if not user_id:
@@ -148,6 +180,7 @@ def principal_from_signed_headers(
         tenant=tenant or "default",
         request_id=request_id,
         secret=secret,
+        body_sha256=body_sha256,
     ):
         raise ApiError("UNAUTHORIZED", "身份头签名无效或已过期")
     return Principal(user_id, role or "customer", tenant or "default")
