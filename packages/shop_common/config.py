@@ -45,8 +45,9 @@ class ServiceSettings(BaseSettings):
     # 本地演示用的自选角色换 token 接口：只在 env=dev 且显式开启时挂载，生产必须关闭
     auth_dev_mode: bool = False
     # 管理员 TOTP 共享密钥的对称加密主密钥（Fernet，32 字节 urlsafe-base64）。
-    # 生产必须注入独立密钥，dev 默认值仅保证本地/单测可跑，明文密钥与 JWT_SECRET 同等级对待。
-    mfa_encryption_key: str = "0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU="
+    # dev 默认值是 32 个 '0' 的 base64 编码，公开可推导，仅保证本地/单测可跑。
+    # 生产必须注入独立随机密钥，启动守卫会拒绝此默认值。
+    mfa_encryption_key: str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
 
     catalog_url: str = "http://localhost:8001"
     inventory_url: str = "http://localhost:8002"
@@ -177,7 +178,7 @@ DEV_SECRET_DEFAULTS = {
     "internal_signing_secret": "dev-internal-signing-secret",
     "runner_signing_secret": "dev-runner-signing-secret",
     "payment_webhook_secret": "dev-payment-webhook-secret",
-    "mfa_encryption_key": "0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU=",
+    "mfa_encryption_key": "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
     # 业务 Redis 的 default 用户密码，生产必须替换
     "redis_password": "dev-redis-password",
 }

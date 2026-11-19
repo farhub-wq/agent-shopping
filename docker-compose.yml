@@ -7,7 +7,7 @@ x-service-env: &service-env
   JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
   # 本地开发默认信任网关签名的身份头；生产 overlay 里会关掉
   INTERNAL_SIGNING_SECRET: ${INTERNAL_SIGNING_SECRET:-dev-internal-signing-secret}
-  MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-0y5-6ym0zsmuIEBUg5OL133pRODLkiRFpQhgbIVZWmU=}
+  MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=}
   TRUST_IDENTITY_HEADERS: ${TRUST_IDENTITY_HEADERS:-true}
   AUTH_DEV_MODE: ${AUTH_DEV_MODE:-false}
   ENV: ${ENV:-dev}
