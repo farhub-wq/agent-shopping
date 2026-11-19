@@ -37,8 +37,8 @@
 | SBX-09 | P2 | 隔离升级 | 未启用 gVisor（`runsc`），共享内核 CVE 面未收敛 | ☑ 2026-11-09 |
 | SBX-10 | P2 | 生命周期 | runner 崩溃时容器可能残留，无 reconcile 回收 | ◐ 2026-11-09 |
 | SBX-11 | P2 | 并发配额 | 并发闸门为进程内 Semaphore，多 worker 时总并发 = 上限 × worker 数，跨 runner 无全局配额 | ☐ |
-| SBX-12 | P2 | 冷启动 | 一次一容器无预热池，冷启动直接计入用户等待 | ☐ |
-| SBX-13 | P2 | 参数硬编码 | 结果缓存 TTL 固定 300s、锁 TTL 硬编码推导，未随执行超时配置联动 | ☐ |
+| SBX-12 | P2 | 冷启动 | 一次一容器无预热池，冷启动直接计入用户等待 | ◐ 2026-11-19 测量就绪 |
+| SBX-13 | P2 | 参数硬编码 | 结果缓存 TTL 固定 300s、锁 TTL 硬编码推导，未随执行超时配置联动 | ☑ 2026-11-19 |
 | SBX-14 | P2 | 输入边界 | harness 侧 `SandboxRequest.code` 无长度上限，超限请求要跨网传到 runner 才被拒 | ☑ 2026-11-08 |
 | SBX-15 | P1 | 密钥半径 | runner 同时持有 `JWT_SECRET`/`INTERNAL_SIGNING_SECRET`，并与业务服务共用 Redis 凭据；被攻破后能伪造任意 staff 身份、读写全部业务数据 | ☑ 2026-11-08 |
 | SBX-16 | P1 | 凭据隔离 | Redis `default` 用户为 `nopass +@all`，runner 被攻破后可匿名连接绕过受限 ACL，直接读写全库 | ☑ 2026-11-08 |
@@ -144,9 +144,9 @@
 
 - **SBX-09 gVisor（☑ 2026-11-09）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。回归脚本 [gvisor_regression.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/gvisor_regression.py) 通过 runner 真实执行链路跑标准库/线程/子进程/文件+sqlite/浮点探针，并支持 `SANDBOX_PROBE_MODULES` 追加业务依赖。**2026-11-09 实测**：节点 `runtime=runsc`、镜像 digest `sha256:e73edb37…` 时 5 项探针全 PASS，审计流写入 5 条、无执行容器残留。**2026-11-19 复测**（节点 <沙箱节点公网IP>，镜像已重建并固定为 `sha256:db172ccc…`，预装 numpy 2.1.3 / pandas 2.2.3）：healthz 显示 `runsc + dedicated + node_exclusive + image_pinned`，回归 6 项（stdlib / threads / subprocess / files / math / deps）全 PASS，无执行容器残留。其他业务依赖需按实际脚本需求增肥镜像（`ModuleNotFoundError` 归为镜像缺依赖，不是 gVisor 不兼容）。
 - **SBX-10 孤儿容器回收（已实施 2026-11-09）**：执行容器带 `shop.sandbox.role=execution` 标签；runner 启动期与每 60s 后台任务扫描**全部**（含已退出）带该标签的容器，删除「创建时间 > `SANDBOX_TIMEOUT_SECONDS + 30s`」的遗留。用创建时间而非进程内状态判定，避免多实例共享端点时误删其他实例正在执行的容器；时间不可读时不删（保守）。回收失败只告警，不阻断启动或请求。**已验证（2026-11-19，节点 <沙箱节点公网IP>）**：人工遗留容器在阈值（50s）前不删，t0+109s 被回收并打印 `已回收沙箱孤儿容器`；同期 15s 真实执行返回 `status=ok`，未被误回收。
-- **SBX-11 全局配额**：多 worker 下并发上限除以 worker 数，或引入 Redis 全局信号量；按租户加权配额。
-- **SBX-12 预热池**：镜像分层 + 容器池 / microVM snapshot；先量 P95 冷启动再决定是否投入。
-- **SBX-13 TTL 联动**：结果缓存 TTL 与锁 TTL 从 `sandbox_timeout_seconds` 推导，避免改超时后去重窗口失配。
+- **SBX-11 全局配额（☐ 降级为扩容前置项，2026-11-19 评估）**：`ConcurrencyGate` 是进程内 `asyncio.Semaphore`，且 runner 为单 uvicorn 进程（[infra/Dockerfile](file:///c:/Users/far/Desktop/git/shop-agent/infra/Dockerfile#L42) 无 `--workers`）。**当前部署形态（单沙箱节点、单 runner 实例）下进程内信号量即全局配额**，`SANDBOX_MAX_CONCURRENCY` 就是全系统并发上界，不会失控，故暂不实施代码。**扩容前置条件**：一旦给 runner 加 `--workers`、加副本、或加第二个沙箱节点，总并发 = 上限 × 进程数且跨节点无全局配额，必须先引入 Redis 全局信号量（`INCR/DECR` + `EXPIRE` 兜底）再扩容；按租户加权配额为可选增强。
+- **SBX-12 预热池（◐ 已测基线，暂不投入）**：镜像分层 + 容器池 / microVM snapshot；先量 P95 冷启动再决定是否投入。已新增 [coldstart_bench.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/coldstart_bench.py)（`make sandbox-coldstart-bench`）：串行跑 N 次空脚本与 import 依赖脚本，统计 runner 侧 `duration_ms` 分位（warmup 丢弃 3 次）。**2026-11-19 实测（沙箱节点 runsc + dedicated，n=30）**：空脚本 p95=438ms（纯容器冷启动，含容器 create/start/logs + 节点独占检查）；import numpy+pandas p95=3471ms。**结论：瓶颈在 numpy/pandas 的 import 开销（~3s，每次新 Python 进程都要付，runsc 拦截 syscall 放大了 C 扩展加载），不在容器创建（仅 ~0.4s）**。简单 warm 容器池只能省 0.4s，收益有限；真正消除 3s 需要常驻进程池（预 import 依赖后 `exec` 代码），复杂度和隔离风险高（见 D7）。中小企业非交互数据分析场景 3.5s 通常可接受，暂不投入；若未来交互场景延迟敏感再评估常驻进程池。
+- **SBX-13 TTL 联动（☑ 2026-11-19）**：原实现锁 TTL 已随超时联动（`timeout + 20`），但结果缓存 TTL 固定 300s、`dedupe_wait` 固定 5s，改 `SANDBOX_TIMEOUT_SECONDS` 后去重窗口与超时失配。已实施：新增 [dedupe.py](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/dedupe.py) 的 `dedupe_ttls()`，锁 TTL = 超时 + 20s（兜崩溃）、结果缓存 TTL = 超时 + 60s（≥ 锁 TTL，保证同一 `execution_id` 的故障转移重试在结果写入后仍复用同一次结论），墓碑 TTL 因 `max(result_ttl, lock_ttl+30)` 与结果缓存同时过期、不留缝隙；[app.py](file:///c:/Users/far/Desktop/git/shop-agent/services/sandbox_runner/app.py) 构造 `ExecutionDedupe` 时统一从 `dedupe_ttls()` 取值。**取舍**：`dedupe_wait` 不随超时联动——它是「锁被占用时短轮询复用结果的耐心上界」，不是去重窗口，随超时线性放大只会让本实例长时间占着连接空等；仍由 `SANDBOX_DEDUPE_WAIT_SECONDS` 独立配置。**验证**：`test_dedupe_ttls_derives_from_timeout`、`test_derived_ttls_keep_tombstone_in_sync_with_result`。
 
 ### SBX-14 输入边界（P2，已关闭）
 
@@ -315,7 +315,7 @@
 
 ### 6.7 仍需记住的未解决项
 
-- 本轮已关闭 SBX-07/08/14/15/16/18；SBX-09 于 2026-11-09 完成 dedicated 节点兼容性回归，并于 2026-11-19 在节点 <沙箱节点公网IP> 重建镜像（`sha256:db172ccc…`，含 numpy/pandas）后复跑通过；SBX-17 已完成专用节点验收（<沙箱节点公网IP>）与 2026-11-19 的控制面 `/sandbox/health`、`/sandbox/run`、dedicated Prometheus 抓取/告警链路验证（生产形态待同 VPC 业务主机落地）；SBX-10 已于 2026-11-19 完成专用节点回收实测；未覆盖：SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
+- 本轮已关闭 SBX-07/08/14/15/16/18；SBX-09 于 2026-11-09 完成 dedicated 节点兼容性回归，并于 2026-11-19 在节点 <沙箱节点公网IP> 重建镜像（`sha256:db172ccc…`，含 numpy/pandas）后复跑通过；SBX-17 已完成专用节点验收（<沙箱节点公网IP>）与 2026-11-19 的控制面 `/sandbox/health`、`/sandbox/run`、dedicated Prometheus 抓取/告警链路验证（生产形态待同 VPC 业务主机落地）；SBX-10 已于 2026-11-19 完成专用节点回收实测；未覆盖：SBX-12 冷启动（已测基线：空脚本 p95 438ms、numpy/pandas p95 3471ms，瓶颈在 import 而非容器创建，暂不投入预热池）；SBX-11 已评估为扩容前置项（单 runner 形态下进程内信号量即全局配额，横向扩容前必须先上 Redis 全局信号量）；SBX-13 已于 2026-11-19 完成 TTL 联动。
 - Redis 的 ACL 与密码已收敛到凭据层，但网络可达面仍需部署侧限制：生产 Redis 不应暴露到公网，并应定期轮换 `REDIS_PASSWORD` / `SANDBOX_REDIS_PASSWORD`。
 - 沙箱执行的审计证据是 `audit.sandbox.executed` 事件，只含哈希不含明文；事故复盘需要代码或输出原文时，只能靠调用方自己的留存，不要去审计库里找明文。
 - `untrusted_output` 标记只在单次运行内生效：同一次工具循环里会拦住写入，下一轮会话会重新建模。跨轮会话的高危操作仍依赖审批，不能假设标记一直在。
@@ -376,3 +376,6 @@ docker compose config -q
 | 2026-11-08 | 验收修复：`container.wait` 读超时被 urllib3 2.x 包装为 `ConnectionError`，按 `read timed out` 文本映射回 `timeout`，避免超时被固化为 `infra_error` |
 | 2026-11-08 | 构建可移植性：`infra/Dockerfile` 新增 `APT_MIRROR` / `PIP_INDEX_URL` / `PIP_TRUSTED_HOST` 构建参数，默认官方源，受限网络改用内网镜像 |
 | 2026-11-19 | SBX-17 控制面与监控：节点 8000 绑私网 `<沙箱节点私网IP>`；`/sandbox/health` 与 `/sandbox/run` 隧道验证通过；新增 `sandbox-runner-node` file_sd 抓取 job 并泛化 `SandboxRunnerDown`，告警 pending/firing 实测通过 |
+| 2026-11-19 | SBX-13 关闭：新增 `dedupe_ttls()`，去重锁 TTL（超时+20s）与结果缓存 TTL（超时+60s）均从 `SANDBOX_TIMEOUT_SECONDS` 派生，墓碑与结果缓存同时过期；`dedupe_wait` 保持独立配置不联动 |
+| 2026-11-19 | SBX-12 测量就绪：新增 `infra/sandbox/coldstart_bench.py` + `make sandbox-coldstart-bench`，串行采样空/依赖脚本的 `duration_ms` 分位，作为预热池投入决策的 P95 基线 |
+| 2026-11-19 | SBX-12 实测（沙箱节点 runsc）：空脚本 p95=438ms、numpy/pandas p95=3471ms，瓶颈在依赖 import（~3s）而非容器创建，暂不投入预热池；顺带修复 `gvisor_regression.py`/`coldstart_bench.py` 签名未绑定 body 导致 401 的问题 |
