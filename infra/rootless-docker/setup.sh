@@ -14,10 +14,14 @@
 #   sudo -E SANDBOX_SETUP_MODE=dedicated bash infra/rootless-docker/setup.sh
 #   # 专用节点可选镜像加速（逗号分隔，仅写入 rootful daemon.json）：
 #   sudo -E SANDBOX_SETUP_MODE=dedicated DOCKER_REGISTRY_MIRRORS=https://mirror.example bash infra/rootless-docker/setup.sh
+#   # Docker 官方 apt 源不可达时（如国内云主机），换用镜像站：
+#   sudo -E SANDBOX_SETUP_MODE=dedicated DOCKER_APT_MIRROR=https://mirrors.cloud.tencent.com/docker-ce bash infra/rootless-docker/setup.sh
 set -euo pipefail
 
 SANDBOX_USER="${SANDBOX_USER:-sandbox}"
 SANDBOX_SETUP_MODE="${SANDBOX_SETUP_MODE:-rootless}"
+# Docker apt 源基址，必须与官方目录结构一致（/linux/<distro>）；默认官方源。
+DOCKER_APT_MIRROR="${DOCKER_APT_MIRROR:-https://download.docker.com}"
 RUNSC_RUNTIME="runsc"
 
 log() { printf '[setup-sandbox-host] %s\n' "$*"; }
@@ -42,12 +46,12 @@ RUNSC_BIN=""
 add_docker_repo() {
   install -m 0755 -d /etc/apt/keyrings
   if [ ! -f /etc/apt/keyrings/docker.asc ]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    curl -fsSL "${DOCKER_APT_MIRROR}/linux/ubuntu/gpg" -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
   fi
   # shellcheck disable=SC1091
   . /etc/os-release
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${DOCKER_APT_MIRROR}/linux/${ID} ${VERSION_CODENAME} stable" \
     > /etc/apt/sources.list.d/docker.list
   apt-get update -qq
 }
