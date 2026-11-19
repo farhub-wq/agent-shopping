@@ -28,6 +28,15 @@ scrape_configs:
           - payment:8000
           - audit:8000
 
+  # 专用沙箱节点（dedicated）：节点上的 runner 只绑私网地址，由同 VPC 业务栈 Prometheus 直抓。
+  # 目标写进 file_sd 文件，默认空数组；业务主机就位后填 [{"targets":["<节点私网IP>:8000"]}] 即可，
+  # 不用改本文件也不用重启 Prometheus（刷新周期 30s，也可以 SIGHUP 立即生效）。
+  - job_name: "sandbox-runner-node"
+    metrics_path: /metrics
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/sandbox-runner.json"]
+        refresh_interval: 30s
+
   # Prometheus 自身：观测观测系统
   - job_name: "prometheus"
     static_configs:

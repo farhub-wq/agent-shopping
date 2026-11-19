@@ -114,14 +114,15 @@ groups:
           runbook: docs/RUNBOOK.md
 
       # 沙箱 runner 抓取失败：目标不在线或端口未监听。
-      # 专用节点部署时 instance 标签是节点私网地址，需同步改成实际抓取目标。
+      # 单机 compose 抓 sandbox-runner:8000；专用节点抓 sandbox-runner-node job（节点私网地址）。
+      # 两条分支同时覆盖，专用节点启用与否都不需要改这里。
       - alert: SandboxRunnerDown
-        expr: up{instance="sandbox-runner:8000"} == 0
+        expr: up{instance="sandbox-runner:8000"} == 0 or up{job="sandbox-runner-node"} == 0
         for: 2m
         labels: { severity: P1 }
         annotations:
-          summary: "沙箱 runner 不可用"
-          description: "连续 2 分钟抓取不到 sandbox-runner:8000，沙箱执行已 fail-closed 拒绝，检查 runner 容器与节点。"
+          summary: "沙箱 runner 不可用（{{ $labels.instance }}）"
+          description: "连续 2 分钟抓取不到 {{ $labels.instance }}，沙箱执行已 fail-closed 拒绝，检查 runner 容器与节点网络。"
           runbook: docs/RUNBOOK.md
 
       # healthz 判死：隔离退化、节点混部、镜像未固定等，均代表安全基线被破坏。

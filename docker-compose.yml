@@ -288,6 +288,8 @@ services:
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # 专用节点抓取目标（file_sd），默认空；同 VPC 部署时写入节点私网地址
+      - ./infra/prometheus/targets:/etc/prometheus/targets:ro
       - prometheusdata:/prometheus
     ports: ["9090:9090"]
 
