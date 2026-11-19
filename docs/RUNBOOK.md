@@ -433,7 +433,7 @@ except Exception as exc:
 **C. 健康与隔离档位**
 
 - [x] `curl -fsS http://$NODE:8000/healthz` 期望 `status=ok`、`isolation.mode=dedicated`、`isolation.node_exclusive=true`、`docker.rootless=false`、`docker.runtime_ok=true`、`image_pinned=true`、`security.secrets_configured=true`。
-- [ ] 业务侧 `/sandbox/health` 期望 `enabled=true`、`backend=remote`、对应 runner 状态 `ok`。
+- [x] 业务侧 `/sandbox/health`（2026-11-19，临时 harness 容器 + SSH 隧道指向节点 `<沙箱节点私网IP>:8000`）：`enabled=true`、`backend=remote`、`runners.status=ok`，runner 返回 `isolation.mode=dedicated`、`node_exclusive=true`、`image_pinned=true`、`security.auth=signed_headers_only`；同链路 `/sandbox/run` 返回 `status=ok`、`stdout="control-plane-e2e 42"`。
 
 **D. 节点独占强制（核心验收项）**
 
@@ -449,16 +449,17 @@ except Exception as exc:
 - [x] 实际运行时为 runsc：执行 sleep 脚本期间在节点运行
   `docker ps -q | xargs -r docker inspect --format '{{.HostConfig.Runtime}} {{.Config.Image}} {{.Config.Labels}}'`
   期望 `runsc sha256:... map[shop.sandbox.role:execution]`。
-- [x] 端口暴露面：节点 `ss -lntp` 中 8000 只绑 `$NODE:8000`（或 127.0.0.1），无 3306/6379/27017。
+- [x] 端口暴露面：节点 `ss -lntp` 中 8000 只绑 `$NODE:8000`（或 127.0.0.1），无 3306/6379/27017。2026-11-19 起正式绑私网 `<沙箱节点私网IP>:8000`，公网不可达。
 - [ ] fail-closed：停掉 runner 后沙箱调用 `status=unavailable`，harness 日志无「本地子进程执行」。
 - [x] 内存炸弹与输出刷屏按 §5.1 D 同法验证；节点磁盘与内存保持稳定。
 
 **F. 观测与运维**
 
-- [ ] healthz 503 能被告警发现；节点容器清单可作为「混部」巡检项。
+- [x] 告警发现（2026-11-19）：业务 Prometheus 新增 `sandbox-runner-node` job（file_sd，目标文件 `infra/prometheus/targets/sandbox-runner.json`，默认空）。经隧道把目标指向节点后 `up=1` 且沙箱指标入库；改为死端口后 `SandboxRunnerDown` 80s 进入 pending、160s 转 firing；恢复空目标并重启后无该 job 目标。
 - [x] `docker compose logs sandbox-runner` 无刷屏；节点可整机重建（重建后只需 `.env` + 镜像 digest + compose 文件）。
-- [ ] 孤儿回收：在节点执行 `docker run -d --label shop.sandbox.role=execution --name orphan-probe alpine:3.20 sleep 3600`，等待 `SANDBOX_TIMEOUT_SECONDS + 30` 秒后最多再等一个回收周期（60s），确认容器被删除且 `docker ps -a --filter label=shop.sandbox.role=execution` 为空；同时确认执行中的容器（sleep 脚本跑着时）不会被回收。
-- [x] gVisor 兼容性回归（SBX-09）在 dedicated 档位实测（2026-11-09）：runner 为 `runtime=runsc`、镜像 digest 固定时，`make sandbox-gvisor-regression` 的 5 项探针 stdlib / threads / subprocess / files / math 全部 PASS，审计流写入 5 条 `audit.sandbox.executed`，无执行容器残留。本轮之后镜像已预装 numpy 2.1.3 / pandas 2.2.3（2026-11-19，需重新构建并固定新 digest 后生效）；其他业务依赖仍按实际脚本需求增肥镜像，`ModuleNotFoundError` 属镜像缺依赖。
+- [x] 孤儿回收（2026-11-19，节点 <沙箱节点公网IP>）：`docker run -d --label shop.sandbox.role=execution --name orphan-probe shop-agent-sandbox:latest sleep 3600`（节点无 alpine，改用沙箱镜像，语义不变）。t0+40s 仍存在（未越过 `SANDBOX_TIMEOUT_SECONDS + 30` = 50s 阈值）；t0+52s 起跑 15s 真实执行返回 `status=ok`，进行中容器未被回收；t0+109s 孤儿被删除，`shop.sandbox.role=execution` 计数归 0，healthz 200，runner 日志输出 `已回收沙箱孤儿容器: orphan-probe`，无报错。
+- [x] gVisor 兼容性回归（SBX-09）在 dedicated 档位实测（2026-11-09）：runner 为 `runtime=runsc`、镜像 digest 固定时，`make sandbox-gvisor-regression` 的 5 项探针 stdlib / threads / subprocess / files / math 全部 PASS，审计流写入 5 条 `audit.sandbox.executed`，无执行容器残留。
+- [x] 镜像重建与复跑（2026-11-19，节点 <沙箱节点公网IP>）：在节点用同一份 `infra/sandbox/Dockerfile`（MD5 一致）执行 `docker build`（层缓存命中，pip 层未变），新 digest `SANDBOX_IMAGE=sha256:db172ccc…` 已写入节点 `.env` 并 `--force-recreate` runner；`docker history` 可见 `pip install numpy==2.1.3 pandas==2.2.3` 层。回归加跑 `SANDBOX_PROBE_MODULES=numpy,pandas`：healthz + stdlib / threads / subprocess / files / math / deps 共 6 项全 PASS，无 `shop.sandbox.role=execution` 残留容器。其他业务依赖仍按实际脚本需求增肥镜像，`ModuleNotFoundError` 属镜像缺依赖。
 
 **结果记录**
 
@@ -471,6 +472,10 @@ except Exception as exc:
 | 2026-11-08 | E | 端到端 + 探针 + 端口面 | `42`；`uid=65534`；`NETWORK_BLOCKED`；`ROOTFS_READONLY`；`runtime=runsc`、`network=none`、`capdrop=[ALL]`、`shm=16MB`；timeout 20s→`status=timeout`；同 execution_id 第二次耗时一致；20KB→`truncated=true`；400MB 写入→`exit_code=137` | 通过（修复 2 处缺陷） |
 | 2026-11-08 | F | 告警、重建与 gVisor 回归 | 日志无刷屏；8000 仅 127.0.0.1；告警未验证（节点无 Prometheus）；SBX-09 兼容性未跑 | 部分通过 |
 | 2026-11-09 | F | gVisor 回归（SBX-09） | 节点临时栈（`runtime=runsc`、digest 固定）跑 `gvisor_regression.py`：stdlib/threads/subprocess/files/math 全 PASS；审计流 5 条；无执行容器残留 | 通过（业务依赖缺失另行跟踪） |
+| 2026-11-19 | F | 孤儿回收（节点 <沙箱节点公网IP>） | `orphan-probe`（`shop-agent-sandbox:latest sleep 3600`）t0+40s 仍在；t0+52s 起 15s 真实执行 `status=ok`；t0+109s 回收，日志 `已回收沙箱孤儿容器: orphan-probe`，标签计数 0，healthz 200 | 通过 |
+| 2026-11-19 | B/F | 镜像重建后复跑（节点 <沙箱节点公网IP>） | Dockerfile MD5 与仓库一致；重建后镜像 `sha256:db172ccc…` 含 numpy 2.1.3 / pandas 2.2.3 且已写入 `.env`，runner `--force-recreate` 后 healthy；healthz `runsc + dedicated + node_exclusive + image_pinned`；回归 6 项（含 deps）全 PASS；无执行容器残留 | 通过 |
+| 2026-11-19 | C | 控制面 `/sandbox/health` + `/sandbox/run`（节点 <沙箱节点私网IP>） | 临时 harness 容器经隧道：`enabled=true`、`backend=remote`、`runners.status=ok`、`mode=dedicated`、`node_exclusive=true`、`image_pinned=true`；真实执行 `status=ok`、`stdout="control-plane-e2e 42"` | 通过（生产需同 VPC 业务主机） |
+| 2026-11-19 | F | dedicated Prometheus 接入 | 新增 `sandbox-runner-node` file_sd job，目标指向节点后 `up=1`、`sandbox_runner_healthy=1` 入库；死端口 80s pending、160s firing；恢复空目标并重启后无该 job 目标 | 通过（目标文件待填入同 VPC 节点地址） |
 
 **验收中发现并修复的缺陷（2026-11-08）**
 
@@ -529,3 +534,28 @@ except Exception as exc:
 
 - `docker compose up` 端到端（当前环境 Docker daemon 未运行，且启动守护进程属于需用户确认的系统操作）
 - 部署机沙箱上线验证：按 §5.1 清单逐项执行（rootless 构建端点、镜像可见性、runsc 实际生效、隔离探针、gVisor 兼容性、fail-closed、告警）
+
+## 8. 腾讯云安全组收窄（2026-11-19）
+
+自建 Redis 不挂独立安全组，收窄对象是业务 CVM（广州 `<CVM实例ID>`）的安全组 `<安全组ID>` 入站规则。收窄后共 6 条，删除了 `0.0.0.0/0 → ALL → 允许` 的 Default 兜底规则，未显式放行的流量一律默认拒绝：
+
+| 来源 | 协议端口 | 策略 | 备注 |
+|---|---|---|---|
+| 0.0.0.0/0 | TCP:5173 | 允许 | web frontend api |
+| <家宽公网IP>/32 | TCP:22 | 允许 | ssh admin only |
+| <沙箱节点私网IP>/32 | TCP:6379 | 允许 | sandbox runner redis via ccn |
+| 0.0.0.0/0 | TCP:6379 | 拒绝 | block redis from others |
+| 10.1.0.0/22 | TCP:8000 | 允许 | |
+| ::/0 | ALL | 拒绝 | Default rule |
+
+设计依据：
+
+- **公网只放 5173**：web 容器内 nginx 同时反代 `/api/` → `gateway:8000` 并托管前端静态资源，浏览器同源访问前端与 API，无需再开 gateway 8080 / 业务服务 8001–8009。
+- **Redis 6379 只放沙箱节点**：唯一跨网络 Redis 客户端是沙箱节点 `<沙箱节点私网IP>`（经 CCN 访问共享 Redis）；业务主机自身走 docker 内网/loopback，不经过安全组，无需放行。
+- **8000 只放内网段 `10.1.0.0/22`**：供沙箱 runner 私网绑定与同 VPC 访问，公网不可达。
+
+运维提醒：
+
+- **家宽 IP 可能漂移**：SSH 只放行 `<家宽公网IP>/32`，运营商重新拨号换 IP 后会被锁在 SSH 外；届时用控制台 OrcaTerm/VNC 登录改规则或补一条新 IP。
+- **Grafana(3000) 与 gateway 直连(8080) 已公网拒绝**：需要访问时走 SSH 隧道（如 `ssh -L 3000:localhost:3000`），或单独评估后再放行。
+- **规则按从上到下首条命中生效**：新插入的规则默认置顶；改动后核对顺序，避免「拒绝」影子覆盖「允许」（曾出现 `0.0.0.0/0 拒绝 6379` 排在上方把 `<沙箱节点私网IP>/32 允许 6379` 挡住）。

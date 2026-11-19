@@ -142,8 +142,8 @@
 
 ### SBX-09~13（P2，待排期）
 
-- **SBX-09 gVisor（☑ 2026-11-09）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。回归脚本 [gvisor_regression.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/gvisor_regression.py) 通过 runner 真实执行链路跑标准库/线程/子进程/文件+sqlite/浮点探针，并支持 `SANDBOX_PROBE_MODULES` 追加业务依赖。**2026-11-09 实测**：节点 `runtime=runsc`、镜像 digest `sha256:e73edb37…` 时 5 项探针全 PASS，审计流写入 5 条、无执行容器残留。注意：沙箱镜像已预装 numpy 2.1.3 / pandas 2.2.3（2026-11-19，重新构建并固定新 digest 后生效）；其他业务依赖需按实际脚本需求增肥镜像（`ModuleNotFoundError` 归为镜像缺依赖，不是 gVisor 不兼容）。
-- **SBX-10 孤儿容器回收（已实施 2026-11-09）**：执行容器带 `shop.sandbox.role=execution` 标签；runner 启动期与每 60s 后台任务扫描**全部**（含已退出）带该标签的容器，删除「创建时间 > `SANDBOX_TIMEOUT_SECONDS + 30s`」的遗留。用创建时间而非进程内状态判定，避免多实例共享端点时误删其他实例正在执行的容器；时间不可读时不删（保守）。回收失败只告警，不阻断启动或请求。**待办**：在专用节点按 RUNBOOK 5.2 F 验证后勾选 ☑。
+- **SBX-09 gVisor（☑ 2026-11-09）**：新增 `SANDBOX_RUNTIME`，生产启动守卫强制 `runsc`；`infra/rootless-docker/setup.sh` 负责安装 runsc 并注册到守护进程的 `daemon.json`（rootless 与 dedicated 两个分支都注册）；healthz 通过 `/info` 的 `Runtimes` 校验运行时是否真的注册。回归脚本 [gvisor_regression.py](file:///c:/Users/far/Desktop/git/shop-agent/infra/sandbox/gvisor_regression.py) 通过 runner 真实执行链路跑标准库/线程/子进程/文件+sqlite/浮点探针，并支持 `SANDBOX_PROBE_MODULES` 追加业务依赖。**2026-11-09 实测**：节点 `runtime=runsc`、镜像 digest `sha256:e73edb37…` 时 5 项探针全 PASS，审计流写入 5 条、无执行容器残留。**2026-11-19 复测**（节点 <沙箱节点公网IP>，镜像已重建并固定为 `sha256:db172ccc…`，预装 numpy 2.1.3 / pandas 2.2.3）：healthz 显示 `runsc + dedicated + node_exclusive + image_pinned`，回归 6 项（stdlib / threads / subprocess / files / math / deps）全 PASS，无执行容器残留。其他业务依赖需按实际脚本需求增肥镜像（`ModuleNotFoundError` 归为镜像缺依赖，不是 gVisor 不兼容）。
+- **SBX-10 孤儿容器回收（已实施 2026-11-09）**：执行容器带 `shop.sandbox.role=execution` 标签；runner 启动期与每 60s 后台任务扫描**全部**（含已退出）带该标签的容器，删除「创建时间 > `SANDBOX_TIMEOUT_SECONDS + 30s`」的遗留。用创建时间而非进程内状态判定，避免多实例共享端点时误删其他实例正在执行的容器；时间不可读时不删（保守）。回收失败只告警，不阻断启动或请求。**已验证（2026-11-19，节点 <沙箱节点公网IP>）**：人工遗留容器在阈值（50s）前不删，t0+109s 被回收并打印 `已回收沙箱孤儿容器`；同期 15s 真实执行返回 `status=ok`，未被误回收。
 - **SBX-11 全局配额**：多 worker 下并发上限除以 worker 数，或引入 Redis 全局信号量；按租户加权配额。
 - **SBX-12 预热池**：镜像分层 + 容器池 / microVM snapshot；先量 P95 冷启动再决定是否投入。
 - **SBX-13 TTL 联动**：结果缓存 TTL 与锁 TTL 从 `sandbox_timeout_seconds` 推导，避免改超时后去重窗口失配。
@@ -185,7 +185,7 @@
 - **残余风险**：runner 被攻破仍然等价节点 root（rootful socket 固有属性）。补偿是节点不承载任何业务数据与密钥、端口只绑私网、节点可整机重建。**禁止把 dedicated 档位套到混部节点上**（例如同时跑 erp-agent 的部署机）。
 - **验证**：`test_prod_dedicated_accepts_root_socket`、`test_prod_dedicated_requires_explicit_endpoint`、`test_prod_dedicated_rejects_tcp_endpoint`、`test_prod_rejects_unknown_isolation_mode`、`test_healthz_exposes_dedicated_isolation`、`test_healthz_returns_503_when_node_not_exclusive`、`test_healthz_returns_503_when_isolation_mode_mismatches`、`test_dedicated_refuses_execution_on_contaminated_node`、`test_dedicated_executes_when_node_is_exclusive`、`test_dedicated_allows_compose_managed_aux_container`、`test_dedicated_allows_custom_compose_project`、`test_dedicated_rejects_other_compose_project`、`test_run_labels_execution_container`。
 - **节点验收（2026-11-08，<沙箱节点公网IP>）**：宿主 rootful + `runsc`、`SecurityOptions` 无 rootless；`/healthz` 返回 `status=ok`、`mode=dedicated`、`node_exclusive=true`、`runtime_ok=true`、`image_pinned=true`；临时启动无标签容器 `mixed-probe` 后 healthz→**503** 且 `foreign_containers=["mixed-probe"]`，此时 `/run`→`unavailable` 且未创建执行容器；删除容器后 healthz 自动恢复 200。执行侧实测 `runtime=runsc`、`network=none`、`readonly=true`、`capdrop=[ALL]`、`shm=16MB`、`uid=65534`、`NETWORK_BLOCKED`、`ROOTFS_READONLY`，8000 只绑 `127.0.0.1`。完整记录见 [RUNBOOK §5.2](../RUNBOOK.md#52-专用节点dedicated部署与验证清单2026-11-08-已执行节点侧控制面项待补)。
-- **待办**：控制面 `SANDBOX_RUNNER_URLS=http://<node>:8000` 与 `/sandbox/health` 未在本轮验证（专用节点不承载业务栈）；gVisor 兼容性回归（SBX-09）与告警发现（Prometheus）待补。补齐后再勾选 ☑。
+- **控制面与监控（2026-11-19）**：节点 8000 已改绑私网 `<沙箱节点私网IP>:8000`。控制面用「临时 harness 容器 + SSH 隧道」完成 `/sandbox/health`（`backend=remote`、runner `ok`、`dedicated`、`node_exclusive=true`、`image_pinned=true`）与真实 `/sandbox/run`（`status=ok`）验证；Prometheus 侧新增 `sandbox-runner-node` file_sd job（目标文件 `infra/prometheus/targets/sandbox-runner.json`，默认空），`SandboxRunnerDown` 改为覆盖单机与专用节点两条分支，实测目标下线 80s pending、160s firing。生产生效只差把目标文件填成同 VPC 业务主机可访问的节点私网地址，并把 `SANDBOX_RUNNER_URLS` 指向同一地址。
 
 ### SBX-18 内存上限可被 swap 绕过（P1）
 
@@ -315,7 +315,7 @@
 
 ### 6.7 仍需记住的未解决项
 
-- 本轮已关闭 SBX-07/08/14/15/16/18；SBX-09 于 2026-11-09 完成 dedicated 节点兼容性回归；SBX-17 已在专用节点 <沙箱节点公网IP> 完成节点侧验收（控制面 E2E 待补）；SBX-10 已实现孤儿回收，待节点实测；未覆盖：SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
+- 本轮已关闭 SBX-07/08/14/15/16/18；SBX-09 于 2026-11-09 完成 dedicated 节点兼容性回归，并于 2026-11-19 在节点 <沙箱节点公网IP> 重建镜像（`sha256:db172ccc…`，含 numpy/pandas）后复跑通过；SBX-17 已完成专用节点验收（<沙箱节点公网IP>）与 2026-11-19 的控制面 `/sandbox/health`、`/sandbox/run`、dedicated Prometheus 抓取/告警链路验证（生产形态待同 VPC 业务主机落地）；SBX-10 已于 2026-11-19 完成专用节点回收实测；未覆盖：SBX-11 全局配额、SBX-12 冷启动、SBX-13 TTL 联动。
 - Redis 的 ACL 与密码已收敛到凭据层，但网络可达面仍需部署侧限制：生产 Redis 不应暴露到公网，并应定期轮换 `REDIS_PASSWORD` / `SANDBOX_REDIS_PASSWORD`。
 - 沙箱执行的审计证据是 `audit.sandbox.executed` 事件，只含哈希不含明文；事故复盘需要代码或输出原文时，只能靠调用方自己的留存，不要去审计库里找明文。
 - `untrusted_output` 标记只在单次运行内生效：同一次工具循环里会拦住写入，下一轮会话会重新建模。跨轮会话的高危操作仍依赖审批，不能假设标记一直在。
@@ -375,3 +375,4 @@ docker compose config -q
 | 2026-11-09 | SBX-09 关闭：dedicated 节点（`runsc release-20261102.0`、镜像 `sha256:e73edb37…`）跑 `gvisor_regression.py` 5 项探针全 PASS，审计流 5 条、无执行容器残留；业务依赖未预装，另按需增肥镜像 |
 | 2026-11-08 | 验收修复：`container.wait` 读超时被 urllib3 2.x 包装为 `ConnectionError`，按 `read timed out` 文本映射回 `timeout`，避免超时被固化为 `infra_error` |
 | 2026-11-08 | 构建可移植性：`infra/Dockerfile` 新增 `APT_MIRROR` / `PIP_INDEX_URL` / `PIP_TRUSTED_HOST` 构建参数，默认官方源，受限网络改用内网镜像 |
+| 2026-11-19 | SBX-17 控制面与监控：节点 8000 绑私网 `<沙箱节点私网IP>`；`/sandbox/health` 与 `/sandbox/run` 隧道验证通过；新增 `sandbox-runner-node` file_sd 抓取 job 并泛化 `SandboxRunnerDown`，告警 pending/firing 实测通过 |
