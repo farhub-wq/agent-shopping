@@ -113,6 +113,39 @@ groups:
           description: "近 5 分钟被策略拒绝 {{ $value }} 次，核查是否存在越权试探。"
           runbook: docs/RUNBOOK.md
 
+      # 沙箱 runner 抓取失败：目标不在线或端口未监听。
+      # 专用节点部署时 instance 标签是节点私网地址，需同步改成实际抓取目标。
+      - alert: SandboxRunnerDown
+        expr: up{instance="sandbox-runner:8000"} == 0
+        for: 2m
+        labels: { severity: P1 }
+        annotations:
+          summary: "沙箱 runner 不可用"
+          description: "连续 2 分钟抓取不到 sandbox-runner:8000，沙箱执行已 fail-closed 拒绝，检查 runner 容器与节点。"
+          runbook: docs/RUNBOOK.md
+
+      # healthz 判死：隔离退化、节点混部、镜像未固定等，均代表安全基线被破坏。
+      # healthz 被 RED 中间件排除，靠 runner 自己写的 gauge 暴露；由 healthcheck 每 30s 刷新。
+      - alert: SandboxHealthDegraded
+        expr: sandbox_runner_healthy{service="sandbox-runner"} == 0
+        for: 2m
+        labels: { severity: P1 }
+        annotations:
+          summary: "沙箱隔离基线异常"
+          description: "runner healthz 连续 2 分钟返回 503，检查 SANDBOX_RUNTIME、节点混部、镜像 digest 与 Redis 凭据。"
+          runbook: docs/RUNBOOK.md
+
+      # 执行直接不可用：去重存储故障、并发闸门繁忙、同一执行仍在进行。
+      # 这类返回没有真正启动容器（fail-closed），出现即说明容量或依赖异常。
+      - alert: SandboxExecutionUnavailable
+        expr: increase(sandbox_executions_total{service="sandbox-runner", result="unavailable"}[5m]) > 0
+        for: 2m
+        labels: { severity: P1 }
+        annotations:
+          summary: "沙箱执行返回不可用"
+          description: "近 5 分钟出现 {{ $value }} 次 unavailable，优先检查 runner Redis 与并发闸门。"
+          runbook: docs/RUNBOOK.md
+
   - name: p2-daily
     rules:
       # 日终对账开放差异 >0：次日处理进日报
@@ -123,4 +156,24 @@ groups:
         annotations:
           summary: "日终对账存在差异（{{ $labels.service }}）"
           description: "对账检出 {{ $value }} 条开放差异，次日人工核查渠道账单。"
+          runbook: docs/RUNBOOK.md
+
+      # 基础设施型执行失败：容器未启动或运行时不可用，不是用户代码本身报错
+      - alert: SandboxInfraError
+        expr: increase(sandbox_executions_total{service="sandbox-runner", result="infra_error"}[10m]) > 0
+        for: 5m
+        labels: { severity: P2 }
+        annotations:
+          summary: "沙箱基础设施执行失败"
+          description: "近 10 分钟出现 {{ $value }} 次 infra_error，检查 Docker/runsc、镜像与节点磁盘。"
+          runbook: docs/RUNBOOK.md
+
+      # 并发饱和：阈值对应默认 SANDBOX_MAX_CONCURRENCY=4，调整配置时同步修改
+      - alert: SandboxConcurrencySaturated
+        expr: http_requests_in_flight{service="sandbox-runner"} >= 4
+        for: 5m
+        labels: { severity: P2 }
+        annotations:
+          summary: "沙箱并发持续饱和"
+          description: "runner 在途执行连续 5 分钟达到 4（默认上限），后续请求会返回繁忙，评估扩容或错峰。"
           runbook: docs/RUNBOOK.md

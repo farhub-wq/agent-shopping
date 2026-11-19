@@ -41,6 +41,16 @@ AGENT_BUDGET_EXCEEDED = Counter("agent_budget_exceeded_total", "Agent 成本预�
 AGENT_INJECTION_BLOCKED = Counter("agent_injection_blocked_total", "提示注入拦截次数", ["service"])
 RECONCILIATION_DIFF = Gauge("reconciliation_diff_total", "对账开放差异数", ["service"])
 
+# ---- 沙箱执行（sandbox-runner）----
+# result 取 SandboxResult.status：ok / error / timeout / unavailable / infra_error。
+# 告警用它区分「代码自身失败」与「去重、容量、隔离这类基础设施不可用」。
+SANDBOX_EXECUTIONS = Counter("sandbox_executions_total", "沙箱执行结果", ["service", "result"])
+# healthz 为 503（隔离退化、节点混部、镜像未固定）时写入 0；由 healthcheck 周期性刷新。
+# /healthz 被 RED 中间件排除，因此需要独立 gauge 才能告警。
+SANDBOX_RUNNER_HEALTHY = Gauge(
+    "sandbox_runner_healthy", "最近一次 healthz 是否健康（1=健康）", ["service"]
+)
+
 # 抓取与健康检查本身不计入 RED，避免 self-scrape 噪声
 _EXCLUDED_PATHS = {"/metrics", "/healthz"}
 
