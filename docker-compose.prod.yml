@@ -57,6 +57,16 @@ services:
         limits: { cpus: "1.0", memory: 512M }
     logging: *logging
 
+  audit:
+    restart: unless-stopped
+    # 审计只给内网服务消费，不要漏掉：基座映射了 8009:8000，且不覆盖 ENV 会退回 dev
+    ports: !reset []
+    environment: *prod-env
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging: *logging
+
   harness:
     restart: unless-stopped
     ports: !reset []
