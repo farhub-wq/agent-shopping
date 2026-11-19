@@ -33,6 +33,25 @@ def owner_scope(tenant: str, user_id: str) -> str:
     return hashlib.sha256(f"{tenant}\n{user_id}".encode()).hexdigest()[:32]
 
 
+# 去重状态 TTL 都锚定到执行超时（SBX-13）：锁 TTL 覆盖单次执行，结果缓存活得比锁更久，
+# 改 SANDBOX_TIMEOUT_SECONDS 后去重窗口随之联动，避免「超时已调大、结果仍缓存 5 分钟」的失配。
+LOCK_TTL_MARGIN_SECONDS = 20
+RESULT_TTL_MARGIN_SECONDS = 60
+
+
+def dedupe_ttls(timeout_seconds: int) -> tuple[int, int]:
+    """从执行超时推导 (锁 TTL, 结果缓存 TTL)。
+
+    锁 TTL = 超时 + 启停开销余量，只兜 runner 崩溃后的自动过期（执行期间靠心跳续租）；
+    结果缓存 TTL = 超时 + 更大余量，始终 ≥ 锁 TTL，保证同一 execution_id 的故障转移
+    重试在结果写入后仍能读到同一次结论，且墓碑与结果缓存同时过期不留缝隙。
+    """
+    return (
+        timeout_seconds + LOCK_TTL_MARGIN_SECONDS,
+        timeout_seconds + RESULT_TTL_MARGIN_SECONDS,
+    )
+
+
 class ExecutionDedupe:
     def __init__(
         self,
@@ -44,7 +63,8 @@ class ExecutionDedupe:
         self.redis = redis
         # 锁 TTL 必须覆盖单次执行超时；执行期间靠心跳续租，崩溃后才按 TTL 过期。
         self.lock_ttl_seconds = max(lock_ttl_seconds, 30)
-        # 结果缓存保留到一次请求的全部故障转移尝试结束即可，5 分钟足够。
+        # 结果缓存保留到一次请求的全部故障转移尝试结束即可；生产由 dedupe_ttls
+        # 按执行超时派生，这里默认 5 分钟只作直接构造时的兜底。
         self.result_ttl_seconds = max(result_ttl_seconds, 60)
 
     @staticmethod

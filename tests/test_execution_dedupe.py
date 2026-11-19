@@ -1,7 +1,7 @@
 """跨 runner 去重存储的读写契约测试（不依赖真实 Redis）。"""
 
 import pytest
-from sandbox_runner.dedupe import ExecutionDedupe, owner_scope
+from sandbox_runner.dedupe import ExecutionDedupe, dedupe_ttls, owner_scope
 from shop_common.sandbox import SandboxResult
 
 OWNER = "owner-a"
@@ -101,3 +101,28 @@ def test_owner_scope_is_stable_and_opaque():
     assert first == owner_scope("acme", "u-1")
     assert first != owner_scope("acme", "u-2")
     assert "u-1" not in first
+
+
+def test_dedupe_ttls_derives_from_timeout():
+    # 锁与结果缓存 TTL 都从执行超时派生，结果缓存活得比锁更久（SBX-13）。
+    lock_ttl, result_ttl = dedupe_ttls(20)
+    assert lock_ttl == 40
+    assert result_ttl == 80
+    assert result_ttl > lock_ttl
+
+    # 超时上调后两者随之联动，不会出现「锁已过期、结果仍缓存 5 分钟」的失配。
+    lock_ttl, result_ttl = dedupe_ttls(120)
+    assert lock_ttl == 140
+    assert result_ttl == 180
+
+
+@pytest.mark.asyncio
+async def test_derived_ttls_keep_tombstone_in_sync_with_result():
+    redis = _FakeRedis()
+    lock_ttl, result_ttl = dedupe_ttls(20)
+    dedupe = ExecutionDedupe(redis, lock_ttl_seconds=lock_ttl, result_ttl_seconds=result_ttl)
+
+    await dedupe.mark_started(OWNER, "exec-1")
+
+    # 派生下墓碑 TTL = 结果缓存 TTL，两者同时过期，不留「缓存已过期但墓碑先消失」的缝隙。
+    assert redis.expires[dedupe.attempt_key(OWNER, "exec-1")] == result_ttl

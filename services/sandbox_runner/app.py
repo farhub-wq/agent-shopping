@@ -27,7 +27,7 @@ from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import SANDBOX_EXECUTIONS, SANDBOX_RUNNER_HEALTHY, install_metrics
 from shop_common.sandbox import EXECUTED_STATUSES, MAX_CODE_CHARS, SandboxResult
 
-from .dedupe import ExecutionDedupe, owner_scope
+from .dedupe import ExecutionDedupe, dedupe_ttls, owner_scope
 from .runner import (
     ORPHAN_RECONCILE_INTERVAL_SECONDS,
     ConcurrencyGate,
@@ -59,10 +59,14 @@ redis_client = Redis.from_url(
     health_check_interval=30,
     socket_keepalive=True,
 )
+# 锁与结果缓存 TTL 都从执行超时派生：改 SANDBOX_TIMEOUT_SECONDS 后去重窗口随之联动（SBX-13）。
+lock_ttl_seconds, result_ttl_seconds = dedupe_ttls(settings.sandbox_timeout_seconds)
 dedupe = ExecutionDedupe(
     redis_client,
     # 锁 TTL 覆盖单次容器执行；执行期间心跳续租，runner 崩溃后才按 TTL 自动过期。
-    lock_ttl_seconds=settings.sandbox_timeout_seconds + 20,
+    lock_ttl_seconds=lock_ttl_seconds,
+    # 结果缓存活得比锁更久，保证同一 execution_id 的故障转移重试仍能复用同一次结论。
+    result_ttl_seconds=result_ttl_seconds,
 )
 # 审计走同一 Redis 流：audit 服务异步消费落库（只增不改、保留 180 天），
 # 执行证据不能只留 5 分钟的结果缓存。
