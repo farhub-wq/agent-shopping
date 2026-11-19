@@ -300,4 +300,12 @@ class EventBus:
 
 
 def create_redis(url: str) -> Redis:
-    return Redis.from_url(url, decode_responses=True)
+    # 连接池健康检查 + TCP keepalive：空闲连接被对端/中间设备静默断开后，复用会在
+    # uvloop 下抛 RuntimeError（the handler is closed）而非 ConnectionError，无法被
+    # redis-py 的自动重试捕获；健康检查在复用前 PING 剔除坏连接，keepalive 减少断连。
+    return Redis.from_url(
+        url,
+        decode_responses=True,
+        health_check_interval=30,
+        socket_keepalive=True,
+    )

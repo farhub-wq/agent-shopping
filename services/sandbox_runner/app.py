@@ -51,7 +51,14 @@ runner = DockerRunner()
 gate = ConcurrencyGate(settings.sandbox_max_concurrency, settings.sandbox_queue_timeout_seconds)
 # 去重状态放 Redis 而不是进程内存：多 runner 必须共享同一份执行状态才能跨实例生效。
 # 连接使用受限 ACL 用户：即使 runner 被攻破，凭据也只能读写沙箱键与审计流，碰不到业务数据。
-redis_client = Redis.from_url(settings.resolved_sandbox_redis_url, decode_responses=False)
+redis_client = Redis.from_url(
+    settings.resolved_sandbox_redis_url,
+    decode_responses=False,
+    # 健康检查 + keepalive 与 shop_common.create_redis 同口径：去重键存 JSON 字节，
+    # 需要 decode_responses=False，无法复用 create_redis，但同样要防复用已关闭连接。
+    health_check_interval=30,
+    socket_keepalive=True,
+)
 dedupe = ExecutionDedupe(
     redis_client,
     # 锁 TTL 覆盖单次容器执行；执行期间心跳续租，runner 崩溃后才按 TTL 自动过期。
