@@ -74,6 +74,12 @@ def _created_epoch(attrs: dict[str, Any]) -> float | None:
 # 资源硬上限：配置可以按部署规模上调，但不能无限抬高，否则单个沙箱容器就能压垮宿主。
 MAX_SANDBOX_CPU = 2.0
 MAX_SANDBOX_MEMORY_MB = 2048
+# 执行参数上限：超时/并发/排队同样决定单节点资源占用，配置多打一个 0
+# 就能让容器长时间占槽或瞬间起满容器；与 CPU/内存一样在生产守卫里硬拒。
+MAX_SANDBOX_TIMEOUT_SECONDS = 120
+MAX_SANDBOX_MAX_CONCURRENCY = 16
+MAX_SANDBOX_QUEUE_TIMEOUT_SECONDS = 60
+MAX_SANDBOX_DEDUPE_WAIT_SECONDS = 60
 
 # 只有内容寻址的镜像引用才不可变：registry 的 repo@sha256:... 或本地镜像 ID sha256:...
 PINNED_IMAGE_RE = re.compile(r"^(?:[^@\s]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
@@ -157,6 +163,26 @@ def validate_sandbox_isolation(settings: ServiceSettings) -> None:
             f"生产环境 SANDBOX_MEMORY_MB 必须在 (0, {MAX_SANDBOX_MEMORY_MB}] 内，"
             "内存炸弹会把宿主先于业务打满"
         )
+    if not 0 < settings.sandbox_timeout_seconds <= MAX_SANDBOX_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_TIMEOUT_SECONDS 必须在 (0, "
+            f"{MAX_SANDBOX_TIMEOUT_SECONDS}] 内，超时过长会让单个执行长期占用并发槽"
+        )
+    if not 0 < settings.sandbox_max_concurrency <= MAX_SANDBOX_MAX_CONCURRENCY:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_MAX_CONCURRENCY 必须在 (0, "
+            f"{MAX_SANDBOX_MAX_CONCURRENCY}] 内，并发上限直接决定宿主容器数量"
+        )
+    if not 0 <= settings.sandbox_queue_timeout_seconds <= MAX_SANDBOX_QUEUE_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_QUEUE_TIMEOUT_SECONDS 必须在 "
+            f"[0, {MAX_SANDBOX_QUEUE_TIMEOUT_SECONDS}] 内"
+        )
+    if not 0 <= settings.sandbox_dedupe_wait_seconds <= MAX_SANDBOX_DEDUPE_WAIT_SECONDS:
+        raise RuntimeError(
+            f"生产环境 SANDBOX_DEDUPE_WAIT_SECONDS 必须在 "
+            f"[0, {MAX_SANDBOX_DEDUPE_WAIT_SECONDS}] 内"
+        )
 
 
 def _truncate(raw: bytes) -> tuple[str, bool]:
@@ -212,7 +238,9 @@ class DockerRunner:
         """
         projects = allowed_compose_projects(self.settings)
         foreign: list[str] = []
-        for container in client.containers.list():
+        # 必须包含已退出的容器：停掉的业务库/中间件虽然不占运行时资源，
+        # 仍可能带着业务数据卷留在节点上，同样破坏「节点只跑沙箱栈」的前提。
+        for container in client.containers.list(all=True):
             labels = (container.attrs.get("Config", {}).get("Labels") or {})
             role = str(labels.get(SANDBOX_CONTAINER_LABEL) or "")
             project = str(labels.get(COMPOSE_PROJECT_LABEL) or "").strip()

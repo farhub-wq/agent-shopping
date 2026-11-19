@@ -22,8 +22,10 @@ from shop_common.sandbox import MAX_CODE_CHARS, SandboxResult, clamp_timeout
 logger = get_logger(__name__)
 
 MAX_OUTPUT_BYTES = 8192
-# 客户端超时 = 容器执行超时 + 网络往返与容器创建/删除开销；
-# 否则 runner 还在等容器退出，客户端就先超时并误报 unavailable。
+# 客户端超时 = 容器执行超时 + runner 排队/去重等待 + 网络与容器启停开销。
+# runner 在返回前可能先等并发槽（SANDBOX_QUEUE_TIMEOUT_SECONDS），再等同一执行
+# 的既有结果（SANDBOX_DEDUPE_WAIT_SECONDS）；余量只给 10s 会让并发饱和时客户端
+# 先判失败，而容器仍在后台执行，形成「假失败 + 重复触发」。
 RUNNER_TIMEOUT_MARGIN = 10
 # 故障 runner 冷却时间：期间排到最后，避免每个请求都先白等一次超时。
 RUNNER_COOLDOWN_SECONDS = 30
@@ -151,6 +153,21 @@ class SandboxManager:
         logger.warning("沙箱未启用，使用本地子进程执行（非安全边界，仅限本地演示）")
         return await self._run_local(code, limit)
 
+    def _runner_budget(self, timeout: int) -> httpx.Timeout:
+        """按 runner 最坏路径计算客户端超时，避免把仍在执行的请求判成失败。
+
+        runner 返回响应的耗时 = 并发槽排队（可能吃满 queue timeout）
+        + 去重等待（同一 execution_id 已有执行时）+ 容器执行 + 启停开销。
+        """
+        total = (
+            timeout
+            + self.settings.sandbox_queue_timeout_seconds
+            + self.settings.sandbox_dedupe_wait_seconds
+            + RUNNER_TIMEOUT_MARGIN
+        )
+        # connect 单独限 3s：坏掉的主机快速失败，执行阶段仍给足预算。
+        return httpx.Timeout(total, connect=3.0)
+
     async def _run_remote(
         self, code: str, timeout: int, user_id: str, role: str, tenant: str
     ) -> SandboxResult:
@@ -170,8 +187,7 @@ class SandboxManager:
         headers["X-Execution-Id"] = uuid.uuid4().hex
         payload = {"code": code, "language": "python", "timeout": timeout}
         failures: list[str] = []
-        # connect 单独限 3s：坏掉的主机快速失败，执行阶段仍给足容器超时。
-        client_timeout = httpx.Timeout(timeout + RUNNER_TIMEOUT_MARGIN, connect=3.0)
+        client_timeout = self._runner_budget(timeout)
         async with httpx.AsyncClient(timeout=client_timeout, transport=self.transport) as client:
             for url in targets:
                 try:

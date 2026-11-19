@@ -118,6 +118,39 @@ async def test_run_rejects_non_staff(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_rejects_oversized_body_before_parsing():
+    # Content-Length 超限必须在读 body / 鉴权前就被拒，避免 runner 内存被打满。
+    huge = "x" * (runner_app.MAX_REQUEST_BODY_BYTES + 1)
+
+    async with _client() as client:
+        response = await client.post(
+            "/run",
+            content=huge,
+            headers={**_headers("operator"), "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_oversized_chunked_body():
+    async def chunks():
+        # 不带 Content-Length 时按实际读取字节计数，chunked 请求同样要受限。
+        chunk = b"x" * (runner_app.MAX_REQUEST_BODY_BYTES // 2)
+        for _ in range(3):
+            yield chunk
+
+    async with _client() as client:
+        response = await client.post(
+            "/run",
+            content=chunks(),
+            headers={**_headers("operator"), "Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_run_rejects_bearer_jwt(monkeypatch):
     called: list[bool] = []
 
@@ -924,6 +957,28 @@ def test_prod_rejects_excessive_memory():
         validate_sandbox_isolation(_prod_sandbox(sandbox_memory_mb=16384))
 
 
+def test_prod_rejects_excessive_timeout():
+    # 超时过长会让单个执行长期占用并发槽，拖垮整台节点的吞吐
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_timeout_seconds=3600))
+
+
+def test_prod_rejects_excessive_concurrency():
+    # 并发上限直接决定同时存在的容器数，配置多打一个 0 就能压垮宿主
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_max_concurrency=1000))
+
+
+def test_prod_rejects_excessive_queue_timeout():
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_queue_timeout_seconds=600))
+
+
+def test_prod_rejects_excessive_dedupe_wait():
+    with pytest.raises(RuntimeError):
+        validate_sandbox_isolation(_prod_sandbox(sandbox_dedupe_wait_seconds=600))
+
+
 def test_dev_allows_relaxed_sandbox_params():
     # 本地开发需要临时放宽网络/资源参数，守卫只在非 dev 生效
     validate_sandbox_isolation(
@@ -933,6 +988,8 @@ def test_dev_allows_relaxed_sandbox_params():
             sandbox_network="bridge",
             sandbox_cpu=8.0,
             sandbox_memory_mb=16384,
+            sandbox_timeout_seconds=3600,
+            sandbox_max_concurrency=1000,
         )
     )
 
@@ -1204,6 +1261,19 @@ def test_dedicated_refuses_execution_on_contaminated_node(monkeypatch):
     assert result.status == "unavailable"
     assert "erp-agent" in result.stderr
     assert client.containers.create_kwargs == {}
+
+
+def test_dedicated_counts_exited_business_container_as_foreign(monkeypatch):
+    client = _FakeDockerClient()
+    client.containers.listed = [_FakeContainerRef("legacy-mysql", None)]
+    runner = _runner_with(_prod_dedicated(), client, monkeypatch)
+
+    result = runner._run_blocking("print(1)", 5)
+
+    # 已退出的业务容器仍可能带着业务数据卷，检查必须包含 all=True
+    assert client.containers.list_kwargs.get("all") is True
+    assert result.status == "unavailable"
+    assert "legacy-mysql" in result.stderr
 
 
 def test_dedicated_executes_when_node_is_exclusive(monkeypatch):

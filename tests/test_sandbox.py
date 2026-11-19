@@ -2,7 +2,12 @@ import json
 
 import httpx
 import pytest
-from harness.core.sandbox import SandboxManager, SandboxResult, validate_sandbox_production
+from harness.core.sandbox import (
+    RUNNER_TIMEOUT_MARGIN,
+    SandboxManager,
+    SandboxResult,
+    validate_sandbox_production,
+)
 from shop_common.auth import verify_internal_signature
 from shop_common.config import ServiceSettings
 from shop_common.sandbox import MAX_CODE_CHARS
@@ -124,6 +129,18 @@ async def test_requested_timeout_is_clamped_to_configured_max(monkeypatch):
     await manager.run("print(1)", timeout=-3)
 
     assert seen == [20, 5, 20]
+
+
+def test_runner_budget_covers_queue_and_dedupe_wait(monkeypatch):
+    manager = SandboxManager()
+    monkeypatch.setattr(manager.settings, "sandbox_queue_timeout_seconds", 10)
+    monkeypatch.setattr(manager.settings, "sandbox_dedupe_wait_seconds", 5)
+
+    budget = manager._runner_budget(20)
+
+    # runner 返回前会先等并发槽（10s）再去重（5s），客户端预算必须覆盖完整最坏路径，
+    # 否则并发饱和时 harness 先判 unavailable，而容器仍在后台执行。
+    assert budget.read == 20 + 10 + 5 + RUNNER_TIMEOUT_MARGIN
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from shop_common.audit import publish_audit
@@ -23,7 +24,7 @@ from shop_common.config import (
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
-from shop_common.metrics import install_metrics
+from shop_common.metrics import SANDBOX_EXECUTIONS, SANDBOX_RUNNER_HEALTHY, install_metrics
 from shop_common.sandbox import EXECUTED_STATUSES, MAX_CODE_CHARS, SandboxResult
 
 from .dedupe import ExecutionDedupe, owner_scope
@@ -39,6 +40,10 @@ logger = get_logger(__name__)
 
 # execution_id 来自 harness 的 UUID；只允许安全字符，防止拼接进 Redis key 时注入分隔符。
 EXECUTION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# 请求体上限：MAX_CODE_CHARS 只约束解析后的代码长度，uvicorn 在进入路由前
+# 就会把整个 body 读进内存；持有 staff 签名的人可用超大 body 打爆唯一持有
+# Docker socket 的 runner。JSON 转义最坏放大到 6 倍（\uXXXX），再留 8KB 给其余字段。
+MAX_REQUEST_BODY_BYTES = MAX_CODE_CHARS * 6 + 8192
 
 settings = get_settings()
 runner = DockerRunner()
@@ -107,9 +112,71 @@ async def lifespan(_: FastAPI):
             await audit_redis.aclose()
 
 
+class RequestBodyLimitMiddleware:
+    """在鉴权与 Pydantic 校验之前拒绝超大请求体。
+
+    Content-Length 可信时直接返回 413；缺失（chunked）时边读边计数。
+    上限只有几百 KB，缓冲后回放不会带来额外内存压力。
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {name.lower(): value for name, value in scope.get("headers") or []}
+        declared = headers.get(b"content-length")
+        if declared is not None:
+            try:
+                too_large = int(declared) > self.max_bytes
+            except ValueError:
+                too_large = True
+            if too_large:
+                await self._reject(scope, receive, send)
+                return
+        buffered: list[tuple[bytes, bool]] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body = message.get("body", b"")
+            total += len(body)
+            if total > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+            more = bool(message.get("more_body", False))
+            buffered.append((body, more))
+            if not more:
+                break
+        index = 0
+
+        async def replay() -> dict[str, Any]:
+            nonlocal index
+            if index < len(buffered):
+                body, more = buffered[index]
+                index += 1
+                return {"type": "http.request", "body": body, "more_body": more}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay, send)
+
+    async def _reject(self, scope: Any, receive: Any, send: Any) -> None:
+        response = JSONResponse(
+            {"detail": f"请求体超过上限 {self.max_bytes} 字节"},
+            status_code=413,
+        )
+        await response(scope, receive, send)
+
+
 app = FastAPI(title="sandbox-runner", version="0.1.0", lifespan=lifespan)
 install_error_handlers(app, "sandbox-runner")
 install_metrics(app, "sandbox-runner")
+# 最后注册即最外层：超大 body 在读入业务逻辑前就被拒，打不到解析与执行路径。
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 
 
 async def get_runner_principal(
@@ -163,6 +230,8 @@ async def healthz(response: Response) -> dict[str, Any]:
         and not runtime.get("mode_mismatch", False)
         and not security_issues
     )
+    # healthz 被 RED 中间件排除，用独立 gauge 暴露给 Prometheus，隔离退化时才能告警。
+    SANDBOX_RUNNER_HEALTHY.labels("sandbox-runner").set(1 if healthy else 0)
     if not healthy:
         response.status_code = 503
     return {
@@ -194,6 +263,8 @@ async def healthz(response: Response) -> dict[str, Any]:
             "cpu": settings.sandbox_cpu,
             "memory_mb": settings.sandbox_memory_mb,
             "timeout_seconds": settings.sandbox_timeout_seconds,
+            "queue_timeout_seconds": settings.sandbox_queue_timeout_seconds,
+            "dedupe_wait_seconds": settings.sandbox_dedupe_wait_seconds,
         },
     }
 
@@ -239,6 +310,17 @@ async def run_sandbox(
     payload: RunRequest,
     principal: RunnerPrincipalDep,
     execution_id: str = Header(default="", alias="X-Execution-Id"),
+) -> dict[str, Any]:
+    result = await _run_sandbox(payload, principal, execution_id)
+    # 按结果状态计数：告警据此区分「去重/容量不可用」与「代码执行失败」。
+    SANDBOX_EXECUTIONS.labels(service="sandbox-runner", result=result["status"]).inc()
+    return result
+
+
+async def _run_sandbox(
+    payload: RunRequest,
+    principal: Principal,
+    execution_id: str,
 ) -> dict[str, Any]:
     # 与 harness 的 /sandbox/run 同一权限口径：沙箱执行只对 staff 开放。
     principal.require_staff()
