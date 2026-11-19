@@ -11,6 +11,7 @@
 ModuleNotFoundError 说明是「镜像缺依赖」，其余多为 runsc syscall 不兼容。
 """
 
+import json
 import os
 import sys
 import uuid
@@ -146,13 +147,16 @@ def _run_probe(
     name: str,
     code: str,
 ) -> tuple[bool, str]:
+    payload = {"code": code, "timeout": PROBE_TIMEOUT_SECONDS}
+    # 签名必须绑定请求体：runner 用原始字节摘要验签，签名与发送必须用同一份字节。
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     headers = {
-        **signed_identity_headers("gvisor-regression", "admin", "platform", secret=secret),
+        **signed_identity_headers("gvisor-regression", "admin", "platform", secret=secret, body=body),
         "X-Execution-Id": f"gvisor-{name}-{uuid.uuid4().hex[:16]}",
+        "Content-Type": "application/json",
     }
-    body = {"code": code, "timeout": PROBE_TIMEOUT_SECONDS}
     try:
-        response = client.post(f"{url}/run", json=body, headers=headers)
+        response = client.post(f"{url}/run", content=body, headers=headers)
     except httpx.HTTPError as exc:
         return False, f"请求失败: {type(exc).__name__}"
     if response.status_code != 200:
