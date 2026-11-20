@@ -15,8 +15,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 settings = get_settings()
 target_metadata = Base.metadata
 
-# 有数据库的服务白名单；gateway/harness 无关系库，不应走到迁移
-DB_SERVICES = {"catalog", "inventory", "order", "fulfillment", "aftersales", "identity", "payment", "audit"}
+# 有数据库的服务白名单；gateway 无关系库，不应走到迁移。
+# harness 自 2026-11 引入关系库（模型提供商/会话/消息/用量），需独立迁移目录。
+DB_SERVICES = {"catalog", "inventory", "order", "fulfillment", "aftersales", "identity", "payment", "audit", "harness"}
 
 
 def _load_service_models() -> None:

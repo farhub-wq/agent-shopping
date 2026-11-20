@@ -48,6 +48,10 @@ class ServiceSettings(BaseSettings):
     # dev 默认值是 32 个 '0' 的 base64 编码，公开可推导，仅保证本地/单测可跑。
     # 生产必须注入独立随机密钥，启动守卫会拒绝此默认值。
     mfa_encryption_key: str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+    # 模型提供商 API Key 的对称加密主密钥（Fernet，32 字节 urlsafe-base64）。
+    # 用户在「模型设置」里自填的各厂商密钥加密后落库；dev 默认值公开可推导，
+    # 仅保证本地/单测可跑，生产必须注入独立随机密钥（harness 启动守卫会拒绝默认值）。
+    model_key_encryption_key: str = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
 
     catalog_url: str = "http://localhost:8001"
     inventory_url: str = "http://localhost:8002"
@@ -179,6 +183,7 @@ DEV_SECRET_DEFAULTS = {
     "runner_signing_secret": "dev-runner-signing-secret",
     "payment_webhook_secret": "dev-payment-webhook-secret",
     "mfa_encryption_key": "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+    "model_key_encryption_key": "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
     # 业务 Redis 的 default 用户密码，生产必须替换
     "redis_password": "dev-redis-password",
 }

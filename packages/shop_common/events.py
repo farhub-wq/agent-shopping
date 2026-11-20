@@ -292,6 +292,8 @@ class EventBus:
                         logger.exception("去重记录清理失败 topic=%s", topic)
                     self._last_purge = time.monotonic()
             except asyncio.CancelledError:
+                # 优雅关闭：等待当前批次处理完成再退出，避免事件丢失
+                logger.info("收到取消信号，消费者将停止 topic=%s group=%s", topic, group)
                 raise
             except Exception:
                 # 循环异常（如 Redis 短暂不可用）不退出消费者，退避后继续。

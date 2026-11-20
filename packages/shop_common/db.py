@@ -112,17 +112,22 @@ class _CountedSessionFactory:
 class _PoolGuardedSession:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+        self._entered = False
 
     async def __aenter__(self) -> AsyncSession:
         try:
-            return await self._session.__aenter__()
+            result = await self._session.__aenter__()
+            self._entered = True
+            return result
         except TimeoutError:
             # asyncio.TimeoutError 在此只可能来自 pool_timeout 超时（池满快速失败）
             DB_POOL_EXHAUSTED.labels(settings.service_name).inc()
             raise
 
     async def __aexit__(self, *exc_info) -> None:
-        await self._session.__aexit__(*exc_info)
+        # 只有成功进入上下文才需要退出，避免池满时重复释放
+        if self._entered:
+            await self._session.__aexit__(*exc_info)
 
     def __getattr__(self, name: str):
         return getattr(self._session, name)
