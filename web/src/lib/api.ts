@@ -65,6 +65,79 @@ export interface ChargebackPage {
   total: number;
 }
 
+// ======== Agent 多模型接入相关类型 ========
+
+// 模型提供商预设
+export interface ProviderPreset {
+  key: string;
+  type: string;
+  name: string;
+  base_url: string;
+  default_model: string;
+  key_label: string;
+}
+
+// 模型提供商
+export interface ModelProvider {
+  id: string;
+  owner_user_id: string | null;
+  tenant_id: string;
+  provider_type: string;
+  name: string;
+  base_url: string;
+  model: string;
+  is_default: boolean;
+  enabled: boolean;
+  has_key: boolean;
+  key_masked: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// 会话
+export interface Conversation {
+  id: string;
+  skill: string;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+}
+
+export interface ConversationPage {
+  items: Conversation[];
+  page: number;
+  size: number;
+  total: number;
+}
+
+// 消息
+export interface Message {
+  id: string;
+  role: string;
+  content: string;
+  tool_calls: string | null;
+  created_at: string;
+}
+
+// 用量统计
+export interface UsageSummary {
+  key: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  calls: number;
+  errors: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+}
+
+export interface UsagePage {
+  items: UsageSummary[];
+  page: number;
+  size: number;
+  total: number;
+}
+
 export function getSession(): Session | null {
   const raw = localStorage.getItem(SESSION_KEY);
   return raw ? (JSON.parse(raw) as Session) : null;
@@ -312,6 +385,66 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ outcome }),
     }),
+  // 模型提供商预设
+  providerPresets: () => request<{ items: ProviderPreset[] }>("/providers/presets"),
+  // 模型提供商列表
+  listProviders: () => request<{ items: ModelProvider[] }>("/providers"),
+  // 创建模型提供商
+  createProvider: (payload: {
+    provider_type: string;
+    name: string;
+    base_url: string;
+    model: string;
+    api_key: string;
+    shared?: boolean;
+    is_default?: boolean;
+  }) => request<ModelProvider>("/providers", { method: "POST", body: JSON.stringify(payload) }),
+  // 更新模型提供商
+  updateProvider: (
+    providerId: string,
+    payload: {
+      name?: string;
+      model?: string;
+      base_url?: string;
+      api_key?: string;
+      is_default?: boolean;
+      enabled?: boolean;
+    },
+  ) =>
+    request<ModelProvider>(`/providers/${providerId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  // 删除模型提供商
+  deleteProvider: (providerId: string) =>
+    request<{ deleted: boolean }>(`/providers/${providerId}`, { method: "DELETE" }),
+  // 测试模型提供商连通性
+  testProvider: (providerId: string) =>
+    request<{ ok: boolean; latency_ms: number; message: string }>(`/providers/${providerId}/test`, {
+      method: "POST",
+      body: "{}",
+    }),
+  // 会话列表
+  listConversations: (params: { skill?: string; page?: number; size?: number } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => value !== undefined && value !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return request<ConversationPage>(`/conversations${query ? `?${query}` : ""}`);
+  },
+  // 会话消息列表
+  listMessages: (conversationId: string) =>
+    request<{ items: Message[] }>(`/conversations/${conversationId}/messages`),
+  // 用量统计
+  listUsage: (params: { group_by?: string; from?: string; to?: string; page?: number; size?: number } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => value !== undefined && value !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return request<UsagePage>(`/usage${query ? `?${query}` : ""}`);
+  },
 };
 
 export function cartItems(): CartItem[] {
@@ -345,14 +478,17 @@ export interface StreamEvent {
 /**
  * Agent 对话走 SSE 流式返回：逐帧解析 data: 行并回调页面。
  * 不能用 response.json()，否则会等到整段结束时才更新 UI。
+ * 新增支持 conversationId 和 providerId 参数。
  */
 export async function chatStream(
   skill: string,
   message: string,
   sessionId: string,
   onEvent: (event: StreamEvent) => void,
+  conversationId?: string,
+  providerId?: string,
 ): Promise<void> {
-  // 流式接口同样要保证 token 已恢复，否则刷新页面后首条消息会以匿名身份被拒
+  // 流式接口同样要保证 token 已恢复,否则刷新页面后首条消息会以匿名身份被拒
   await ensureAccessToken();
   const response = await fetch(`/api/agents/${skill}/chat`, {
     method: "POST",
@@ -361,7 +497,12 @@ export async function chatStream(
       "Content-Type": "application/json",
       ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     },
-    body: JSON.stringify({ message, session_id: sessionId }),
+    body: JSON.stringify({
+      message,
+      session_id: sessionId,
+      conversation_id: conversationId,
+      provider_id: providerId,
+    }),
   });
   if (!response.ok || !response.body) throw new Error("Agent 连接失败");
   const reader = response.body.getReader();
@@ -370,7 +511,7 @@ export async function chatStream(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    // 按空行切分 SSE 事件；最后一段可能不完整，留在 buffer 等下一帧再拼。
+    // 按空行切分 SSE 事件；最后一段可能不完整,留在 buffer 等下一帧再拼。
     buffer += decoder.decode(value, { stream: true });
     const chunks = buffer.split("\n\n");
     buffer = chunks.pop() || "";

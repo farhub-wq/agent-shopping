@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chatStream, api, getSession, type StreamEvent } from "../lib/api";
+import { chatStream, api, getSession, type StreamEvent, ModelProvider, Conversation } from "../lib/api";
 
 interface Message {
   role: "user" | "assistant";
@@ -25,13 +25,44 @@ export default function Agent() {
   const [busy, setBusy] = useState(false);
   // 流式答案的累积文本：逐 delta 追加，final 落库后清空，渲染成打字机效果。
   const [streaming, setStreaming] = useState("");
+  // 模型提供商列表与当前选中的 provider
+  const [providers, setProviders] = useState<ModelProvider[]>([]);
+  const [providerId, setProviderId] = useState<string | undefined>(undefined);
+  // 会话列表与当前会话
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationId, setConversationId] = useState<string | undefined>(undefined);
   // 会话 id 在页面生命周期内固定，让多轮对话共享 Agent 的上下文与记忆。
   const sessionId = useRef(`web-${crypto.randomUUID().slice(0, 8)}`);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     api.agents().then((data) => setAgents(data.items || [])).catch((exc) => setError(exc.message));
+    // 加载模型提供商列表和会话历史（仅登录用户）
+    if (session) {
+      api.listProviders().then((data) => setProviders(data.items || [])).catch((exc) => setError(exc.message));
+      loadConversations();
+    }
   }, []);
+
+  async function loadConversations() {
+    try {
+      const data = await api.listConversations({ skill, page: 1, size: 20 });
+      setConversations(data.items || []);
+    } catch (exc) {
+      setError((exc as Error).message);
+    }
+  }
+
+  async function loadConversationMessages(convId: string) {
+    try {
+      const data = await api.listMessages(convId);
+      // 将历史消息恢复到对话框
+      setMessages(data.items.map(msg => ({ role: msg.role as "user" | "assistant", text: msg.content })));
+      setConversationId(convId);
+    } catch (exc) {
+      setError((exc as Error).message);
+    }
+  }
 
   useEffect(() => {
     // 新消息、等待中或流式累积中自动滚到底部，保证流式输出始终可见。
@@ -58,9 +89,11 @@ export default function Agent() {
           setRunId(result.run_id);
           setMessages((prev) => [...prev, { role: "assistant", text: result.answer }]);
           setStreaming("");
+          // 刷新会话列表
+          if (session) loadConversations();
         }
         if (event.type === "error") setError(event.message);
-      });
+      }, conversationId, providerId);
     } catch (exc) {
       setError((exc as Error).message);
     } finally {
@@ -99,6 +132,61 @@ export default function Agent() {
       </aside>
 
       <section className="agent-main">
+        {/* provider 选择器 */}
+        {session && providers.length > 0 && (
+          <div className="panel" style={{ padding: "0.75rem 1rem", marginBottom: "1rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+              <label style={{ fontSize: "0.875rem", fontWeight: 500 }}>选择模型:</label>
+              <select
+                style={{
+                  flex: 1,
+                  border: "1px solid #d1d5db",
+                  borderRadius: "0.375rem",
+                  padding: "0.5rem",
+                  fontSize: "0.875rem",
+                }}
+                value={providerId || ""}
+                onChange={(e) => setProviderId(e.target.value || undefined)}
+              >
+                <option value="">默认模型</option>
+                {providers.filter(p => p.enabled).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.model})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
+        {/* 会话历史 */}
+        {session && conversations.length > 0 && (
+          <div className="panel" style={{ padding: "0.75rem 1rem", marginBottom: "1rem", maxHeight: "150px", overflow: "auto" }}>
+            <h3 style={{ fontSize: "0.875rem", fontWeight: 600, marginBottom: "0.5rem" }}>历史会话</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+              {conversations.map((conv) => (
+                <button
+                  key={conv.id}
+                  onClick={() => loadConversationMessages(conv.id)}
+                  className={conv.id === conversationId ? "chip active" : "chip"}
+                  style={{
+                    textAlign: "left",
+                    padding: "0.5rem",
+                    fontSize: "0.8125rem",
+                    border: conv.id === conversationId ? "1px solid #3b82f6" : "1px solid #e5e7eb",
+                    borderRadius: "0.375rem",
+                  }}
+                >
+                  {conv.title || conv.id.slice(0, 8)}
+                  <small style={{ marginLeft: "0.5rem", color: "#9ca3af" }}>
+                    {new Date(conv.last_message_at).toLocaleString()}
+                  </small>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="chat-window">
           {messages.length === 0 && (
             <div className="chat-empty">

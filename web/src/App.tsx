@@ -10,6 +10,8 @@ import Audit from "./pages/Audit";
 import Mfa from "./pages/Mfa";
 import Chargebacks from "./pages/Chargebacks";
 import Agent from "./pages/Agent";
+import ModelSettings from "./pages/ModelSettings";
+import Usage from "./pages/Usage";
 
 const PHONE_PATTERN = /^1[3-9]\d{9}$/;
 
@@ -106,6 +108,10 @@ function Header({ session, onSession }: { session: Session | null; onSession: (s
         {session?.role === "admin" && <NavLink to="/audit">审计日志</NavLink>}
         {/* 管理员自己的双因素认证设置，仅管理员可见。 */}
         {session?.role === "admin" && <NavLink to="/mfa">安全设置</NavLink>}
+        {/* 模型设置：所有登录用户可配置自己的模型提供商 */}
+        {session && <NavLink to="/models">模型设置</NavLink>}
+        {/* 用量监控：仅运营与管理员可查看全局用量 */}
+        {(session?.role === "operator" || session?.role === "admin") && <NavLink to="/usage">用量监控</NavLink>}
         {/* 拒付处置是资金风险操作，运营与管理员都可见，服务端再校验。 */}
         {(session?.role === "operator" || session?.role === "admin") && <NavLink to="/chargebacks">拒付处理</NavLink>}
       </nav>
@@ -185,6 +191,8 @@ export default function App() {
           <Route path="/ops" element={<Ops />} />
           <Route path="/audit" element={<Audit />} />
           <Route path="/mfa" element={<Mfa />} />
+          <Route path="/models" element={<ModelSettings />} />
+          <Route path="/usage" element={<Usage />} />
           <Route path="/chargebacks" element={<Chargebacks />} />
           <Route path="/agent" element={<Agent />} />
         </Routes>
