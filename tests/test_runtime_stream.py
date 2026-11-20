@@ -53,16 +53,16 @@ class _FakeMemory:
     async def retrieve(self, user_id, message, k=5):
         return []
 
-    async def working_messages(self, session_id, limit=6):
+    async def working_messages(self, user_id, session_id, limit=6):
         return []
 
-    async def append_turn(self, session_id, role, text):
+    async def append_turn(self, user_id, session_id, role, text):
         return None
 
     async def remember(self, user_id, text, *, kind, importance, tenant, metadata):
         return "r1"
 
-    async def summarize_session(self, session_id, user_id):
+    async def summarize_session(self, user_id, session_id):
         return None
 
 
