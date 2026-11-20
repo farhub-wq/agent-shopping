@@ -58,6 +58,10 @@ class ToolContext:
     # 本次运行是否已收到沙箱执行输出：输出属于低信任数据，
     # 一旦为 True，后续写/不可逆动作一律转人工复核。
     untrusted_output: bool = False
+    # 用量落库与对话持久化所需的归属信息；离线/访客路径下保持 None。
+    conversation_id: str | None = None
+    provider_id: str | None = None
+    provider_model: str | None = None
 
     def is_staff(self) -> bool:
         return self.role in {"operator", "admin"}

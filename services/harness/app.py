@@ -1,6 +1,8 @@
 import json
+import math
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,23 +18,38 @@ from shop_common.config import (
     get_settings,
     validate_production_settings,
 )
+from shop_common.db import dispose_engine, get_session_factory, init_models
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import EventBus, create_redis
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
 from shop_common.mongo import close_mongo
 from shop_common.sandbox import MAX_CODE_CHARS
+from sqlalchemy import case, func, select
 
-from .core.llm import build_provider
+from .core.crypto import decrypt_model_key
+from .core.llm import build_provider, build_provider_from_record
 from .core.manifest import load_all, load_skill
 from .core.mcp import MCPHub, MCPServer, build_mcp_hub, discover_and_register
 from .core.memory import MemoryManager
 from .core.policy import summarize
-from .core.runtime import AgentRuntime
+from .core.providers import (
+    PRESETS,
+    create_provider,
+    delete_provider,
+    ensure_default_free_ai,
+    list_visible_providers,
+    resolve_provider,
+    test_provider,
+    to_dict,
+    update_provider,
+)
+from .core.runtime import AgentRuntime, persist_usage
 from .core.sandbox import SandboxManager, validate_sandbox_production
 from .core.tools import ToolContext, registry
 from .core.tools_impl import BUSINESS_TOOLS  # noqa: F401  （导入即注册业务工具）
 from .core.trace import load_trace
+from .models import Conversation, Message, ModelProvider, UsageRecord
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -54,13 +71,18 @@ async def lifespan(_: FastAPI):
     configure_logging("harness")
     # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
     # harness 还要签发给 runner 的请求，因此额外要求独立的 RUNNER_SIGNING_SECRET，
-    # 避免业务内网密钥同时成为执行沙箱代码的凭据。
+    # 避免业务内网密钥同时成为执行沙箱代码的凭据。模型密钥主密钥同样不许沿用默认值。
     validate_production_settings(
-        settings, secrets=(*COMMON_SECRETS, *RUNNER_SECRETS)
+        settings, secrets=(*COMMON_SECRETS, *RUNNER_SECRETS, "model_key_encryption_key")
     )
     # 生产未启用远程沙箱时拒绝启动：本地子进程与 harness 同权限，等于内网任意代码执行。
     validate_sandbox_production(settings)
-    # 记忆与轨迹都在 Mongo 里，不再需要建关系表；索引由各模块首次使用时幂等补建。
+    # harness 自本轮起有独立关系库（模型提供商/会话/消息/用量），dev/test 用 create_all 补表，
+    # 生产走 Alembic 迁移；记忆与轨迹仍在 Mongo，不受影响。
+    await init_models()
+    async with get_session_factory()() as session:
+        await ensure_default_free_ai(session)
+    # 记忆与轨迹都在 Mongo 里；索引由各模块首次使用时幂等补建。
     redis = create_redis(settings.resolved_redis_url)
     # harness 只发布审计事件不消费，无需会话工厂；session_factory 仅消费路径会用到
     bus = EventBus(redis, namespace="shop", session_factory=None)
@@ -68,7 +90,10 @@ async def lifespan(_: FastAPI):
     # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
     # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
     skills = {item.name: item for item in load_all(SKILL_ROOT)}
-    runtime = AgentRuntime(registry, build_provider(redis), skills, memory)
+    # usage_sink 注入真实用量落库；离线/测试环境不写库也不影响运行。
+    # 提前构建 provider 并注入 runtime，以便在 shutdown 时关闭其连接池
+    provider = build_provider(redis)
+    runtime = AgentRuntime(registry, provider, skills, memory, usage_sink=persist_usage)
     # 启动时发现并注册远端 MCP 工具；放在 MCPServer 之前，让 /mcp、/tools 清单与工具网关一致。
     mcp_hub = build_mcp_hub(settings.mcp_http_servers)
     discovered = await discover_and_register(registry, mcp_hub)
@@ -76,8 +101,12 @@ async def lifespan(_: FastAPI):
     mcp_server = MCPServer("shop-agent-harness", registry)
     logger.info("已加载 %s 个技能：%s", len(skills), ", ".join(skills))
     yield
+    # 优雅关闭：先关闭 HTTP 客户端连接池，再释放数据库与缓存连接
+    if hasattr(provider, 'close'):
+        await provider.close()
     await redis.close()
     await close_mongo()
+    await dispose_engine()
 
 
 app = FastAPI(title="agent-harness", version="0.1.0", lifespan=lifespan)
@@ -88,6 +117,28 @@ install_metrics(app, "harness")
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     session_id: str | None = None
+    conversation_id: str | None = None
+    provider_id: str | None = None
+
+
+class ProviderCreate(BaseModel):
+    provider_type: str
+    name: str = Field(min_length=1, max_length=64)
+    base_url: str = Field(min_length=1, max_length=256)
+    model: str = Field(min_length=1, max_length=64)
+    api_key: str = ""
+    # shared=True 表示创建全局共享（owner 为空，仅 staff 可创建）；否则记当前用户私有。
+    shared: bool = False
+    is_default: bool = False
+
+
+class ProviderUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    model: str | None = Field(default=None, min_length=1, max_length=64)
+    base_url: str | None = Field(default=None, min_length=1, max_length=256)
+    api_key: str | None = None
+    is_default: bool | None = None
+    enabled: bool | None = None
 
 
 class MemoryWrite(BaseModel):
@@ -109,14 +160,80 @@ class SandboxRequest(BaseModel):
     timeout: int | None = Field(default=None, ge=1)
 
 
-def _ctx(principal, session_id: str | None) -> ToolContext:
+def _ctx(principal, session_id: str | None, *, conversation_id: str | None = None,
+         provider_id: str | None = None, provider_model: str | None = None) -> ToolContext:
     return ToolContext(
         user_id=principal.user_id,
         role=principal.role,
         tenant=principal.tenant,
         session_id=session_id or f"s-{uuid.uuid4().hex[:12]}",
         run_id=uuid.uuid4().hex,
+        conversation_id=conversation_id,
+        provider_id=provider_id,
+        provider_model=provider_model,
     )
+
+
+async def _persist_assistant(conversation_id: str, answer: str) -> None:
+    """会话助手消息落库并推进 last_message_at；失败只记日志，不阻断已完成的回答。"""
+    try:
+        async with get_session_factory()() as session:
+            conv = await session.get(Conversation, conversation_id)
+            if conv is None:
+                return
+            session.add(
+                Message(id=uuid.uuid4().hex, conversation_id=conversation_id, role="assistant", content=answer)
+            )
+            conv.last_message_at = datetime.now(UTC)
+            await session.commit()
+    except Exception:
+        logger.exception("会话助手消息持久化失败 conversation_id=%s", conversation_id)
+
+
+async def _owned_provider(session, provider_id: str, principal) -> ModelProvider:
+    """加载 provider 并做归属校验：共享只许 staff 动，私有只许本人动，跨租户一律 404。"""
+    record = await session.get(ModelProvider, provider_id)
+    if record is None or record.tenant_id != principal.tenant:
+        raise ApiError("NOT_FOUND", "provider 不存在")
+    if record.owner_user_id is None:
+        if not principal.is_staff():
+            raise ApiError("FORBIDDEN", "无权操作共享 provider")
+    elif record.owner_user_id != principal.user_id:
+        raise ApiError("FORBIDDEN", "无权操作他人 provider")
+    return record
+
+
+def _decrypt_or_error(token: str) -> str:
+    try:
+        return decrypt_model_key(token)
+    except ValueError as exc:
+        raise ApiError("BAD_REQUEST", str(exc)) from exc
+
+
+def _conv_dict(conv: Conversation) -> dict[str, Any]:
+    return {
+        "id": conv.id,
+        "skill": conv.skill,
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat() if conv.created_at else None,
+        "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+    }
+
+
+def _parse_dt(value: str | None, name: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ApiError("BAD_REQUEST", f"{name} 时间格式不合法") from exc
+
+
+def _p95(values: list[int]) -> int:
+    if not values:
+        return 0
+    values.sort()
+    return values[math.ceil(0.95 * len(values)) - 1]
 
 
 @app.get("/healthz")
@@ -191,14 +308,85 @@ async def chat(
     stream: bool = Query(True),
 ):
     assert runtime is not None
-    ctx = _ctx(principal, payload.session_id)
+    # 访客只用环境默认/离线模型，会话与用量都不落库，保持既有匿名体验。
+    is_guest = principal.user_id == "guest"
+
+    provider = build_provider(redis)
+    provider_id: str | None = None
+    provider_model: str | None = None
+    conversation_id = payload.conversation_id
+
+    if not is_guest:
+        async with get_session_factory()() as session:
+            # provider 解析：显式 provider_id → 用户私有最近 → 共享默认免费 AI。
+            # 命中但 key 为空（免费 AI 尚未填 key）时回退环境/离线模型。
+            record = await resolve_provider(
+                session,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant,
+                provider_id=payload.provider_id,
+            )
+            if record is not None and record.api_key_enc:
+                provider = build_provider_from_record(
+                    redis,
+                    base_url=record.base_url,
+                    api_key=decrypt_model_key(record.api_key_enc),
+                    model=record.model,
+                    provider_type=record.provider_type,
+                    provider_id=record.id,
+                )
+                provider_id = record.id
+                provider_model = record.model
+
+            # 会话归属校验：conversation_id 非空必须属于当前用户与租户，否则 403（IDOR）。
+            if conversation_id:
+                conv = await session.get(Conversation, conversation_id)
+                if conv is None or conv.user_id != principal.user_id or conv.tenant_id != principal.tenant:
+                    raise ApiError("FORBIDDEN", "无权访问该会话")
+            else:
+                conv = Conversation(
+                    id=uuid.uuid4().hex,
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant,
+                    skill=skill_name,
+                    title=payload.message[:30],
+                )
+                session.add(conv)
+            session.add(
+                Message(id=uuid.uuid4().hex, conversation_id=conv.id, role="user", content=payload.message)
+            )
+            conv.last_message_at = datetime.now(UTC)
+            await session.commit()
+            conversation_id = conv.id
+
+    # session_id 保留兼容：缺省时用 conversation_id 作为 Redis 工作记忆后缀，
+    # 同用户多轮对话能续上上下文；user_id 前缀已在 memory 层隔离不同用户。
+    session_id = payload.session_id or conversation_id or f"s-{uuid.uuid4().hex[:12]}"
+    ctx = _ctx(
+        principal,
+        session_id,
+        conversation_id=conversation_id,
+        provider_id=provider_id,
+        provider_model=provider_model,
+    )
+
     if not stream:
-        result = await runtime.run(skill_name, payload.message, ctx)
+        result = await runtime.run(skill_name, payload.message, ctx, provider=provider)
+        if not is_guest and conversation_id:
+            await _persist_assistant(conversation_id, result.answer)
         return result.to_dict()
 
     async def generator():
-        async for event in runtime.run_stream(skill_name, payload.message, ctx):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        answer = ""
+        try:
+            async for event in runtime.run_stream(skill_name, payload.message, ctx, provider=provider):
+                if event.get("type") == "final":
+                    answer = event.get("result", {}).get("answer", "")
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            # 流结束（含异常收尾）后补落助手消息，不让持久化失败中断 SSE。
+            if not is_guest and conversation_id and answer:
+                await _persist_assistant(conversation_id, answer)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generator(), media_type="text/event-stream")
@@ -335,3 +523,198 @@ async def mcp_endpoint(request: Request, principal: PrincipalDep) -> dict[str, A
     # 这是「manifest 不能提权」在 MCP 入口上的同一原则。
     trust = "certified" if principal.role == "admin" else ("vendor" if principal.role == "operator" else "reviewed")
     return await mcp_server.handle(body, ctx, trust=trust)
+
+
+@app.get("/providers/presets")
+async def provider_presets() -> dict[str, Any]:
+    # 公开元数据：只含厂商端点与默认模型，无任何密钥。
+    return {"items": [{"key": key, **preset} for key, preset in PRESETS.items()]}
+
+
+@app.get("/providers")
+async def list_providers(principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        records = await list_visible_providers(
+            session,
+            user_id=principal.user_id,
+            tenant_id=principal.tenant,
+            is_staff=principal.is_staff(),
+        )
+    return {"items": [to_dict(record) for record in records]}
+
+
+@app.post("/providers", status_code=201)
+async def create_provider_route(payload: ProviderCreate, principal: PrincipalDep) -> dict[str, Any]:
+    if payload.shared and not principal.is_staff():
+        raise ApiError("FORBIDDEN", "仅运营人员可创建共享 provider")
+    owner = None if payload.shared else principal.user_id
+    # 系统默认只认共享 provider（解析链的默认步按 owner 为空过滤），
+    # 私有 provider 的 is_default 无意义，这里直接不落。
+    is_default = payload.is_default and payload.shared
+    async with get_session_factory()() as session:
+        record = await create_provider(
+            session,
+            owner_user_id=owner,
+            tenant_id=principal.tenant,
+            provider_type=payload.provider_type,
+            name=payload.name,
+            base_url=payload.base_url,
+            model=payload.model,
+            api_key=payload.api_key,
+            is_default=is_default,
+        )
+    return to_dict(record)
+
+
+@app.patch("/providers/{provider_id}")
+async def patch_provider(provider_id: str, payload: ProviderUpdate, principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        record = await _owned_provider(session, provider_id, principal)
+        if payload.is_default and record.owner_user_id is not None:
+            raise ApiError("FORBIDDEN", "仅共享 provider 可设为默认")
+        record = await update_provider(
+            session,
+            record,
+            name=payload.name,
+            model=payload.model,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            is_default=payload.is_default,
+            enabled=payload.enabled,
+        )
+    return to_dict(record)
+
+
+@app.delete("/providers/{provider_id}")
+async def remove_provider(provider_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        record = await _owned_provider(session, provider_id, principal)
+        await delete_provider(session, record)
+    return {"deleted": True}
+
+
+@app.post("/providers/{provider_id}/test")
+async def test_provider_route(provider_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        record = await _owned_provider(session, provider_id, principal)
+        if not record.api_key_enc:
+            return {"ok": False, "latency_ms": 0, "message": "尚未配置密钥"}
+        api_key = _decrypt_or_error(record.api_key_enc)
+        base_url, model, provider_type = record.base_url, record.model, record.provider_type
+    ok, latency_ms, message = await test_provider(base_url, api_key, model, provider_type)
+    return {"ok": ok, "latency_ms": latency_ms, "message": message}
+
+
+@app.get("/conversations")
+async def list_conversations(
+    principal: PrincipalDep,
+    skill: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    filters = [Conversation.user_id == principal.user_id, Conversation.tenant_id == principal.tenant]
+    if skill:
+        filters.append(Conversation.skill == skill)
+    async with get_session_factory()() as session:
+        total = await session.scalar(select(func.count()).select_from(Conversation).where(*filters))
+        rows = await session.execute(
+            select(Conversation)
+            .where(*filters)
+            .order_by(Conversation.last_message_at.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+        )
+        items = [_conv_dict(conv) for conv in rows.scalars().all()]
+    return {"items": items, "page": page, "size": size, "total": total or 0}
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def list_messages(conversation_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        conv = await session.get(Conversation, conversation_id)
+        if conv is None or conv.user_id != principal.user_id or conv.tenant_id != principal.tenant:
+            raise ApiError("FORBIDDEN", "无权访问该会话")
+        rows = await session.execute(
+            select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+        )
+        items = [
+            {
+                "id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "tool_calls": msg.tool_calls_json,
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+            for msg in rows.scalars().all()
+        ]
+    return {"items": items}
+
+
+@app.get("/usage")
+async def usage(
+    principal: PrincipalDep,
+    group_by: str = Query("day"),
+    start: str | None = Query(None, alias="from"),
+    end: str | None = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    # 用量聚合涉及跨用户与成本口径，只对运营/管理员开放。
+    principal.require_staff()
+    if group_by not in {"day", "model", "user"}:
+        raise ApiError("BAD_REQUEST", "group_by 必须是 day/model/user 之一")
+    started, ended = _parse_dt(start, "from"), _parse_dt(end, "to")
+    filters = []
+    if started:
+        filters.append(UsageRecord.created_at >= started)
+    if ended:
+        filters.append(UsageRecord.created_at < ended)
+
+    if group_by == "day":
+        key = func.date(UsageRecord.created_at)
+    elif group_by == "model":
+        key = UsageRecord.model
+    else:
+        key = UsageRecord.user_id
+
+    async with get_session_factory()() as session:
+        rows = await session.execute(
+            select(
+                key.label("key"),
+                func.sum(UsageRecord.prompt_tokens).label("prompt_tokens"),
+                func.sum(UsageRecord.completion_tokens).label("completion_tokens"),
+                func.sum(UsageRecord.total_tokens).label("total_tokens"),
+                func.count().label("calls"),
+                func.sum(case((UsageRecord.status != "ok", 1), else_=0)).label("errors"),
+                func.avg(UsageRecord.latency_ms).label("avg_latency_ms"),
+            )
+            .where(*filters)
+            .group_by(key)
+        )
+        # p95 无法用 SQL 聚合表达式统一表示（MySQL/SQLite 差异大），
+        # 单独取各组的延迟值在 Python 里算分位，量级受时间范围约束。
+        latency_rows = await session.execute(
+            select(key.label("key"), UsageRecord.latency_ms).where(*filters)
+        )
+        latencies: dict[Any, list[int]] = {}
+        for group_key, latency in latency_rows.all():
+            latencies.setdefault(group_key, []).append(int(latency or 0))
+
+    items = []
+    for row in rows.all():
+        group_key = row.key
+        items.append(
+            {
+                "key": str(group_key),
+                "prompt_tokens": int(row.prompt_tokens or 0),
+                "completion_tokens": int(row.completion_tokens or 0),
+                "total_tokens": int(row.total_tokens or 0),
+                "calls": int(row.calls or 0),
+                "errors": int(row.errors or 0),
+                "avg_latency_ms": int(row.avg_latency_ms or 0),
+                "p95_latency_ms": _p95(latencies.get(group_key, [])),
+            }
+        )
+    total = len(items)
+    start_idx = (page - 1) * size
+    return {"items": items[start_idx : start_idx + size], "page": page, "size": size, "total": total}

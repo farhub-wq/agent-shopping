@@ -9,6 +9,7 @@
 端点故障时回退哈希向量，并按向量维度隔离新旧两个向量空间。
 """
 
+import asyncio
 import hashlib
 import json
 import math
@@ -171,6 +172,8 @@ class MemoryManager:
         # 主嵌入失败时的离线保底：哈希向量与主嵌入可能不同维，落盘时标签记录实际来源。
         self._fallback = HashingEmbedder(settings.embedding_dim)
         self._indexed = False
+        # 索引初始化锁：防止并发请求重复创建索引
+        self._index_lock = asyncio.Lock()
 
     async def _embed(self, text: str) -> tuple[list[float], str]:
         # 嵌入是增强路径不是关键路径：失败回退哈希并打点，保证记忆写入/召回不因端点故障 5xx。
@@ -188,31 +191,36 @@ class MemoryManager:
         """首次访问时补建索引；create_index 幂等，重复调用不会报错。"""
         if self._indexed:
             return
-        collection = self._collection()
-        # (user_id, kind, created_at) 支撑去重时按用户+类型取最近记录；
-        # (user_id, created_at) 支撑列表的时间排序；
-        # (user_id, embedder, importance|created_at) 支撑有界召回的两路候选：
-        # embedder 等值过滤在索引层隔离向量空间，排序不回表全扫。
-        await collection.create_index([("user_id", 1), ("kind", 1), ("created_at", -1)])
-        await collection.create_index([("user_id", 1), ("created_at", -1)])
-        await collection.create_index([("user_id", 1), ("embedder", 1), ("importance", -1)])
-        await collection.create_index([("user_id", 1), ("embedder", 1), ("created_at", -1)])
-        self._indexed = True
+        # 用锁防止并发请求重复执行索引创建，减少 MongoDB 锁等待
+        async with self._index_lock:
+            # 双重检查：其他协程可能已在等锁期间完成创建
+            if self._indexed:
+                return
+            collection = self._collection()
+            # (user_id, kind, created_at) 支撑去重时按用户+类型取最近记录；
+            # (user_id, created_at) 支撑列表的时间排序；
+            # (user_id, embedder, importance|created_at) 支撑有界召回的两路候选：
+            # embedder 等值过滤在索引层隔离向量空间，排序不回表全扫。
+            await collection.create_index([("user_id", 1), ("kind", 1), ("created_at", -1)])
+            await collection.create_index([("user_id", 1), ("created_at", -1)])
+            await collection.create_index([("user_id", 1), ("embedder", 1), ("importance", -1)])
+            await collection.create_index([("user_id", 1), ("embedder", 1), ("created_at", -1)])
+            self._indexed = True
 
-    def _work_key(self, session_id: str) -> str:
-        return f"{self.namespace}:mem:work:{session_id}"
+    def _work_key(self, user_id: str, session_id: str) -> str:
+        # 加 user_id 前缀：session_id 由前端自造，不同用户撞同值时必须互不可见（IDOR）。
+        return f"{self.namespace}:mem:work:{user_id}:{session_id}"
 
-    async def append_turn(self, session_id: str, role: str, content: str, max_turns: int = 12) -> None:
+    async def append_turn(self, user_id: str, session_id: str, role: str, content: str, max_turns: int = 12) -> None:
         # 工作记忆只保留最近 max_turns 轮并设 24h 过期：
         # 上下文成本有上界，也避免 Redis key 无限增长。
-        await self.redis.lpush(
-            self._work_key(session_id), json.dumps({"role": role, "content": content}, ensure_ascii=False)
-        )
-        await self.redis.ltrim(self._work_key(session_id), 0, max_turns - 1)
-        await self.redis.expire(self._work_key(session_id), 86400)
+        key = self._work_key(user_id, session_id)
+        await self.redis.lpush(key, json.dumps({"role": role, "content": content}, ensure_ascii=False))
+        await self.redis.ltrim(key, 0, max_turns - 1)
+        await self.redis.expire(key, 86400)
 
-    async def working_messages(self, session_id: str, limit: int = 8) -> list[dict[str, str]]:
-        raw = await self.redis.lrange(self._work_key(session_id), 0, limit - 1)
+    async def working_messages(self, user_id: str, session_id: str, limit: int = 8) -> list[dict[str, str]]:
+        raw = await self.redis.lrange(self._work_key(user_id, session_id), 0, limit - 1)
         return [json.loads(item) for item in reversed(raw)]
 
     async def extract_semantic(
@@ -427,9 +435,9 @@ class MemoryManager:
             )
         return selected
 
-    async def summarize_session(self, session_id: str, user_id: str, keep_turns: int = 4) -> str | None:
+    async def summarize_session(self, user_id: str, session_id: str, keep_turns: int = 4) -> str | None:
         """把较早的工作记忆压缩成情节记忆，只保留最近若干轮原文。"""
-        messages = await self.working_messages(session_id, limit=24)
+        messages = await self.working_messages(user_id, session_id, limit=24)
         if len(messages) < keep_turns + 2:
             return None
         # 早于 keep_turns 的轮次压成一条摘要落情节记忆，Redis 里只留最近的原文，
@@ -440,7 +448,7 @@ class MemoryManager:
             user_id, f"会话摘要：{summary}", kind="episodic", importance=0.6,
             metadata={"session_id": session_id, "summarized": True},
         )
-        await self.redis.ltrim(self._work_key(session_id), 0, keep_turns - 1)
+        await self.redis.ltrim(self._work_key(user_id, session_id), 0, keep_turns - 1)
         return summary
 
     async def list_records(self, user_id: str) -> list[dict[str, Any]]:

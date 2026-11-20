@@ -6,6 +6,7 @@
 
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +36,7 @@ class Decision:
     steps: list[dict[str, Any]] = field(default_factory=list)  # plan 的有序工具步骤 [{tool, args}]
     usage: dict[str, Any] = field(default_factory=dict)
     model: str = ""  # 产出该决策的模型名，供证据卡审计降级/熔断来源
+    latency_ms: int = 0  # 本次模型调用的耗时，供用量记录汇总
 
 
 def parse_decision(message: dict[str, Any], tools: list[dict[str, Any]]) -> Decision:
@@ -231,6 +233,21 @@ class OpenAICompatibleProvider(LLMProvider):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        # 连接池复用：减少连接建立开销，避免高并发下 TIME_WAIT 连接堆积
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """惰性创建并复用 HTTP 客户端，避免每次请求都新建连接。"""
+        if self._client is None:
+            limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+            self._client = httpx.AsyncClient(timeout=self.timeout, limits=limits)
+        return self._client
+
+    async def close(self) -> None:
+        """关闭 HTTP 客户端，释放连接池资源。"""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     def _payload(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], stream: bool
@@ -256,24 +273,30 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         if stream:
             payload["stream"] = True
+            # 流式下默认不返回 usage，显式声明才在收尾块带上真实 token 数，供用量落库。
+            payload["stream_options"] = {"include_usage": True}
         return payload
 
     async def decide(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> Decision:
         payload = self._payload(system, messages, tools, stream=False)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-            response.raise_for_status()
-            body = response.json()
+        started = time.perf_counter()
+        # 复用客户端连接池
+        client = self._get_client()
+        response = await client.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+        response.raise_for_status()
+        body = response.json()
         message = body["choices"][0]["message"]
         usage = body.get("usage", {})
         decision = parse_decision(message, tools)
         decision.usage = usage
+        decision.model = self.model
+        decision.latency_ms = int((time.perf_counter() - started) * 1000)
         return decision
 
     async def decide_stream(
@@ -283,15 +306,18 @@ class OpenAICompatibleProvider(LLMProvider):
         content_parts: list[str] = []
         # 并行 tool_calls 的参数拆在多帧里，按 index 归位累积，避免串到同一工具的 args。
         tool_parts: dict[int, list[str]] = {}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
+        usage: dict[str, Any] = {}
+        started = time.perf_counter()
+        # 复用客户端连接池
+        client = self._get_client()
+        async with client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
                     data = line[len("data:") :].strip()
@@ -302,6 +328,9 @@ class OpenAICompatibleProvider(LLMProvider):
                     except ValueError:
                         # 偶发的非 JSON 心跳行直接跳过，不中断流。
                         continue
+                    # 声明 include_usage 后，最后一块带 usage 且无 choices，单独收下。
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
                     content_delta, tool_deltas = _openai_stream_delta(chunk)
                     if content_delta:
                         content_parts.append(content_delta)
@@ -312,6 +341,7 @@ class OpenAICompatibleProvider(LLMProvider):
                             entry[0] = name_delta
                         if args_delta:
                             entry[1] += args_delta
+        latency_ms = int((time.perf_counter() - started) * 1000)
         if tool_parts:
             # 组装成伪 message 交给 parse_decision 统一校验（单个 → tool，多个 → plan）。
             tool_calls = [
@@ -320,9 +350,17 @@ class OpenAICompatibleProvider(LLMProvider):
             ]
             decision = parse_decision({"tool_calls": tool_calls}, tools)
             decision.model = self.model
+            decision.usage = usage
+            decision.latency_ms = latency_ms
             yield decision
             return
-        yield Decision(kind="final", content="".join(content_parts), model=self.model)
+        yield Decision(
+            kind="final",
+            content="".join(content_parts),
+            model=self.model,
+            usage=usage,
+            latency_ms=latency_ms,
+        )
 
 
 def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, list[tuple[int, str, str]]]:
@@ -342,6 +380,223 @@ def _openai_stream_delta(chunk: dict[str, Any]) -> tuple[str, list[tuple[int, st
         index = tool_call.get("index", position)
         deltas.append((index, name, args))
     return content, deltas
+
+
+class AnthropicProvider(LLMProvider):
+    """Anthropic Messages API 适配器（POST {base_url}/messages）。
+
+    与 OpenAI 兼容端点最大的差异在消息格式：工具调用不是独立的 tool_calls 字段，
+    而是 assistant 内容块里的 tool_use，工具结果以 user 消息里的 tool_result 回填。
+    这里做一层转换，让运行时 ReAct 循环继续用统一的 OpenAI 形状消息，转换后的
+    tool_calls 仍经 parse_decision 统一校验。
+    """
+
+    name = "anthropic"
+
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 15.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        # 连接池复用
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """惰性创建并复用 HTTP 客户端。"""
+        if self._client is None:
+            limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+            self._client = httpx.AsyncClient(timeout=self.timeout, limits=limits)
+        return self._client
+
+    async def close(self) -> None:
+        """关闭 HTTP 客户端，释放连接池资源。"""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _payload(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], stream: bool
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": _to_anthropic_messages(messages),
+            # Anthropic 工具 schema 直接用 input_schema 字段，不需要 OpenAI 的 function 包装。
+            "tools": [
+                {"name": item["name"], "description": item["description"], "input_schema": item["input_schema"]}
+                for item in tools
+            ],
+        }
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def _headers(self) -> dict[str, str]:
+        return {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+
+    async def decide(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> Decision:
+        payload = self._payload(system, messages, tools, stream=False)
+        started = time.perf_counter()
+        # 复用客户端连接池
+        client = self._get_client()
+        response = await client.post(f"{self.base_url}/messages", json=payload, headers=self._headers())
+        response.raise_for_status()
+        body = response.json()
+        content, tool_calls, usage = _anthropic_response_parts(body)
+        decision = parse_decision({"content": content, "tool_calls": tool_calls}, tools)
+        decision.usage = usage
+        decision.model = self.model
+        decision.latency_ms = int((time.perf_counter() - started) * 1000)
+        return decision
+
+    async def decide_stream(
+        self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[Decision]:
+        payload = self._payload(system, messages, tools, stream=True)
+        text_parts: list[str] = []
+        # tool_use 的 name 在 content_block_start 给出，参数拆在后续 input_json_delta 分帧累积。
+        tool_blocks: dict[int, dict[str, str]] = {}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        started = time.perf_counter()
+        # 复用客户端连接池
+        client = self._get_client()
+        async with client.stream(
+            "POST", f"{self.base_url}/messages", json=payload, headers=self._headers()
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        event = json.loads(line[len("data:") :].strip())
+                    except ValueError:
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "content_block_start":
+                        block = event.get("content_block") or {}
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text") or "")
+                        elif block.get("type") == "tool_use":
+                            tool_blocks[event.get("index", 0)] = {
+                                "name": block.get("name") or "",
+                                "args": "",
+                            }
+                    elif event_type == "content_block_delta":
+                        delta = event.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            part = delta.get("text") or ""
+                            text_parts.append(part)
+                            yield Decision(kind="delta", content=part)
+                        elif delta.get("type") == "input_json_delta":
+                            index = event.get("index", 0)
+                            tool_blocks.setdefault(index, {"name": "", "args": ""})
+                            tool_blocks[index]["args"] += delta.get("partial_json") or ""
+                    elif event_type == "message_start":
+                        _merge_anthropic_usage(usage, (event.get("message") or {}).get("usage") or {})
+                    elif event_type == "message_delta":
+                        _merge_anthropic_usage(usage, event.get("usage") or {})
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        if tool_blocks:
+            tool_calls = [
+                {"function": {"name": block["name"], "arguments": block["args"] or "{}"}}
+                for _, block in sorted(tool_blocks.items())
+            ]
+            decision = parse_decision({"tool_calls": tool_calls}, tools)
+            decision.model = self.model
+            decision.usage = usage
+            decision.latency_ms = latency_ms
+            yield decision
+            return
+        yield Decision(
+            kind="final",
+            content="".join(text_parts),
+            model=self.model,
+            usage=usage,
+            latency_ms=latency_ms,
+        )
+
+
+def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # 连续多条 tool 消息合并成一条 user 消息（多个 tool_result 块），符合 Anthropic 推荐格式；
+    # assistant 的 tool_calls 转成 tool_use 内容块，其余文本消息原样透传。
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        role = message.get("role")
+        if role == "tool":
+            blocks: list[dict[str, Any]] = []
+            while i < len(messages) and messages[i].get("role") == "tool":
+                blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": messages[i].get("tool_call_id") or "",
+                        "content": str(messages[i].get("content") or ""),
+                    }
+                )
+                i += 1
+            out.append({"role": "user", "content": blocks})
+            continue
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                blocks = []
+                for call in tool_calls:
+                    function = call.get("function") or {}
+                    try:
+                        args = json.loads(function.get("arguments") or "{}")
+                    except ValueError:
+                        args = {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call.get("id") or "",
+                            "name": function.get("name") or "",
+                            "input": args,
+                        }
+                    )
+                out.append({"role": "assistant", "content": blocks})
+            else:
+                out.append({"role": "assistant", "content": str(message.get("content") or "")})
+        else:
+            out.append({"role": "user", "content": str(message.get("content") or "")})
+        i += 1
+    return out
+
+
+def _anthropic_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    # 把 Anthropic 非流式响应拆成 OpenAI 形状的 (content, tool_calls, usage)，复用 parse_decision。
+    content = ""
+    tool_calls: list[dict[str, Any]] = []
+    for block in body.get("content") or []:
+        if block.get("type") == "text":
+            content += block.get("text") or ""
+        elif block.get("type") == "tool_use":
+            tool_calls.append(
+                {
+                    "function": {
+                        "name": block.get("name") or "",
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    }
+                }
+            )
+    return content, tool_calls, _anthropic_usage_to_openai(body.get("usage") or {})
+
+
+def _anthropic_usage_to_openai(usage: dict[str, Any]) -> dict[str, Any]:
+    prompt = int(usage.get("input_tokens") or 0)
+    completion = int(usage.get("output_tokens") or 0)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _merge_anthropic_usage(acc: dict[str, Any], usage: dict[str, Any]) -> None:
+    # 流式下 input_tokens 在 message_start、output_tokens 在 message_delta，分两次合并。
+    acc["prompt_tokens"] += int(usage.get("input_tokens") or 0)
+    acc["completion_tokens"] += int(usage.get("output_tokens") or 0)
+    acc["total_tokens"] = acc["prompt_tokens"] + acc["completion_tokens"]
 
 
 # 双模型都不可用时的兜底话术：明确引导转人工，且必须是 final 决策，避免循环里反复试模型。
@@ -390,6 +645,13 @@ class FailoverProvider(LLMProvider):
         self.fallback = fallback
         self.breaker = breaker
         self.canned_message = canned_message
+
+    async def close(self) -> None:
+        """关闭主备模型的 HTTP 客户端。"""
+        if hasattr(self.primary, 'close'):
+            await self.primary.close()
+        if hasattr(self.fallback, 'close'):
+            await self.fallback.close()
 
     async def decide(
         self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -488,3 +750,34 @@ def build_provider(redis: Any) -> LLMProvider:
     )
     logger.info("主模型 %s + 降级模型 %s", settings.llm_model, fallback.name)
     return FailoverProvider(primary, fallback, breaker)
+
+
+def build_provider_from_record(
+    redis: Any,
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    provider_type: str,
+    provider_id: str,
+) -> LLMProvider:
+    """按数据库里的用户/组织模型记录构建 provider（含降级与熔断）。
+
+    与全局 build_provider 的区别：降级统一用固定话术（用户自配的第三方 key 挂了
+    不应悄悄切到别的模型产生额外费用），熔断器按 provider_id 命名，让每个自配
+    模型独立开路，互不拖累。
+    """
+    settings = get_settings()
+    timeout = settings.llm_timeout_seconds
+    if provider_type == "anthropic":
+        primary: LLMProvider = AnthropicProvider(base_url, api_key, model, timeout=timeout)
+    else:
+        primary = OpenAICompatibleProvider(base_url, api_key, model, timeout=timeout)
+
+    breaker = CircuitBreaker(
+        redis,
+        f"provider-{provider_id}",
+        failure_threshold=settings.llm_failure_threshold,
+        cooldown_seconds=settings.llm_cooldown_seconds,
+    )
+    return FailoverProvider(primary, CannedProvider(), breaker)
