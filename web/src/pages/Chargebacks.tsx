@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, getSession, money, type Chargeback } from "../lib/api";
+import { api, getSession, money, type Chargeback } from "../api";
 
 const PAGE_SIZE = 20;
 

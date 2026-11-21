@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, money, type Session } from "../lib/api";
+import { api, money, type FeedItem, type Session } from "../api";
 
 const CATEGORIES = [
   { key: "", label: "全部" },
@@ -11,7 +11,7 @@ const CATEGORIES = [
 ];
 
 export default function Home({ session }: { session: Session | null }) {
-  const [items, setItems] = useState<any[]>([]);
+  const [items, setItems] = useState<FeedItem[]>([]);
   const [category, setCategory] = useState("");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");

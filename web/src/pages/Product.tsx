@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { addToCart, api, money } from "../lib/api";
+import { addToCart, api, money, type ProductPage } from "../api";
 
 export default function Product() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  const [data, setData] = useState<any>(null);
+  const [data, setData] = useState<ProductPage | null>(null);
   const [qty, setQty] = useState(1);
   const [error, setError] = useState("");
 

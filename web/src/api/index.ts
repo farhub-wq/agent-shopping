@@ -138,6 +138,167 @@ export interface UsagePage {
   total: number;
 }
 
+// ======== 业务领域类型：与各服务响应字段对齐，组件只消费这些收窄后的类型 ========
+
+// 商城首页商品（storefront/feed）
+export interface FeedItem {
+  id: string;
+  image_url: string;
+  title: string;
+  category: string;
+  subtitle: string;
+  price_cents: number;
+  available: number;
+}
+
+// 商品详情 + 库存快照（storefront/products/:id）
+export interface ProductDetail {
+  id: string;
+  sku: string;
+  title: string;
+  image_url: string;
+  category: string;
+  subtitle: string;
+  description: string;
+  attributes: Record<string, unknown>;
+  price_cents: number;
+}
+
+export interface StockSnapshot {
+  available: number;
+}
+
+export interface ProductPage {
+  product: ProductDetail;
+  stock: StockSnapshot;
+}
+
+// 订单行（storefront/orders、/orders）
+export interface OrderItem {
+  item_id: string;
+  title: string;
+  qty: number;
+  refunded_qty?: number;
+  sku?: string;
+}
+
+export interface Order {
+  id: string;
+  order_no: string;
+  status: string;
+  amount_cents: number;
+  user_id?: string;
+  payment_id?: string | null;
+  items: OrderItem[];
+}
+
+// 售后工单（aftersales/tickets）
+export interface TicketRecommendation {
+  recommendation: string;
+  confidence: number;
+  rationale: string;
+}
+
+export interface Ticket {
+  id: string;
+  ticket_no: string;
+  status: string;
+  amount_cents: number;
+  order_id?: string;
+  reason?: string;
+  description?: string;
+  decision_note?: string;
+  risk_score?: number;
+  risk_reasons?: string[];
+  agent_recommendation?: TicketRecommendation;
+}
+
+// 履约单（fulfillment/shipments）
+export interface ShipmentItem {
+  order_item_id: string;
+  sku: string;
+  qty: number;
+}
+
+export interface Shipment {
+  id: string;
+  order_id: string;
+  status: string;
+  sla_flagged: boolean;
+  deadline_at: string;
+  tracking_no: string | null;
+  items: ShipmentItem[];
+}
+
+// 库存行（inventory/stocks）
+export interface InventoryRow {
+  sku: string;
+  total: number;
+  reserved: number;
+  available: number;
+}
+
+// 订单状态轨迹（orders/:id/timeline）
+export interface TimelineEvent {
+  from: string;
+  to: string;
+  event: string;
+  actor: string;
+  at: string;
+}
+
+export interface Timeline {
+  status_label: string;
+  events: TimelineEvent[];
+}
+
+// Agent 列表项（/agents）
+export interface AgentInfo {
+  name: string;
+  description: string;
+  trust: string;
+  allowed_tools: string[];
+}
+
+// 运行证据卡（/agents/runs/:id/evidence）
+export interface Evidence {
+  run_id: string;
+  skill: string;
+  trust: string;
+  status: string;
+  tool_calls: unknown;
+  denied_calls: unknown;
+}
+
+// 下单请求体（storefront/checkout）
+export interface CheckoutPayload {
+  items: { sku: string; qty: number }[];
+  address: Record<string, string>;
+}
+
+// 售后建单请求体（aftersales/tickets）
+export interface CreateTicketPayload {
+  order_id: string;
+  reason: string;
+  description: string;
+  type: string;
+  order_item_id?: string;
+  quantity?: number;
+}
+
+// Agent SSE 流式事件的 trace 步骤（渲染运行证据用）
+export interface TraceStep {
+  type: string;
+  tool?: string;
+  status?: string;
+  duration_ms?: number;
+}
+
+export interface StreamFinal {
+  run_id: string;
+  answer: string;
+}
+
 export function getSession(): Session | null {
   const raw = localStorage.getItem(SESSION_KEY);
   return raw ? (JSON.parse(raw) as Session) : null;
@@ -294,7 +455,7 @@ async function ensureAccessToken(): Promise<void> {
  * 全站唯一的 HTTP 出口：统一拼 /api 前缀、注入登录态、解析错误响应。
  * 页面组件不得自行 fetch，避免路径与鉴权头散落各处。
  */
-async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string> | undefined),
@@ -324,25 +485,25 @@ export const api = {
     const query = new URLSearchParams(
       Object.entries(params).filter(([, value]) => value) as [string, string][],
     ).toString();
-    return request(`/storefront/feed${query ? `?${query}` : ""}`);
+    return request<{ items: FeedItem[] }>(`/storefront/feed${query ? `?${query}` : ""}`);
   },
-  product: (productId: string) => request(`/storefront/products/${productId}`),
+  product: (productId: string) => request<ProductPage>(`/storefront/products/${productId}`),
   // 下单必须带 Idempotency-Key，由调用方生成，保证重复提交不会产生重复订单。
-  checkout: (payload: any, idempotencyKey: string) =>
+  checkout: (payload: CheckoutPayload, idempotencyKey: string) =>
     request("/storefront/checkout", {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify(payload),
     }),
-  orders: (status?: string) => request(`/storefront/orders${status ? `?status=${status}` : ""}`),
+  orders: (status?: string) => request<{ items: Order[] }>(`/storefront/orders${status ? `?status=${status}` : ""}`),
   // 支付由独立 payment 服务处理：前端只拿 payment_id 调 mock 收银台确认
   pay: (paymentId: string) =>
     request(`/storefront/payments/${paymentId}/pay`, { method: "POST" }),
-  timeline: (orderId: string) => request(`/orders/${orderId}/timeline`),
-  inventory: () => request("/inventory/stocks"),
+  timeline: (orderId: string) => request<Timeline>(`/orders/${orderId}/timeline`),
+  inventory: () => request<{ items: InventoryRow[] }>("/inventory/stocks"),
   setStock: (sku: string, total: number) =>
     request("/inventory/stocktake", { method: "POST", body: JSON.stringify({ sku, total }) }),
-  shipments: (status?: string) => request(`/fulfillment/shipments${status ? `?status=${status}` : ""}`),
+  shipments: (status?: string) => request<{ items: Shipment[] }>(`/fulfillment/shipments${status ? `?status=${status}` : ""}`),
   ship: (shipmentId: string, items?: { order_item_id: string; qty: number }[]) =>
     request(`/fulfillment/shipments/${shipmentId}/ship`, {
       method: "POST",
@@ -350,17 +511,17 @@ export const api = {
     }),
   deliver: (shipmentId: string) =>
     request(`/fulfillment/shipments/${shipmentId}/deliver`, { method: "POST", body: "{}" }),
-  tickets: (status?: string) => request(`/aftersales/tickets${status ? `?status=${status}` : ""}`),
-  createTicket: (payload: any) =>
+  tickets: (status?: string) => request<{ items: Ticket[] }>(`/aftersales/tickets${status ? `?status=${status}` : ""}`),
+  createTicket: (payload: CreateTicketPayload) =>
     request("/aftersales/tickets", { method: "POST", body: JSON.stringify(payload) }),
   approveTicket: (ticketId: string) =>
     request(`/aftersales/tickets/${ticketId}/approve`, { method: "POST", body: JSON.stringify({ note: "人工审核通过" }) }),
   rejectTicket: (ticketId: string) =>
     request(`/aftersales/tickets/${ticketId}/reject`, { method: "POST", body: JSON.stringify({ note: "人工驳回" }) }),
-  agents: () => request("/agents"),
+  agents: () => request<{ items: AgentInfo[] }>("/agents"),
   policies: () => request("/policies"),
-  evidence: (runId: string) => request(`/agents/runs/${runId}/evidence`),
-  opsOrders: (status?: string) => request(`/orders${status ? `?status=${status}` : ""}`),
+  evidence: (runId: string) => request<Evidence>(`/agents/runs/${runId}/evidence`),
+  opsOrders: (status?: string) => request<{ items: Order[] }>(`/orders${status ? `?status=${status}` : ""}`),
   memory: (userId: string) => request(`/agents/memory/${userId}`),
   // 审计日志只对 admin 开放，服务端再校验一次；筛选字段可空，空值不拼进查询串
   listAuditLogs: (params: { action?: string; target_type?: string; target_id?: string; actor_id?: string; page?: number; size?: number } = {}) => {
@@ -470,10 +631,11 @@ export function clearCart() {
   saveCart([]);
 }
 
-export interface StreamEvent {
-  type: string;
-  [key: string]: any;
-}
+export type StreamEvent =
+  | { type: "trace"; event: TraceStep }
+  | { type: "delta"; text: string }
+  | { type: "final"; result: StreamFinal }
+  | { type: "error"; message: string };
 
 /**
  * Agent 对话走 SSE 流式返回：逐帧解析 data: 行并回调页面。
