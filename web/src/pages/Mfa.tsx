@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { confirmMfa, disableMfa, enrollMfa, getMfaStatus, getSession } from "../lib/api";
+import { confirmMfa, disableMfa, enrollMfa, getMfaStatus, getSession } from "../api";
 
 // 管理员双因素认证设置：绑定（enroll→confirm）、关闭（需重新校验密码）。
 // 二维码按确认结论以 otpauth 链接呈现，用户用 Authenticator 扫码或手动录入 secret。

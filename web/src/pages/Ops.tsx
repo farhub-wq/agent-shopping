@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, getSession, money } from "../lib/api";
+import { api, getSession, money, type InventoryRow, type Order, type Shipment, type Ticket } from "../api";
 
 type Tab = "inventory" | "orders" | "shipments" | "tickets";
+
+// 不同 tab 复用同一列表状态，渲染时按 tab 收窄到具体行类型。
+type OpsRow = InventoryRow | Order | Shipment | Ticket;
 
 export default function Ops() {
   const session = getSession();
   const [tab, setTab] = useState<Tab>("inventory");
-  const [rows, setRows] = useState<any[]>([]);
+  const [rows, setRows] = useState<OpsRow[]>([]);
   const [error, setError] = useState("");
 
   // 不同 tab 对应不同服务接口，切换后按当前 tab 重新取数，避免残留旧列表。
@@ -46,7 +49,7 @@ export default function Ops() {
   }
 
   // 所有运营动作成功后再拉一次列表，以服务端状态为准，避免本地乐观更新失真。
-  const act = async (fn: () => Promise<any>) => {
+  const act = async (fn: () => Promise<unknown>) => {
     try {
       await fn();
       await load();
@@ -56,7 +59,7 @@ export default function Ops() {
   };
 
   // 部分发货：逐行询问本次发出数量，全部默认发满即等价于整单发货
-  const shipPartial = async (shipment: any) => {
+  const shipPartial = async (shipment: Shipment) => {
     const items: { order_item_id: string; qty: number }[] = [];
     for (const item of shipment.items || []) {
       const value = window.prompt(
@@ -103,7 +106,7 @@ export default function Ops() {
               <tr><th>SKU</th><th>总量</th><th>预占</th><th>可售</th><th>操作</th></tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
+              {(rows as InventoryRow[]).map((row) => (
                 <tr key={row.sku}>
                   <td>{row.sku}</td>
                   <td>{row.total}</td>
@@ -130,14 +133,14 @@ export default function Ops() {
 
       {tab === "orders" && (
         <div className="list">
-          {rows.map((order) => (
+          {(rows as Order[]).map((order) => (
             <article className="panel order" key={order.id}>
               <header>
                 <strong>{order.order_no}</strong>
                 <span className={`status ${order.status.toLowerCase()}`}>{order.status}</span>
                 <span className="price">{money(order.amount_cents)}</span>
               </header>
-              <p className="muted">用户 {order.user_id} · {order.items?.map((item: any) => `${item.title}×${item.qty}`).join("，")}</p>
+              <p className="muted">用户 {order.user_id} · {order.items?.map((item) => `${item.title}×${item.qty}`).join("，")}</p>
             </article>
           ))}
         </div>
@@ -145,7 +148,7 @@ export default function Ops() {
 
       {tab === "shipments" && (
         <div className="list">
-          {rows.map((shipment) => (
+          {(rows as Shipment[]).map((shipment) => (
             <article className="panel order" key={shipment.id}>
               <header>
                 <strong>订单 {shipment.order_id.slice(0, 8)}</strong>
@@ -154,7 +157,7 @@ export default function Ops() {
               </header>
               <p className="muted">截止 {new Date(shipment.deadline_at).toLocaleString()} · 运单 {shipment.tracking_no || "-"}</p>
               <p className="muted">
-                {shipment.items?.map((item: any) => `${item.sku}×${item.qty}`).join("，") || "无履约行"}
+                {shipment.items?.map((item) => `${item.sku}×${item.qty}`).join("，") || "无履约行"}
               </p>
               <div className="row-actions">
                 {/* 履约动作按状态单向推进：pending 发货（可部分），shipped 后确认签收。 */}
@@ -176,7 +179,7 @@ export default function Ops() {
 
       {tab === "tickets" && (
         <div className="list">
-          {rows.map((ticket) => (
+          {(rows as Ticket[]).map((ticket) => (
             <article className="panel order" key={ticket.id}>
               <header>
                 <strong>{ticket.ticket_no}</strong>
@@ -188,9 +191,9 @@ export default function Ops() {
               {/* Agent 只给建议，通过/驳回仍是人工动作，前端不自动执行。 */}
               {ticket.agent_recommendation?.recommendation && (
                 <p className="advice">
-                  Agent 建议：{ticket.agent_recommendation.recommendation}（置信度 {ticket.agent_recommendation.confidence}）
+                  Agent 建议：{ticket.agent_recommendation?.recommendation}（置信度 {ticket.agent_recommendation?.confidence}）
                   <br />
-                  {ticket.agent_recommendation.rationale}
+                  {ticket.agent_recommendation?.rationale}
                 </p>
               )}
               <div className="row-actions">

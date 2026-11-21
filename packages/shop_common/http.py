@@ -18,6 +18,13 @@ class ServiceClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        # 惰性初始化连接池：首次调用才建 client，后续请求复用同一连接池。
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
     async def request(
         self,
@@ -33,7 +40,7 @@ class ServiceClient:
         for attempt in range(self.retries + 1):
             try:
                 # 复用连接池，显著降低服务间调用延迟
-                response = await self._client.request(method, url, json=json, headers=headers)
+                response = await self._get_client().request(method, url, json=json, headers=headers)
                 if response.status_code >= 500:
                     # 5xx 转成 HTTPStatusError，借统一异常分支触发重试。
                     raise httpx.HTTPStatusError(

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, getSession, money } from "../lib/api";
+import { api, getSession, money, type Order, type OrderItem, type Ticket, type Timeline, type TimelineEvent } from "../api";
 
 // 后端状态码到中文的展示映射；未命中的状态回退显示原始码，避免悄悄丢信息。
 const STATUS_LABELS: Record<string, string> = {
@@ -25,14 +25,14 @@ const REASONS = [
 ];
 
 // 行级可退数量 = 下单数量 − 已退数量；负数按 0 收口，历史脏数据不导致 UI 出现可退 -1
-const refundableQty = (item: any): number => Math.max(0, item.qty - (item.refunded_qty || 0));
+const refundableQty = (item: OrderItem): number => Math.max(0, item.qty - (item.refunded_qty || 0));
 
 export default function Orders() {
   const session = getSession();
   const [tab, setTab] = useState<"orders" | "tickets">("orders");
-  const [orders, setOrders] = useState<any[]>([]);
-  const [tickets, setTickets] = useState<any[]>([]);
-  const [timeline, setTimeline] = useState<any>(null);
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [formOrder, setFormOrder] = useState<string | null>(null);
   const [reason, setReason] = useState("quality_issue");
   const [description, setDescription] = useState("");
@@ -68,7 +68,7 @@ export default function Orders() {
     );
   }
 
-  const pay = async (paymentId: string | null) => {
+  const pay = async (paymentId: string | null | undefined) => {
     if (!paymentId) {
       setError("支付单尚未创建，请稍后重试");
       return;
@@ -95,7 +95,7 @@ export default function Orders() {
     try {
       // 顾客侧只发起「仅退款」申请，审批与退款由运营在后台完成。
       const order = orders.find((row) => row.id === orderId);
-      const item = order?.items?.find((row: any) => row.item_id === refundItemId);
+      const item = order?.items?.find((row) => row.item_id === refundItemId);
       await api.createTicket({
         order_id: orderId,
         reason,
@@ -132,7 +132,7 @@ export default function Orders() {
         <div className="list">
           {orders.map((order) => {
             // 模板只做展示：可退数量与上限在渲染前算好，避免把业务算术塞进 JSX
-            const selectedItem = order.items?.find((row: any) => row.item_id === refundItemId);
+            const selectedItem = order.items?.find((row) => row.item_id === refundItemId);
             const selectedMax = selectedItem ? Math.max(1, refundableQty(selectedItem)) : 1;
             return (
             <article className="panel order" key={order.id}>
@@ -144,7 +144,7 @@ export default function Orders() {
                 <strong className="price">{money(order.amount_cents)}</strong>
               </header>
               <ul className="items">
-                {order.items.map((item: any) => (
+                {order.items.map((item) => (
                   <li key={item.item_id}>
                     <span>{item.title}</span>
                     <span className="muted">{item.sku} × {item.qty}</span>
@@ -177,8 +177,8 @@ export default function Orders() {
                   }}>
                     <option value="">整单退款</option>
                     {order.items
-                      .filter((item: any) => refundableQty(item) > 0)
-                      .map((item: any) => (
+                      .filter((item) => refundableQty(item) > 0)
+                      .map((item) => (
                         <option key={item.item_id} value={item.item_id}>
                           {item.title}（可退 {refundableQty(item)} 件）
                         </option>
@@ -226,8 +226,8 @@ export default function Orders() {
               <p className="muted">订单 {ticket.order_id} · 原因 {ticket.reason}</p>
               <p>{ticket.decision_note}</p>
               {/* 风险评分与命中原因由售后规则计算，存在才展示，供用户理解审核依据。 */}
-              {ticket.risk_reasons?.length > 0 && (
-                <p className="hint">风险：{ticket.risk_reasons.join("；")}（评分 {ticket.risk_score}）</p>
+              {(ticket.risk_reasons?.length ?? 0) > 0 && (
+                <p className="hint">风险：{ticket.risk_reasons?.join("；")}（评分 {ticket.risk_score}）</p>
               )}
             </article>
           ))}
@@ -242,7 +242,7 @@ export default function Orders() {
             <button className="ghost" onClick={() => setTimeline(null)}>关闭</button>
           </div>
           <ol className="timeline">
-            {timeline.events.map((event: any, index: number) => (
+            {timeline.events.map((event, index) => (
               <li key={index}>
                 <strong>{event.from} → {event.to}</strong>
                 <span className="muted">事件 {event.event} · 操作者 {event.actor}</span>

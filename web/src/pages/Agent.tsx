@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chatStream, api, getSession, type StreamEvent, ModelProvider, Conversation } from "../lib/api";
+import { chatStream, api, getSession, type StreamEvent, type TraceStep, type AgentInfo, type Evidence, ModelProvider, Conversation } from "../api";
 
 interface Message {
   role: "user" | "assistant";
@@ -14,13 +14,13 @@ const QUICK_PROMPTS: Record<string, string[]> = {
 
 export default function Agent() {
   const session = getSession();
-  const [agents, setAgents] = useState<any[]>([]);
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [skill, setSkill] = useState("customer-service");
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [trace, setTrace] = useState<StreamEvent[]>([]);
+  const [trace, setTrace] = useState<TraceStep[]>([]);
   const [runId, setRunId] = useState("");
-  const [evidence, setEvidence] = useState<any>(null);
+  const [evidence, setEvidence] = useState<Evidence | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   // 流式答案的累积文本：逐 delta 追加，final 落库后清空，渲染成打字机效果。

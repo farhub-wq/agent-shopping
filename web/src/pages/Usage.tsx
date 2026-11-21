@@ -1,5 +1,5 @@
 ﻿import { useEffect, useState } from "react";
-import { api, UsageSummary } from "../lib/api";
+import { api, UsageSummary } from "../api";
 
 /**
  * 用量监控页面：展示 AI 模型调用的 token 用量、延迟、失败率等指标。
@@ -33,8 +33,8 @@ export default function Usage() {
       });
       setData(response.items);
       setTotal(response.total);
-    } catch (err: any) {
-      setError(err.message || "加载失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载失败");
     } finally {
       setLoading(false);
     }

@@ -531,6 +531,6 @@ class DockerRunner:
                 try:
                     container.remove(force=True)
                 except Exception:
-                    pass
+                    logger.exception("Docker 容器清理失败")
             # 每次执行都新建客户端，用完必须关闭，避免长期运行泄漏连接。
             client.close()

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, getSession, type AuditLog } from "../lib/api";
+import { api, getSession, type AuditLog } from "../api";
 
 const PAGE_SIZE = 20;
 

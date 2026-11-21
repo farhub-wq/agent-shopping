@@ -1,5 +1,5 @@
 ﻿import { useEffect, useState } from "react";
-import { api, getSession, ModelProvider, ProviderPreset } from "../lib/api";
+import { api, getSession, ModelProvider, ProviderPreset } from "../api";
 
 /**
  * 模型设置页面：管理 AI 模型提供商,支持多厂商接入、密钥配置、连通性测试。
@@ -45,8 +45,8 @@ export default function ModelSettings() {
       ]);
       setPresets(presetsRes.items);
       setProviders(providersRes.items);
-    } catch (err: any) {
-      setError(err.message || "加载失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载失败");
     } finally {
       setLoading(false);
     }
@@ -84,8 +84,8 @@ export default function ModelSettings() {
       }
       await loadData();
       resetForm();
-    } catch (err: any) {
-      setError(err.message || "保存失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存失败");
     }
   }
 
@@ -123,8 +123,8 @@ export default function ModelSettings() {
     try {
       await api.deleteProvider(id);
       await loadData();
-    } catch (err: any) {
-      setError(err.message || "删除失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败");
     }
   }
 
@@ -134,8 +134,8 @@ export default function ModelSettings() {
     try {
       const result = await api.testProvider(id);
       setTestResults({ ...testResults, [id]: result });
-    } catch (err: any) {
-      setError(err.message || "测试失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "测试失败");
     } finally {
       setTesting(null);
     }
@@ -146,8 +146,8 @@ export default function ModelSettings() {
     try {
       await api.updateProvider(id, { enabled: !enabled });
       await loadData();
-    } catch (err: any) {
-      setError(err.message || "更新失败");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新失败");
     }
   }
 

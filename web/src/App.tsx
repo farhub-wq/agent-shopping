@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, NavLink, Route, Routes, useNavigate } from "react-router-dom";
-import { ApiError, cartItems, getSession, login, logout, refreshSession, register, type Session } from "./lib/api";
+import { ApiError, cartItems, getSession, login, logout, refreshSession, register, type Session } from "./api";
 import Home from "./pages/Home";
 import Product from "./pages/Product";
 import Cart from "./pages/Cart";
@@ -182,7 +182,7 @@ export default function App() {
     <BrowserRouter>
       <Header session={session} onSession={setSession} />
       <main className="page">
-        {/* 页面组件只负责渲染与交互，所有接口调用都封在 lib/api.ts 里。 */}
+        {/* 页面组件只负责渲染与交互，所有接口调用都封在 api/index.ts 里。 */}
         <Routes>
           <Route path="/" element={<Home session={session} />} />
           <Route path="/product/:id" element={<Product />} />

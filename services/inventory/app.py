@@ -455,11 +455,17 @@ async def reserve(
             for item in payload.items
         ]
         try:
+            skus = [item.sku for item in payload.items]
+            existing = {
+                stock.sku: stock
+                for stock in (await session.execute(select(Stock).where(Stock.sku.in_(skus)))).scalars()
+            }
             for item in payload.items:
-                stock = await session.get(Stock, item.sku)
+                stock = existing.get(item.sku)
                 if stock is None:
                     stock = Stock(sku=item.sku, total=item.qty, reserved=0)
                     session.add(stock)
+                    existing[item.sku] = stock
                 stock.reserved += item.qty
             session.add_all(reservations)
             await session.commit()
