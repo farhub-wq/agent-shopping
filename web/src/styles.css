@@ -238,8 +238,52 @@ button { cursor: pointer; border: none; background: none; }
 .trace-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 8px 10px; border-radius: 8px; background: var(--bg); }
 .evidence { background: var(--ink); color: #d6ffef; padding: 14px; border-radius: 10px; font-size: 12px; overflow-x: auto; }
 
+/* 内页标题区：模型设置、用量监控等非营销页共用，标题层级低于首页 hero */
+.page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; padding: 6px 0 22px; }
+.page-head h1 { margin: 6px 0 8px; font-size: clamp(26px, 3vw, 34px); letter-spacing: -0.02em; }
+.page-head .muted { max-width: 640px; line-height: 1.65; font-size: 13px; }
+.page-head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* 设置页：左侧表单、右侧列表；移动端在媒体查询里收成单列 */
+.settings-layout { display: grid; grid-template-columns: minmax(320px, 0.85fr) 1.15fr; gap: 20px; align-items: start; }
+.settings-layout > .panel { margin-top: 0; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.form-grid .span-2 { grid-column: 1 / -1; }
+.form-actions { display: flex; gap: 10px; margin-top: 4px; }
+.preset-row { display: grid; gap: 8px; margin-bottom: 16px; }
+.panel label.check-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; color: var(--ink); }
+.panel label.check-row input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
+
+.provider-card { border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 10px; background: var(--bg); }
+.provider-card + .provider-card { margin-top: 12px; }
+.provider-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.provider-head h3 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.provider-meta { display: grid; gap: 4px; font-size: 12px; color: var(--muted); word-break: break-all; }
+.provider-card .row-actions { margin-top: 2px; }
+.ghost.danger { color: var(--red); border-color: #f0c9c4; }
+.ghost.danger:hover { border-color: var(--red); }
+
+/* 筛选区：自动分栏，最后按钮贴底对齐输入框 */
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; align-items: end; }
+.filters label { margin-bottom: 0; }
+.filters .filters-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* 指标卡：用量页顶部汇总 */
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-top: 18px; }
+.metric { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; display: grid; gap: 6px; }
+.metric span { font-size: 12px; color: var(--muted); }
+.metric strong { font-size: 22px; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+
+/* 宽表格横向滚动，数字列右对齐 */
+.table-wrap { overflow-x: auto; }
+.table-wrap .table { min-width: 720px; }
+.table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.table .num.bad { color: var(--red); }
+.table .table-empty { text-align: center; color: var(--muted); padding: 28px 8px; }
+
 @media (max-width: 900px) {
-  .hero, .detail, .two-col, .agent-layout { grid-template-columns: 1fr; }
+  .hero, .detail, .two-col, .agent-layout, .settings-layout { grid-template-columns: 1fr; }
+  .form-grid { grid-template-columns: 1fr; }
   .topbar { flex-wrap: wrap; padding: 12px 16px; gap: 12px; }
   .nav { order: 3; width: 100%; overflow-x: auto; }
   .page { padding: 20px 16px 48px; }
