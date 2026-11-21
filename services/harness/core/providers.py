@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import ModelProvider
-from .crypto import encrypt_model_key, mask_key
+from .crypto import decrypt_model_key, encrypt_model_key, mask_key
 
 # 内置厂商预设：前端下拉的公开元数据，用户只需补 key 与模型名。
 # anthropic 与 openai_compatible 的 base_url 统一带版本段，调用方直接拼 /messages
@@ -127,7 +127,7 @@ def to_dict(record: ModelProvider) -> dict:
         "is_default": record.is_default,
         "enabled": record.enabled,
         "has_key": bool(record.api_key_enc),
-        "key_masked": mask_key(record.api_key_enc),
+        "key_masked": mask_key(decrypt_model_key(record.api_key_enc)) if record.api_key_enc else "",
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
     }

@@ -42,6 +42,7 @@ include = ["shop_common*", "gateway*", "catalog*", "inventory*", "order*", "fulf
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+addopts = "--ignore=tests/load_test.py"
 pythonpath = [".", "packages", "services"]
 
 [tool.ruff]

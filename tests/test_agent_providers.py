@@ -101,7 +101,11 @@ async def test_default_free_ai_seeded_idempotently():
 
 
 @pytest.mark.asyncio
-async def test_resolve_provider_chain_and_ownership():
+async def test_resolve_provider_chain_and_ownership(monkeypatch):
+    # api.example.com 为占位域名，mock DNS 到公网 IP，避免测试依赖真实网络解析。
+    monkeypatch.setattr(
+        providers.socket, "getaddrinfo", lambda host, port: [("", "", 0, "", ("8.8.8.8", 0))]
+    )
     async with get_session_factory()() as session:
         await ensure_default_free_ai(session)
         # 用户 u1 建私有 provider
@@ -126,7 +130,10 @@ async def test_resolve_provider_chain_and_ownership():
 
 
 @pytest.mark.asyncio
-async def test_resolve_skips_disabled_provider():
+async def test_resolve_skips_disabled_provider(monkeypatch):
+    monkeypatch.setattr(
+        providers.socket, "getaddrinfo", lambda host, port: [("", "", 0, "", ("8.8.8.8", 0))]
+    )
     async with get_session_factory()() as session:
         await ensure_default_free_ai(session)
         mine = await create_provider(
