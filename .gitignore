@@ -12,3 +12,10 @@ data/
 .screenshots/
 *.tsbuildinfo
 AGENTS.md
+
+# AI 规范文档与本地配置（不提交）
+.clinerules/
+.ai/
+.husky/
+lint-staged.config.js
+skill规范.txt
