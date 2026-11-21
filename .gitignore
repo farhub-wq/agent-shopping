@@ -18,4 +18,5 @@ AGENTS.md
 .ai/
 .husky/
 lint-staged.config.js
+s.md
 skill规范.txt
