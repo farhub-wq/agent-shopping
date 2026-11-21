@@ -8,6 +8,8 @@ CREATE DATABASE IF NOT EXISTS aftersales_db CHARACTER SET utf8mb4 COLLATE utf8mb
 CREATE DATABASE IF NOT EXISTS identity_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 CREATE DATABASE IF NOT EXISTS payment_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 CREATE DATABASE IF NOT EXISTS audit_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+-- harness 自 2026-11 起有独立关系库：模型提供商、会话、消息、用量四张表
+CREATE DATABASE IF NOT EXISTS harness_db CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
 -- 应用账号名与 compose 的 MYSQL_USER 默认值保持一致；
 -- 若覆盖 MYSQL_USER，需要同步修改这里的账号名，否则服务连库会被拒绝。
@@ -19,4 +21,5 @@ GRANT ALL PRIVILEGES ON aftersales_db.* TO 'shop'@'%';
 GRANT ALL PRIVILEGES ON identity_db.* TO 'shop'@'%';
 GRANT ALL PRIVILEGES ON payment_db.* TO 'shop'@'%';
 GRANT ALL PRIVILEGES ON audit_db.* TO 'shop'@'%';
+GRANT ALL PRIVILEGES ON harness_db.* TO 'shop'@'%';
 FLUSH PRIVILEGES;

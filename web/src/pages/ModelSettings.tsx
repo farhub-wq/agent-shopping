@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+﻿﻿import { useEffect, useState } from "react";
 import { api, getSession, ModelProvider, ProviderPreset } from "../api";
 
 /**
@@ -151,116 +151,187 @@ export default function ModelSettings() {
     }
   }
 
-  if (loading) return <div className="container mx-auto p-6">加载中...</div>;
-
   return (
-    <div className="container mx-auto p-6 max-w-5xl">
-      <h1 className="text-3xl font-bold mb-6">模型设置</h1>
-
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-4">
-          {error}
+    <div>
+      <div className="page-head">
+        <div>
+          <p className="eyebrow">AI Providers</p>
+          <h1>模型设置</h1>
+          <p className="muted">
+            接入 DeepSeek、GLM、Claude、OpenAI 等厂商，填写密钥后即可测试连通性与延迟。
+            {isStaff && " 管理员创建的共享提供商会出现在所有用户的列表中。"}
+          </p>
         </div>
-      )}
-      <div className="bg-white shadow rounded-lg p-6 mb-8">
-        <h2 className="text-xl font-semibold mb-4">
-          {editingId ? "编辑提供商" : "添加新提供商"}
-        </h2>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {!editingId && (
+        {!loading && <span className="chip">{providers.length} 个提供商</span>}
+      </div>
+
+      {error && <p className="error">{error}</p>}
+
+      <div className="settings-layout">
+        <div className="panel">
+          <h2>{editingId ? "编辑提供商" : "添加提供商"}</h2>
+          <form onSubmit={handleSubmit}>
+            {/* 预设只用于快速填充字段，选中后仍可手工修改 */}
+            {!editingId && (
+              <div className="preset-row">
+                <span className="hint">快速选择预设厂商</span>
+                <div className="chips">
+                  {presets.map((preset) => (
+                    <button
+                      key={preset.key}
+                      type="button"
+                      className={selectedPreset === preset.key ? "chip active" : "chip"}
+                      onClick={() => applyPreset(preset.key)}
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                  {!presets.length && <span className="hint">暂无预设，可直接手工填写。</span>}
+                </div>
+              </div>
+            )}
+
+            <div className="form-grid">
+              <label className="span-2">
+                名称
+                <input
+                  type="text"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                  placeholder="例如 我的 DeepSeek"
+                  required
+                />
+              </label>
+              <label className="span-2">
+                Base URL
+                <input
+                  type="url"
+                  value={formData.base_url}
+                  onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                  placeholder="https://api.deepseek.com/v1"
+                  required
+                />
+              </label>
+              <label>
+                模型名称
+                <input
+                  type="text"
+                  value={formData.model}
+                  onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                  placeholder="deepseek-chat"
+                  required
+                />
+              </label>
+              <label>
+                API Key{editingId ? "（留空不更新）" : ""}
+                <input
+                  type="password"
+                  value={formData.api_key}
+                  onChange={(e) => setFormData({ ...formData, api_key: e.target.value })}
+                  placeholder={editingId ? "留空沿用旧密钥" : "sk-..."}
+                  required={!editingId}
+                />
+              </label>
+            </div>
+
+            {isStaff && (
+              <div>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={formData.shared}
+                    onChange={(e) => setFormData({ ...formData, shared: e.target.checked })}
+                    disabled={!!editingId}
+                  />
+                  全局共享（所有用户可见）
+                </label>
+                {formData.shared && (
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={formData.is_default}
+                      onChange={(e) => setFormData({ ...formData, is_default: e.target.checked })}
+                    />
+                    设为系统默认
+                  </label>
+                )}
+              </div>
+            )}
+
+            <div className="form-actions">
+              <button type="submit" className="primary small">{editingId ? "保存修改" : "添加提供商"}</button>
+              {editingId && (
+                <button type="button" className="ghost" onClick={resetForm}>取消</button>
+              )}
+            </div>
+          </form>
+        </div>
+
+        <div className="panel">
+          <div className="panel-head">
+            <h2>已配置的提供商</h2>
+            <span className="hint">每个用户可用自己的密钥，互不影响</span>
+          </div>
+
+          {loading ? (
+            <p className="muted center">加载中…</p>
+          ) : providers.length === 0 ? (
+            <p className="muted center">还没有提供商，先在左侧添加一个。</p>
+          ) : (
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">选择预设</label>
-              <select
-                className="w-full border border-gray-300 rounded-md px-3 py-2"
-                value={selectedPreset}
-                onChange={(e) => applyPreset(e.target.value)}
-              >
-                <option value="">-- 选择预设厂商 --</option>
-                {presets.map((p) => (
-                  <option key={p.key} value={p.key}>{p.name}</option>
-                ))}
-              </select>
+              {providers.map((provider) => {
+                const testResult = testResults[provider.id];
+                return (
+                  <article className="provider-card" key={provider.id}>
+                    <div className="provider-head">
+                      <div>
+                        <h3>
+                          {provider.name}
+                          {provider.is_default && <span className="status ok">默认</span>}
+                          {!provider.enabled && <span className="status">已停用</span>}
+                          {provider.owner_user_id === null && <span className="status">共享</span>}
+                        </h3>
+                        <div className="provider-meta">
+                          <span>模型 {provider.model} · 类型 {provider.provider_type}</span>
+                          <span>Base URL：{provider.base_url}</span>
+                          <span>密钥：{provider.has_key ? provider.key_masked : "未配置"}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {testResult && (
+                      testResult.ok ? (
+                        <p className="advice">连接成功，延迟 {testResult.latency_ms}ms</p>
+                      ) : (
+                        <p className="error">连接失败：{testResult.message}</p>
+                      )
+                    )}
+
+                    <div className="row-actions">
+                      <button
+                        className="ghost small"
+                        onClick={() => handleTest(provider.id)}
+                        disabled={testing === provider.id || !provider.has_key}
+                      >
+                        {testing === provider.id ? "测试中…" : "测试连通"}
+                      </button>
+                      <button className="ghost small" onClick={() => startEdit(provider)}>编辑</button>
+                      <button
+                        className="ghost small"
+                        onClick={() => handleToggleEnabled(provider.id, provider.enabled)}
+                      >
+                        {provider.enabled ? "停用" : "启用"}
+                      </button>
+                      {(provider.owner_user_id === session?.user_id || isStaff) && !provider.is_default && (
+                        <button className="ghost small danger" onClick={() => handleDelete(provider.id)}>删除</button>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           )}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">名称</label>
-            <input type="text" className="w-full border border-gray-300 rounded-md px-3 py-2" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} required />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
-            <input type="url" className="w-full border border-gray-300 rounded-md px-3 py-2" value={formData.base_url} onChange={(e) => setFormData({ ...formData, base_url: e.target.value })} required />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">模型名称</label>
-            <input type="text" className="w-full border border-gray-300 rounded-md px-3 py-2" value={formData.model} onChange={(e) => setFormData({ ...formData, model: e.target.value })} required />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">API Key {editingId && "(留空表示不更新)"}</label>
-            <input type="password" className="w-full border border-gray-300 rounded-md px-3 py-2" value={formData.api_key} onChange={(e) => setFormData({ ...formData, api_key: e.target.value })} placeholder={editingId ? "留空不更新密钥" : ""} required={!editingId} />
-          </div>
-          {isStaff && (
-            <>
-              <div className="flex items-center">
-                <input type="checkbox" id="shared" className="h-4 w-4 rounded border-gray-300" checked={formData.shared} onChange={(e) => setFormData({ ...formData, shared: e.target.checked })} disabled={!!editingId} />
-                <label htmlFor="shared" className="ml-2 text-sm text-gray-700">全局共享（所有用户可见）</label>
-              </div>
-              {formData.shared && (
-                <div className="flex items-center">
-                  <input type="checkbox" id="is_default" className="h-4 w-4 rounded border-gray-300" checked={formData.is_default} onChange={(e) => setFormData({ ...formData, is_default: e.target.checked })} />
-                  <label htmlFor="is_default" className="ml-2 text-sm text-gray-700">设为系统默认</label>
-                </div>
-              )}
-            </>
-          )}
-          <div className="flex gap-3">
-            <button type="submit" className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">{editingId ? "保存" : "添加"}</button>
-            {editingId && (
-              <button type="button" onClick={resetForm} className="bg-gray-300 text-gray-700 px-4 py-2 rounded-md hover:bg-gray-400">取消</button>
-            )}
-          </div>
-        </form>
-      </div>
-      <div className="bg-white shadow rounded-lg p-6">
-        <h2 className="text-xl font-semibold mb-4">已配置的提供商</h2>
-        {providers.length === 0 ? (
-          <p className="text-gray-500">暂无提供商</p>
-        ) : (
-          <div className="space-y-4">
-            {providers.map((provider) => {
-              const testResult = testResults[provider.id];
-              return (
-                <div key={provider.id} className="border border-gray-200 rounded-lg p-4 hover:shadow-md transition">
-                  <div className="flex justify-between items-start mb-2">
-                    <div>
-                      <h3 className="font-semibold text-lg">
-                        {provider.name}
-                        {provider.is_default && (<span className="ml-2 text-xs bg-green-100 text-green-700 px-2 py-1 rounded">默认</span>)}
-                        {!provider.enabled && (<span className="ml-2 text-xs bg-gray-100 text-gray-600 px-2 py-1 rounded">已停用</span>)}
-                        {provider.owner_user_id === null && (<span className="ml-2 text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">共享</span>)}
-                      </h3>
-                      <p className="text-sm text-gray-600 mt-1">模型: {provider.model} | 类型: {provider.provider_type}</p>
-                      <p className="text-sm text-gray-500 mt-1">Base URL: {provider.base_url}</p>
-                      <p className="text-sm text-gray-500">密钥: {provider.has_key ? provider.key_masked : "未配置"}</p>
-                    </div>
-                  </div>
-                  {testResult && (
-                    <div className={`mt-2 p-2 rounded text-sm ${testResult.ok ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"}`}>
-                      {testResult.ok ? `✓ 连接成功 (延迟: ${testResult.latency_ms}ms)` : `✗ ${testResult.message}`}
-                    </div>
-                  )}
-                  <div className="mt-4 flex gap-2">
-                    <button onClick={() => handleTest(provider.id)} disabled={testing === provider.id || !provider.has_key} className="text-sm bg-blue-100 text-blue-700 px-3 py-1 rounded hover:bg-blue-200 disabled:opacity-50">{testing === provider.id ? "测试中..." : "测试连通"}</button>
-                    <button onClick={() => startEdit(provider)} className="text-sm bg-gray-100 text-gray-700 px-3 py-1 rounded hover:bg-gray-200">编辑</button>
-                    <button onClick={() => handleToggleEnabled(provider.id, provider.enabled)} className="text-sm bg-gray-100 text-gray-700 px-3 py-1 rounded hover:bg-gray-200">{provider.enabled ? "停用" : "启用"}</button>
-                    {(provider.owner_user_id === session?.user_id || isStaff) && !provider.is_default && (
-                      <button onClick={() => handleDelete(provider.id)} className="text-sm bg-red-100 text-red-700 px-3 py-1 rounded hover:bg-red-200">删除</button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

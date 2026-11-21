@@ -34,12 +34,19 @@ SERVICES = {
     "aftersales": settings.aftersales_url,
     "agents": settings.harness_url,
     "harness": settings.harness_url,
+    # 模型设置 / 会话 / 用量都属于 harness 控制面，前端按根路径访问，这里做别名透传
+    "providers": settings.harness_url,
+    "conversations": settings.harness_url,
+    "usage": settings.harness_url,
     "payments": settings.payment_url,
     "audit": settings.audit_url,
 }
 
 RATE_LIMIT_PER_MINUTE = 120
 LOGIN_RATE_LIMIT_PER_MINUTE = 10
+# 未登录访客的 AI 对话额度：按客户端 IP 每天 3 次，登录用户不受此限
+GUEST_CHAT_DAILY_LIMIT = 3
+GUEST_USER_ID = "guest"
 
 # 服务名与下游真实路由前缀并非一一对应：inventory/orders/aftersales 带服务前缀，
 # fulfillment/harness 的路由没有前缀；agents 是 harness 的别名，还需要兼容
@@ -52,6 +59,10 @@ SERVICE_PATH_PREFIX = {
     "aftersales": "/aftersales",
     "payments": "/payments",
     "harness": "",
+    # harness 根路由别名：/api/providers/presets → harness /providers/presets
+    "providers": "/providers",
+    "conversations": "/conversations",
+    "usage": "/usage",
     "audit": "/audit",
 }
 # 这些路径属于 harness 根路由，不能再补 /agents 前缀
@@ -129,6 +140,33 @@ async def _hit(key: str) -> int:
 def _rate_limited(message: str) -> JSONResponse:
     # 中间件里抛 ApiError 到不了异常处理器，直接组装 429 响应返回
     return JSONResponse(status_code=429, content={"code": "RATE_LIMITED", "message": message, "details": {}})
+
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP：经过 nginx/负载均衡时用转发链首地址，本地直连回退 socket 地址。"""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _consume_guest_chat_quota(request: Request) -> None:
+    """匿名访客按 IP 每天最多 3 次 AI 对话。
+
+    Redis key 按 UTC 自然日分桶，跨天自动重置；TTL 多留一天，
+    避免零点前后旧桶提前过期导致额度被意外刷新。
+    """
+    assert redis is not None
+    day = time.strftime("%Y%m%d", time.gmtime())
+    key = f"shop:guest_chat:{_client_ip(request)}:{day}"
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 2 * 86400)
+    if count > GUEST_CHAT_DAILY_LIMIT:
+        raise ApiError(
+            "RATE_LIMITED",
+            f"访客每天最多 {GUEST_CHAT_DAILY_LIMIT} 次 AI 对话，登录后可继续使用",
+        )
 
 
 @app.middleware("http")
@@ -369,12 +407,60 @@ async def all_orders(request: Request, principal: PrincipalDep, status: str | No
     return response.json()
 
 
+async def _forward_harness(request: Request, principal: PrincipalDep, path: str) -> Response:
+    """透传无子路径的 harness 根接口（/providers、/conversations、/usage）。
+
+    这些接口前端按 /api/{name} 访问，命中不了带 {rest} 的通用代理，这里单独补一层。
+    状态码与响应体原样返回，避免前端把下游 4xx 当成功处理。
+    """
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in {"host", "content-length", "connection", "accept-encoding", "authorization"}
+    }
+    headers.update(_forward(principal, _request_id(request)))
+    async with httpx.AsyncClient(timeout=15) as client:
+        upstream = await client.request(
+            request.method,
+            f"{settings.harness_url}{path}",
+            params=request.query_params,
+            content=await request.body(),
+            headers=headers,
+        )
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+# 模型设置页：GET 列表 / POST 新建都落在 harness /providers
+@app.api_route("/api/providers", methods=["GET", "POST"])
+async def providers_root(request: Request, principal: PrincipalDep) -> Response:
+    return await _forward_harness(request, principal, "/providers")
+
+
+# 会话列表按用户隔离，分页与技能过滤都靠查询串透传
+@app.get("/api/conversations")
+async def conversations_root(request: Request, principal: PrincipalDep) -> Response:
+    return await _forward_harness(request, principal, "/conversations")
+
+
+# 用量统计只对运营/管理员开放，权限校验由 harness 侧完成
+@app.get("/api/usage")
+async def usage_root(request: Request, principal: PrincipalDep) -> Response:
+    return await _forward_harness(request, principal, "/usage")
+
+
 @app.api_route("/api/{service}/{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 async def proxy(service: str, rest: str, request: Request, principal: PrincipalDep):
     # 白名单命中校验：SERVICES 未登记的服务名直接 404，杜绝把网关当内网扫描器
     base = SERVICES.get(service)
     if base is None:
         raise ApiError("NOT_FOUND", f"未知服务 {service}")
+    # 访客（未登录）每天最多 3 次 AI 对话；登录用户与服务间调用不计数
+    if service in {"agents", "harness"} and rest.endswith("/chat") and principal.user_id == GUEST_USER_ID:
+        await _consume_guest_chat_quota(request)
     url = f"{base}{_upstream_path(service, rest)}"
     # 透传业务头但剔除 hop-by-hop 头（Host/Content-Length 等），否则 httpx 重建请求会冲突
     headers = {
