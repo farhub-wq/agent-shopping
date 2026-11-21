@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 from shop_common.errors import ApiError
-from sqlalchemy import select
+from sqlalchemy import not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import ModelProvider
@@ -145,9 +145,16 @@ def _visible_filter(user_id: str, tenant_id: str, is_staff: bool):
 async def list_visible_providers(
     session: AsyncSession, *, user_id: str, tenant_id: str, is_staff: bool
 ) -> list[ModelProvider]:
+    # 启动时自动写入的「默认免费」占位记录只用于解析链兜底，不进界面列表；
+    # 管理员配置出密钥后（api_key_enc 非空）说明确实在用，才恢复可见。
+    placeholder = not_(
+        ModelProvider.owner_user_id.is_(None)
+        & ModelProvider.is_default.is_(True)
+        & (ModelProvider.api_key_enc == "")
+    )
     result = await session.execute(
         select(ModelProvider)
-        .where(_visible_filter(user_id, tenant_id, is_staff))
+        .where(_visible_filter(user_id, tenant_id, is_staff), placeholder)
         .order_by(ModelProvider.created_at)
     )
     return list(result.scalars().all())
