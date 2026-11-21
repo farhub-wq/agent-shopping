@@ -191,7 +191,8 @@ services:
     build: { context: ., dockerfile: infra/Dockerfile, args: { SERVICE_NAME: harness } }
     environment:
       <<: *service-env
-      # Harness 的记忆与轨迹存 Mongo，不再需要关系库
+      # 记忆与轨迹仍存 Mongo；模型提供商/会话/消息/用量需要独立关系库
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-shop}:${MYSQL_PASSWORD:-shop}@mysql:3306/harness_db?charset=utf8mb4
       MONGO_URL: mongodb://mongo:27017
       MONGO_DB: ${MONGO_DB:-shop_harness}
       SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
