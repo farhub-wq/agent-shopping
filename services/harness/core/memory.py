@@ -28,6 +28,93 @@ from shop_common.logging import get_logger
 from shop_common.metrics import EMBEDDING_FALLBACK
 from shop_common.mongo import get_mongo_db
 
+from .context import estimate_tokens, working_token_budget
+
+# 工作记忆保留上限（消息条数）。真正的裁剪由 token 预算决定，
+# 这里只做一个防 Redis 无限增长的硬上限（约 100 轮对话）。
+WORKING_MEMORY_MAX_MESSAGES = 200
+
+# 摘要里值得长期保留的稳定标识：订单号 / SKU / 外部单号。
+_SUMMARY_PIN = re.compile(r"\b(?:SO|SKU|ORD)[-_]?[A-Z0-9]{3,}\b", re.IGNORECASE)
+_SUMMARY_MAX_PINNED = 20
+_SUMMARY_LINE_CHARS = 80
+
+
+def _one_line(text: str, limit: int) -> str:
+    return " ".join(text.split())[:limit]
+
+
+def extract_pinned_facts(texts: list[str]) -> list[str]:
+    """从原文中抽取订单号 / SKU 等稳定标识，作为摘要里永不丢弃的关键事实。"""
+    facts: list[str] = []
+    for text in texts:
+        for match in _SUMMARY_PIN.findall(text or ""):
+            token = match.upper()
+            if token not in facts:
+                facts.append(token)
+    return facts
+
+
+def merge_session_summary(
+    previous_text: str | None,
+    previous_meta: dict[str, Any] | None,
+    older: list[dict[str, str]],
+    *,
+    max_tokens: int = 300,
+) -> tuple[str, dict[str, Any]]:
+    """把本轮被裁掉的旧对话合并进已有摘要，返回 (摘要文本, 结构化元数据)。
+
+    不把旧摘要当原文再摘要：intent / pinned / digest 分字段保存，
+    每轮只追加新 digest、去重关键事实，再按 token 预算丢弃最旧的 digest。
+    这样多次压缩不会产生多条互相矛盾的摘要，也不会无限递归失真。
+    """
+    meta = previous_meta or {}
+    intent = str(meta.get("intent") or "")
+    if not intent:
+        intent = next(
+            (_one_line(message.get("content") or "", 100) for message in older if message.get("role") == "user"),
+            "",
+        )
+    pinned = [str(item) for item in (meta.get("pinned") or [])]
+    pinned += extract_pinned_facts([message.get("content") or "" for message in older])
+    deduped: list[str] = []
+    for item in pinned:
+        if item not in deduped:
+            deduped.append(item)
+
+    digest = [str(item) for item in (meta.get("digest") or [])]
+    if previous_text and not digest:
+        # 兼容早期只有纯文本、没有结构化元数据的摘要记录。
+        legacy = previous_text.replace("会话摘要：", "", 1)
+        digest.append(_one_line(legacy, 300))
+    chunk = "；".join(
+        f"{message.get('role')}:{_one_line(message.get('content') or '', _SUMMARY_LINE_CHARS)}"
+        for message in older
+        if (message.get("content") or "").strip()
+    )
+    if chunk:
+        digest.append(chunk)
+
+    def compose() -> str:
+        facts = "、".join(deduped[:_SUMMARY_MAX_PINNED]) or "无"
+        body = "；".join(digest) or "无"
+        return f"会话摘要：诉求：{intent or '未记录'}；关键事实：{facts}；经过：{body}"
+
+    text = compose()
+    # 超出预算时从最旧的 digest 丢起，intent 与 pinned 永不压缩。
+    while estimate_tokens(text) > max_tokens and len(digest) > 1:
+        digest.pop(0)
+        text = compose()
+    if estimate_tokens(text) > max_tokens:
+        text = text[: max_tokens * 3]
+    return text, {
+        "intent": intent,
+        "pinned": deduped[:_SUMMARY_MAX_PINNED],
+        "digest": digest,
+        "summary_level": 1,
+        "summary_merged": bool(previous_text),
+    }
+
 settings = get_settings()
 logger = get_logger(__name__)
 
@@ -211,17 +298,76 @@ class MemoryManager:
         # 加 user_id 前缀：session_id 由前端自造，不同用户撞同值时必须互不可见（IDOR）。
         return f"{self.namespace}:mem:work:{user_id}:{session_id}"
 
-    async def append_turn(self, user_id: str, session_id: str, role: str, content: str, max_turns: int = 12) -> None:
-        # 工作记忆只保留最近 max_turns 轮并设 24h 过期：
-        # 上下文成本有上界，也避免 Redis key 无限增长。
+    async def append_turn(
+        self, user_id: str, session_id: str, role: str, content: str, max_messages: int = WORKING_MEMORY_MAX_MESSAGES
+    ) -> None:
+        # 工作记忆保留最近若干消息并设 24h 过期：上下文成本由 token 预算控制，
+        # 这里只保证 Redis key 有硬上限、不无限增长。
         key = self._work_key(user_id, session_id)
         await self.redis.lpush(key, json.dumps({"role": role, "content": content}, ensure_ascii=False))
-        await self.redis.ltrim(key, 0, max_turns - 1)
+        await self.redis.ltrim(key, 0, max_messages - 1)
         await self.redis.expire(key, 86400)
 
     async def working_messages(self, user_id: str, session_id: str, limit: int = 8) -> list[dict[str, str]]:
         raw = await self.redis.lrange(self._work_key(user_id, session_id), 0, limit - 1)
         return [json.loads(item) for item in reversed(raw)]
+
+    async def has_working(self, user_id: str, session_id: str) -> bool:
+        """该会话是否还有未过期的 Redis 工作记忆（回灌前的判空依据）。"""
+        return bool(await self.redis.llen(self._work_key(user_id, session_id)))
+
+    async def seed_handoff(
+        self,
+        user_id: str,
+        session_id: str,
+        text: str,
+        pinned: list[str] | tuple[str, ...] = (),
+    ) -> bool:
+        """工作记忆为空时注入上一段会话的交接摘要。
+
+        已有工作记忆不覆盖：用户可能正在继续当前对话，把旧摘要塞到前面会污染上下文。
+        摘要以 system 角色放在最前，模型能读到但不会当作用户本轮诉求。
+        """
+        if not text:
+            return False
+        key = self._work_key(user_id, session_id)
+        if await self.redis.llen(key):
+            return False
+        content = text if text.startswith("会话摘要") else f"会话摘要：{text}"
+        if pinned:
+            content = f"{content}（关键事实：{'、'.join(str(item) for item in pinned)}）"
+        await self.redis.lpush(
+            key, json.dumps({"role": "system", "content": content}, ensure_ascii=False)
+        )
+        await self.redis.ltrim(key, 0, WORKING_MEMORY_MAX_MESSAGES - 1)
+        await self.redis.expire(key, 86400)
+        return True
+
+    async def latest_summary(self, user_id: str, session_id: str) -> dict[str, Any] | None:
+        """暴露会话摘要读取：拆分交接与会话回灌复用同一份摘要，避免两套口径。"""
+        return await self._find_session_summary(user_id, session_id)
+
+    async def context_messages(
+        self, user_id: str, session_id: str, *, budget_tokens: int, limit: int = WORKING_MEMORY_MAX_MESSAGES
+    ) -> tuple[list[dict[str, str]], int]:
+        """按 token 预算从最新往回装填工作记忆，返回 (消息, 被省略条数)。
+
+        与固定条数裁剪不同，这里保证「最近一轮一定可见」，再按剩余额度向前追溯；
+        超出额度的旧轮次被省略，条数通过第二个返回值交给上下文事件展示。
+        """
+        raw = await self.redis.lrange(self._work_key(user_id, session_id), 0, limit - 1)
+        history = [json.loads(item) for item in reversed(raw)]
+        selected: list[dict[str, str]] = []
+        used = 0
+        for message in reversed(history):
+            cost = estimate_tokens(message.get("content") or "")
+            # 最新一轮必须保留：即使单条超预算，也不能让模型看不到刚发生的事。
+            if selected and used + cost > budget_tokens:
+                break
+            selected.append(message)
+            used += cost
+        selected.reverse()
+        return selected, len(history) - len(selected)
 
     async def extract_semantic(
         self, user_id: str, text: str, tenant: str = "default", provider: Any = None
@@ -435,21 +581,80 @@ class MemoryManager:
             )
         return selected
 
-    async def summarize_session(self, user_id: str, session_id: str, keep_turns: int = 4) -> str | None:
-        """把较早的工作记忆压缩成情节记忆，只保留最近若干轮原文。"""
-        messages = await self.working_messages(user_id, session_id, limit=24)
-        if len(messages) < keep_turns + 2:
-            return None
-        # 早于 keep_turns 的轮次压成一条摘要落情节记忆，Redis 里只留最近的原文，
-        # 兼顾长期可追溯与短期上下文成本。
-        older = messages[:-keep_turns]
-        summary = "；".join(f"{item['role']}:{item['content'][:60]}" for item in older)[:500]
-        await self.remember(
-            user_id, f"会话摘要：{summary}", kind="episodic", importance=0.6,
-            metadata={"session_id": session_id, "summarized": True},
+    async def _find_session_summary(self, user_id: str, session_id: str) -> dict[str, Any] | None:
+        """定位当前会话的摘要记录：同一会话只维护一条，后续压缩在它上面合并。"""
+        await self._ensure_indexes()
+        return await self._collection().find_one(
+            {
+                "user_id": user_id,
+                "kind": "episodic",
+                "metadata.session_id": session_id,
+                "metadata.summarized": True,
+            },
+            sort=[("created_at", -1)],
         )
-        await self.redis.ltrim(self._work_key(user_id, session_id), 0, keep_turns - 1)
-        return summary
+
+    async def summarize_session(
+        self, user_id: str, session_id: str, keep_messages: int = WORKING_MEMORY_MAX_MESSAGES
+    ) -> str | None:
+        """把超出 token 预算的较早工作记忆合并进会话摘要，只保留预算内的最近原文。
+
+        同一会话只维护一条摘要：读取上一次摘要的结构化元数据，追加本轮被裁掉的
+        对话片段后覆盖写回，避免每次压缩都新增一条互相矛盾的摘要。
+        压缩前的原文已落 MySQL 历史，可追溯。
+        """
+        messages = await self.working_messages(user_id, session_id, limit=WORKING_MEMORY_MAX_MESSAGES)
+        if len(messages) < 2:
+            return None
+        budget = working_token_budget()
+        kept: list[dict[str, str]] = []
+        used = 0
+        for message in reversed(messages):
+            cost = estimate_tokens(message.get("content") or "")
+            if kept and (used + cost > budget or len(kept) >= keep_messages):
+                break
+            kept.append(message)
+            used += cost
+        kept.reverse()
+        older = messages[: len(messages) - len(kept)]
+        if not older:
+            return None
+
+        previous = await self._find_session_summary(user_id, session_id)
+        merged_text, summary_meta = merge_session_summary(
+            previous.get("text") if previous else None,
+            previous.get("metadata") if previous else None,
+            older,
+            max_tokens=int(getattr(settings, "agent_session_summary_max_tokens", 300)),
+        )
+        metadata = {
+            **(previous.get("metadata") if previous else {}),
+            **summary_meta,
+            "session_id": session_id,
+            "summarized": True,
+        }
+        now = datetime.now(UTC)
+        if previous:
+            embedding, embedder_name = await self._embed(merged_text)
+            await self._collection().update_one(
+                {"_id": previous["_id"]},
+                {
+                    "$set": {
+                        "text": merged_text,
+                        "embedding": embedding,
+                        "embedder": embedder_name,
+                        "importance": max(float(previous.get("importance") or 0.0), 0.6),
+                        "metadata": metadata,
+                        "last_access": now,
+                    }
+                },
+            )
+        else:
+            await self.remember(
+                user_id, merged_text, kind="episodic", importance=0.6, metadata=metadata
+            )
+        await self.redis.ltrim(self._work_key(user_id, session_id), 0, len(kept) - 1)
+        return merged_text
 
     async def list_records(self, user_id: str) -> list[dict[str, Any]]:
         await self._ensure_indexes()

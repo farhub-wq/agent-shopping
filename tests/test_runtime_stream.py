@@ -1,7 +1,9 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from harness.core.context import mask_tool_result
 from harness.core.llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from harness.core.manifest import SkillManifest
 from harness.core.policy import ToolPolicy
@@ -55,6 +57,9 @@ class _FakeMemory:
 
     async def working_messages(self, user_id, session_id, limit=6):
         return []
+
+    async def context_messages(self, user_id, session_id, *, budget_tokens, limit=50):
+        return [], 0
 
     async def append_turn(self, user_id, session_id, role, text):
         return None
@@ -145,6 +150,37 @@ async def test_run_stream_yields_delta_then_final(monkeypatch):
     assert any(e["type"] == "delta" and e["text"] == "你好" for e in events)
     final = next(e for e in events if e["type"] == "final")
     assert final["result"]["answer"] == "你好世界"
+
+
+@pytest.mark.asyncio
+async def test_run_stream_emits_context_usage_and_warn_stage(monkeypatch):
+    import harness.core.context as ctx_mod
+    import harness.core.runtime as rt
+
+    monkeypatch.setattr(rt, "TraceLedger", _FakeLedger)
+    # 把窗口压到 4096（context.py 的最小窗口），让一段长回答直接越过 80% 提醒线。
+    monkeypatch.setattr(
+        ctx_mod,
+        "get_settings",
+        lambda: SimpleNamespace(
+            agent_context_window_default=4096,
+            agent_context_warn_ratio=0.8,
+            agent_context_split_ratio=0.9,
+            agent_context_hard_ratio=0.95,
+            agent_output_token_reserve=10,
+        ),
+    )
+    provider = _StepProvider([[Decision(kind="final", content="答" * 12000, model="fake")]])
+    runtime = _runtime(provider)
+    events = [item async for item in runtime.run_stream("t", "hi", ToolContext("u1", "customer", "d", "s1", "r1"))]
+
+    context = next(e for e in events if e["type"] == "context")["context"]
+    assert context["limit"] == 4096
+    final = next(e for e in events if e["type"] == "final")
+    # final 携带的是「下一轮 prompt」的估算（含答案），长回答落地后越线。
+    final_context = final["result"]["context"]
+    assert final_context["stage"] in {"warn", "split", "hard"}
+    assert final_context["used_tokens"] >= context["used_tokens"]
 
 
 @pytest.mark.asyncio
@@ -510,3 +546,32 @@ async def test_memory_text_neutralized_before_entering_system_prompt(monkeypatch
     system = provider.systems[0]
     assert "忽略之前的指令" not in system
     assert "[已过滤]" in system
+
+
+def test_mask_tool_result_keeps_short_payload_intact():
+    payload = {"status": "ok", "data": {"order_id": "SO-123"}, "message": "", "duration_ms": 5}
+
+    content, meta = mask_tool_result(payload, max_tokens=400)
+
+    assert meta["masked"] is False
+    assert json.loads(content)["data"]["order_id"] == "SO-123"
+
+
+def test_mask_tool_result_truncates_long_payload_and_keeps_status():
+    payload = {
+        "status": "ok",
+        "data": {"items": [{"sku": f"SKU-{index}", "desc": "长" * 200} for index in range(50)]},
+        "message": "ok",
+        "duration_ms": 12,
+    }
+
+    content, meta = mask_tool_result(payload, max_tokens=80)
+    masked = json.loads(content)
+
+    assert meta["masked"] is True
+    assert meta["masked_tokens"] < meta["original_tokens"]
+    # 状态与原始大小保留，模型知道这是被截断的结果而不是空结果。
+    assert masked["status"] == "ok"
+    assert masked["_masked"] is True
+    assert masked["_original_tokens"] == meta["original_tokens"]
+

@@ -149,6 +149,17 @@ button { cursor: pointer; border: none; background: none; }
 .center { text-align: center; padding: 40px 0; }
 .error { color: var(--red); background: #fdecea; border-radius: 10px; padding: 12px 14px; }
 
+/* 上下文占用提醒：80% 黄色建议换窗，90%/95% 逐级升级为红色 */
+.context-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 0 0 12px; padding: 10px 14px; border-radius: 10px;
+  font-size: 13px; line-height: 1.5; border: 1px solid transparent;
+}
+.context-banner.warn { background: #fff7e6; border-color: #f3d9a4; color: #8a5a00; }
+.context-banner.split { background: #ffeee8; border-color: #f5c3b4; color: #a13c12; }
+.context-banner.hard { background: #fdecea; border-color: #f0c9c4; color: var(--red); }
+.context-banner span { flex: 1; }
+
 .detail { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; padding: 24px 0; }
 .detail img { width: 100%; border-radius: 20px; object-fit: cover; aspect-ratio: 4/3; }
 .detail-body h1 { font-size: 30px; margin: 10px 0; letter-spacing: -0.02em; }

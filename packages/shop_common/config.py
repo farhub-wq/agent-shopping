@@ -100,8 +100,27 @@ class ServiceSettings(BaseSettings):
     llm_cooldown_seconds: int = 300
     # Agent 成本预算：单次运行估算 token 上限 / 单用户每日估算 token 配额
     # （口径为 字符数//3 粗估，是护栏而非计费）
-    agent_run_token_budget: int = 20000
+    # 单次运行上限需覆盖会话上下文预算，否则长对话会在 80% 提示前先撞运行预算。
+    agent_run_token_budget: int = 40000
     agent_user_daily_token_quota: int = 200000
+
+    # 会话上下文预算：工作记忆按 token 装填，达到 warn 比例即提示换新窗口。
+    # 这是成本护栏口径，不等同于模型最大窗口；接入超长窗口模型时仍按此预算控制。
+    agent_context_window_default: int = 32000
+    agent_context_warn_ratio: float = 0.8
+    agent_context_split_ratio: float = 0.9
+    agent_context_hard_ratio: float = 0.95
+    # 为模型输出预留的 token，不计入工作记忆装填
+    agent_output_token_reserve: int = 1024
+    # 单条工具结果进入 prompt 前的 token 上限；超出则结构化截断（observation masking）
+    agent_tool_result_max_tokens: int = 400
+    # 会话摘要合并后的 token 上限；intent 与关键事实不参与丢弃
+    agent_session_summary_max_tokens: int = 300
+    # 会话拆分：累计 token 达到 split 比例或空闲超过该小时数时建议/允许拆分。
+    agent_conversation_idle_hours: int = 24
+    # 消息归档：未归档条数超过阈值时，把较早消息压缩进归档表，仅保留最近若干条原文。
+    agent_conversation_archive_threshold: int = 400
+    agent_conversation_archive_keep: int = 200
 
     # MCP：逗号分隔的 name=endpoint 列表，留空则不接远端 MCP Server
     mcp_http_servers: str = ""

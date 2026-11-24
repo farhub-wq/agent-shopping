@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { chatStream, api, getSession, type StreamEvent, type TraceStep, type AgentInfo, type Evidence, ModelProvider, Conversation } from "../api";
+import { chatStream, api, getSession, type StreamEvent, type TraceStep, type AgentInfo, type Evidence, type ContextUsage, ModelProvider, Conversation } from "../api";
 
 interface Message {
   role: "user" | "assistant";
@@ -31,6 +31,10 @@ export default function Agent() {
   // 会话列表与当前会话
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string | undefined>(undefined);
+  // 当前会话的上下文占用；达到 80% 时提示换新窗口，避免长对话质量下降。
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  // 更早历史的分页游标：为空表示当前会话已加载到最早一条。
+  const [messageCursor, setMessageCursor] = useState<string | null>(null);
   // 会话 id 在页面生命周期内固定，让多轮对话共享 Agent 的上下文与记忆。
   const sessionId = useRef(`web-${crypto.randomUUID().slice(0, 8)}`);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -56,9 +60,57 @@ export default function Agent() {
   async function loadConversationMessages(convId: string) {
     try {
       const data = await api.listMessages(convId);
-      // 将历史消息恢复到对话框
+      // 将历史消息恢复到对话框（默认最新一页，更早历史用游标继续加载）
       setMessages(data.items.map(msg => ({ role: msg.role as "user" | "assistant", text: msg.content })));
+      setMessageCursor(data.next_cursor);
       setConversationId(convId);
+      // 旧会话的占用要等下一轮运行才能算出，先清空避免展示过期提示。
+      setContextUsage(null);
+    } catch (exc) {
+      setError((exc as Error).message);
+    }
+  }
+
+  async function loadOlderMessages() {
+    if (!conversationId || !messageCursor) return;
+    try {
+      const data = await api.listMessages(conversationId, { cursor: messageCursor });
+      const older = data.items.map(msg => ({ role: msg.role as "user" | "assistant", text: msg.content }));
+      setMessages(prev => [...older, ...prev]);
+      setMessageCursor(data.next_cursor);
+    } catch (exc) {
+      setError((exc as Error).message);
+    }
+  }
+
+  function startNewSession() {
+    // 新窗口 = 新 Redis 会话 + 新数据库会话：旧历史仍可回看，但不再占用本轮上下文。
+    sessionId.current = `web-${crypto.randomUUID().slice(0, 8)}`;
+    setConversationId(undefined);
+    setMessages([]);
+    setMessageCursor(null);
+    setTrace([]);
+    setEvidence(null);
+    setStreaming("");
+    setRunId("");
+    setContextUsage(null);
+    setError("");
+  }
+
+  async function splitConversation() {
+    // 拆分后旧会话冻结，新会话带交接摘要继续，前端切到新会话 id。
+    if (!conversationId) return;
+    try {
+      const data = await api.splitConversation(conversationId);
+      setConversationId(data.conversation.id);
+      setMessages([]);
+      setMessageCursor(null);
+      setTrace([]);
+      setEvidence(null);
+      setStreaming("");
+      setRunId("");
+      setContextUsage(null);
+      await loadConversations();
     } catch (exc) {
       setError((exc as Error).message);
     }
@@ -68,6 +120,22 @@ export default function Agent() {
     // 新消息、等待中或流式累积中自动滚到底部，保证流式输出始终可见。
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy, streaming]);
+
+  const activeConversation = conversations.find((item) => item.id === conversationId);
+  // 累计 token 到拆分阈值或后端建议拆分时展示入口；仅提示，不静默切换会话。
+  const splitSuggested = Boolean(
+    conversationId &&
+      (contextUsage?.stage === "split" ||
+        contextUsage?.stage === "hard" ||
+        activeConversation?.context_state === "split" ||
+        activeConversation?.split_suggested === "context"),
+  );
+  const bannerStage =
+    contextUsage && contextUsage.stage !== "ok"
+      ? contextUsage.stage
+      : activeConversation?.context_state === "split"
+        ? "split"
+        : null;
 
   const send = async (text: string) => {
     if (!text.trim() || busy) return;
@@ -83,12 +151,19 @@ export default function Agent() {
         // trace 事件逐条累积，形成工具调用证据；delta 逐片累积成流式答案；
         // final 才把完整答案落进消息列表并记录 run_id。
         if (event.type === "trace") setTrace((prev) => [...prev, event.event]);
+        if (event.type === "context") setContextUsage(event.context);
         if (event.type === "delta") setStreaming((prev) => prev + event.text);
         if (event.type === "final") {
           const result = event.result;
           setRunId(result.run_id);
           setMessages((prev) => [...prev, { role: "assistant", text: result.answer }]);
           setStreaming("");
+          if (result.context) setContextUsage(result.context);
+          // 首轮新建/空闲拆分会返回新会话 id，后续消息必须续用同一条会话。
+          if (result.conversation_id) {
+            if (result.conversation_id !== conversationId) setMessageCursor(null);
+            setConversationId(result.conversation_id);
+          }
           // 刷新会话列表
           if (session) loadConversations();
         }
@@ -121,7 +196,7 @@ export default function Agent() {
           <button
             key={agent.name}
             className={agent.name === skill ? "agent-item active" : "agent-item"}
-            onClick={() => { setSkill(agent.name); setMessages([]); setTrace([]); setEvidence(null); setStreaming(""); }}
+            onClick={() => { setSkill(agent.name); setMessages([]); setTrace([]); setEvidence(null); setStreaming(""); setContextUsage(null); }}
           >
             <strong>{agent.name}</strong>
             <span>{agent.description}</span>
@@ -187,7 +262,35 @@ export default function Agent() {
           </div>
         )}
 
+        {bannerStage && (
+          <div className={`context-banner ${bannerStage}`} role="status" aria-live="polite">
+            <span>
+              {contextUsage
+                ? `当前会话已占用 ${Math.min(100, Math.round(contextUsage.ratio * 100))}% 上下文（约 ${contextUsage.used_tokens}/${contextUsage.limit} tokens）${
+                    contextUsage.omitted_messages > 0
+                      ? `，已省略 ${contextUsage.omitted_messages} 条较早对话`
+                      : ""
+                  }`
+                : "该会话已拆分或接近上限"}
+              {bannerStage === "hard"
+                ? "，继续对话可能失败，请立即拆分或开启新会话。"
+                : "，建议拆分会话以保持回答质量。"}
+            </span>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              {splitSuggested && (
+                <button className="ghost small" onClick={splitConversation}>
+                  拆分会话继续
+                </button>
+              )}
+              <button className="ghost small" onClick={startNewSession}>开启新会话</button>
+            </div>
+          </div>
+        )}
+
         <div className="chat-window">
+          {messageCursor && (
+            <button className="ghost small" onClick={loadOlderMessages}>加载更早消息</button>
+          )}
           {messages.length === 0 && (
             <div className="chat-empty">
               <h2>{currentAgent?.name || "智能助手"}</h2>

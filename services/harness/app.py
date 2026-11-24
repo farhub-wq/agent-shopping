@@ -25,13 +25,23 @@ from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
 from shop_common.mongo import close_mongo
 from shop_common.sandbox import MAX_CODE_CHARS
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select, update
 
+from .core.context import context_window, estimate_tokens
+from .core.conversation import (
+    ARCHIVE_ENCODING,
+    compress_records,
+    conversation_state,
+    decode_cursor,
+    decompress_records,
+    encode_cursor,
+    should_split,
+)
 from .core.crypto import decrypt_model_key
 from .core.llm import build_provider, build_provider_from_record
 from .core.manifest import load_all, load_skill
 from .core.mcp import MCPHub, MCPServer, build_mcp_hub, discover_and_register
-from .core.memory import MemoryManager
+from .core.memory import MemoryManager, merge_session_summary
 from .core.policy import summarize
 from .core.providers import (
     PRESETS,
@@ -49,7 +59,14 @@ from .core.sandbox import SandboxManager, validate_sandbox_production
 from .core.tools import ToolContext, registry
 from .core.tools_impl import BUSINESS_TOOLS  # noqa: F401  （导入即注册业务工具）
 from .core.trace import load_trace
-from .models import Conversation, Message, ModelProvider, UsageRecord
+from .models import (
+    Conversation,
+    ConversationSummary,
+    Message,
+    MessageArchive,
+    ModelProvider,
+    UsageRecord,
+)
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -174,20 +191,180 @@ def _ctx(principal, session_id: str | None, *, conversation_id: str | None = Non
     )
 
 
+async def _append_message(session, conv: Conversation, role: str, content: str) -> Message:
+    """写一条会话消息并同步累计 token / 上下文状态，作为拆分判定的唯一数据源。"""
+    seq = (
+        await session.scalar(
+            select(func.max(Message.seq)).where(Message.conversation_id == conv.id)
+        )
+    ) or 0
+    message = Message(
+        id=uuid.uuid4().hex,
+        conversation_id=conv.id,
+        role=role,
+        content=content or "",
+        seq=seq + 1,
+        token_count=estimate_tokens(content),
+    )
+    session.add(message)
+    conv.token_count = int(conv.token_count or 0) + message.token_count
+    conv.context_state = conversation_state(conv.token_count, context_window())
+    conv.last_message_at = datetime.now(UTC)
+    return message
+
+
+async def _archive_old_messages(session, conv: Conversation, keep_recent: int) -> int:
+    """把超出 keep_recent 的较早消息批量压缩归档，原行保留并标记软归档。"""
+    rows = (
+        await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id, Message.is_archived.is_(False))
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .offset(max(keep_recent, 0))
+        )
+    ).scalars().all()
+    if not rows:
+        return 0
+    records = [
+        {
+            "id": msg.id,
+            "role": msg.role,
+            "content": msg.content,
+            "tool_calls": msg.tool_calls_json,
+            "seq": msg.seq,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+        }
+        for msg in rows
+    ]
+    archive = MessageArchive(
+        id=uuid.uuid4().hex,
+        conversation_id=conv.id,
+        user_id=conv.user_id,
+        tenant_id=conv.tenant_id,
+        message_count=len(records),
+        first_message_at=rows[-1].created_at,
+        last_message_at=rows[0].created_at,
+        encoding=ARCHIVE_ENCODING,
+        payload=compress_records(records),
+    )
+    session.add(archive)
+    await session.flush()
+    await session.execute(
+        update(Message)
+        .where(Message.id.in_([msg.id for msg in rows]))
+        .values(is_archived=True, archive_id=archive.id)
+    )
+    return len(records)
+
+
 async def _persist_assistant(conversation_id: str, answer: str) -> None:
-    """会话助手消息落库并推进 last_message_at；失败只记日志，不阻断已完成的回答。"""
+    """会话助手消息落库，并按阈值触发归档；失败只记日志，不阻断已完成的回答。"""
     try:
         async with get_session_factory()() as session:
             conv = await session.get(Conversation, conversation_id)
             if conv is None:
                 return
-            session.add(
-                Message(id=uuid.uuid4().hex, conversation_id=conversation_id, role="assistant", content=answer)
+            await _append_message(session, conv, "assistant", answer)
+            await session.flush()
+            active = await session.scalar(
+                select(func.count())
+                .select_from(Message)
+                .where(Message.conversation_id == conversation_id, Message.is_archived.is_(False))
             )
-            conv.last_message_at = datetime.now(UTC)
+            if (active or 0) > int(settings.agent_conversation_archive_threshold):
+                await _archive_old_messages(
+                    session, conv, int(settings.agent_conversation_archive_keep)
+                )
             await session.commit()
     except Exception:
         logger.exception("会话助手消息持久化失败 conversation_id=%s", conversation_id)
+
+
+async def _summary_text_for(session, conv: Conversation) -> tuple[str, list[str], int]:
+    """取会话交接摘要：摘要表 → Mongo 会话摘要 → 最近原文兜底，返回 (文本, 关键事实, 级别)。"""
+    row: ConversationSummary | None = None
+    if conv.summary_id:
+        row = await session.get(ConversationSummary, conv.summary_id)
+    if row is None:
+        row = await session.scalar(
+            select(ConversationSummary)
+            .where(ConversationSummary.conversation_id == conv.id)
+            .order_by(ConversationSummary.created_at.desc())
+            .limit(1)
+        )
+    if row is not None and row.text:
+        try:
+            pinned = json.loads(row.pinned_json or "[]")
+        except ValueError:
+            pinned = []
+        return row.text, [str(item) for item in pinned], int(row.summary_level or 1)
+
+    if memory is not None:
+        record = await memory.latest_summary(conv.user_id, conv.id)
+        if record and record.get("text"):
+            meta = record.get("metadata") or {}
+            return (
+                str(record["text"]),
+                [str(item) for item in (meta.get("pinned") or [])],
+                int(meta.get("summary_level") or 1),
+            )
+
+    rows = (
+        await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id, Message.is_archived.is_(False))
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(12)
+        )
+    ).scalars().all()
+    if not rows:
+        return "", [], 1
+    text, meta = merge_session_summary(
+        None,
+        None,
+        [{"role": msg.role, "content": msg.content} for msg in reversed(rows)],
+        max_tokens=int(settings.agent_session_summary_max_tokens),
+    )
+    return text, [str(item) for item in (meta.get("pinned") or [])], int(meta.get("summary_level") or 1)
+
+
+def _create_split_child(
+    session,
+    conv: Conversation,
+    text: str,
+    pinned: list[str],
+    level: int,
+    *,
+    source: str,
+) -> tuple[Conversation, str]:
+    """创建子会话并挂上交接摘要；旧会话标记为已拆分。返回 (子会话, 摘要文本)。"""
+    child = Conversation(
+        id=uuid.uuid4().hex,
+        user_id=conv.user_id,
+        tenant_id=conv.tenant_id,
+        skill=conv.skill,
+        title=(conv.title or "会话")[:120],
+        root_id=conv.root_id or conv.id,
+        parent_id=conv.id,
+        token_count=0,
+        context_state="ok",
+    )
+    session.add(child)
+    if text:
+        summary = ConversationSummary(
+            id=uuid.uuid4().hex,
+            conversation_id=child.id,
+            user_id=conv.user_id,
+            tenant_id=conv.tenant_id,
+            text=text,
+            pinned_json=json.dumps(pinned, ensure_ascii=False),
+            summary_level=level,
+            source=source,
+        )
+        session.add(summary)
+        child.summary_id = summary.id
+    conv.context_state = "split"
+    return child, text
 
 
 async def _owned_provider(session, provider_id: str, principal) -> ModelProvider:
@@ -210,11 +387,29 @@ def _decrypt_or_error(token: str) -> str:
         raise ApiError("BAD_REQUEST", str(exc)) from exc
 
 
+def _split_reason(conv: Conversation) -> str | None:
+    return should_split(
+        int(conv.token_count or 0),
+        conv.last_message_at,
+        now=datetime.now(UTC),
+        window=context_window(),
+        split_ratio=float(settings.agent_context_split_ratio),
+        idle_hours=int(settings.agent_conversation_idle_hours),
+    )
+
+
 def _conv_dict(conv: Conversation) -> dict[str, Any]:
     return {
         "id": conv.id,
         "skill": conv.skill,
         "title": conv.title,
+        "root_id": conv.root_id,
+        "parent_id": conv.parent_id,
+        "token_count": int(conv.token_count or 0),
+        "context_state": conv.context_state or "ok",
+        "summary_id": conv.summary_id,
+        # context = 累计 token 到拆分阈值；idle = 空闲超时。仅作建议，不自动切换会话。
+        "split_suggested": _split_reason(conv),
         "created_at": conv.created_at.isoformat() if conv.created_at else None,
         "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
     }
@@ -249,8 +444,12 @@ async def healthz() -> dict[str, Any]:
 
 
 @app.get("/agents")
-async def list_agents() -> dict[str, Any]:
+async def list_agents(principal: PrincipalDep) -> dict[str, Any]:
     assert runtime is not None
+    visible = [
+        manifest for manifest in runtime.skills.values()
+        if principal.role in manifest.allowed_roles
+    ]
     return {
         "items": [
             {
@@ -264,7 +463,7 @@ async def list_agents() -> dict[str, Any]:
                 if any(item.severity == "high" for item in manifest.findings)
                 else "allow",
             }
-            for manifest in runtime.skills.values()
+            for manifest in visible
         ]
     }
 
@@ -308,6 +507,13 @@ async def chat(
     stream: bool = Query(True),
 ):
     assert runtime is not None
+    # 技能按 SKILL.md 声明的 roles 过滤：顾客不能调用 ops-* 运营侧技能，
+    # 即使前端绕过了列表直接调 chat 接口，后端也要拒绝。
+    manifest = runtime.skills.get(skill_name)
+    if manifest is None:
+        raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
+    if principal.role not in manifest.allowed_roles:
+        raise ApiError("FORBIDDEN", f"技能 {skill_name} 不对角色 {principal.role} 开放")
     # 访客只用环境默认/离线模型，会话与用量都不落库，保持既有匿名体验。
     is_guest = principal.user_id == "guest"
 
@@ -315,6 +521,8 @@ async def chat(
     provider_id: str | None = None
     provider_model: str | None = None
     conversation_id = payload.conversation_id
+    # 回灌内容：Redis 工作记忆过期后，用会话摘要把上一段上下文接回来。
+    backfill: tuple[str, list[str]] | None = None
 
     if not is_guest:
         async with get_session_factory()() as session:
@@ -343,25 +551,41 @@ async def chat(
                 conv = await session.get(Conversation, conversation_id)
                 if conv is None or conv.user_id != principal.user_id or conv.tenant_id != principal.tenant:
                     raise ApiError("FORBIDDEN", "无权访问该会话")
+                # 空闲超时：本轮开始前先拆出子会话，旧会话继续保持只读，
+                # 避免隔天回来继续往一条已超时的上下文里堆消息。
+                if _split_reason(conv) == "idle":
+                    text, pinned, level = await _summary_text_for(session, conv)
+                    conv, _ = _create_split_child(
+                        session, conv, text, pinned, level, source="idle"
+                    )
+                    if text:
+                        backfill = (text, pinned)
+                elif memory is not None and not await memory.has_working(principal.user_id, conv.id):
+                    # Redis 已过期（换设备/隔天/重启）：从摘要或最近原文重建最小上下文。
+                    text, pinned, _ = await _summary_text_for(session, conv)
+                    if text:
+                        backfill = (text, pinned)
             else:
+                conv_id = uuid.uuid4().hex
                 conv = Conversation(
-                    id=uuid.uuid4().hex,
+                    id=conv_id,
                     user_id=principal.user_id,
                     tenant_id=principal.tenant,
                     skill=skill_name,
                     title=payload.message[:30],
+                    # 新会话自成一链，后续拆分继承该 root_id。
+                    root_id=conv_id,
                 )
                 session.add(conv)
-            session.add(
-                Message(id=uuid.uuid4().hex, conversation_id=conv.id, role="user", content=payload.message)
-            )
-            conv.last_message_at = datetime.now(UTC)
+            await _append_message(session, conv, "user", payload.message)
             await session.commit()
             conversation_id = conv.id
 
-    # session_id 保留兼容：缺省时用 conversation_id 作为 Redis 工作记忆后缀，
-    # 同用户多轮对话能续上上下文；user_id 前缀已在 memory 层隔离不同用户。
-    session_id = payload.session_id or conversation_id or f"s-{uuid.uuid4().hex[:12]}"
+    # 工作记忆按会话隔离：已有 conversation_id 时优先用它，保证换浏览器/刷新后
+    # 仍能命中同一份 Redis 记忆；访客与无会话场景才退回前端生成的 session_id。
+    session_id = conversation_id or payload.session_id or f"s-{uuid.uuid4().hex[:12]}"
+    if backfill and memory is not None:
+        await memory.seed_handoff(principal.user_id, session_id, backfill[0], backfill[1])
     ctx = _ctx(
         principal,
         session_id,
@@ -374,7 +598,10 @@ async def chat(
         result = await runtime.run(skill_name, payload.message, ctx, provider=provider)
         if not is_guest and conversation_id:
             await _persist_assistant(conversation_id, result.answer)
-        return result.to_dict()
+        data = result.to_dict()
+        # 首轮新建/空闲拆分都会产生新的会话 id，必须回传前端，否则下一轮又新建一条会话。
+        data["conversation_id"] = conversation_id
+        return data
 
     async def generator():
         answer = ""
@@ -382,6 +609,8 @@ async def chat(
             async for event in runtime.run_stream(skill_name, payload.message, ctx, provider=provider):
                 if event.get("type") == "final":
                     answer = event.get("result", {}).get("answer", "")
+                    if conversation_id:
+                        event.setdefault("result", {})["conversation_id"] = conversation_id
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         finally:
             # 流结束（含异常收尾）后补落助手消息，不让持久化失败中断 SSE。
@@ -628,25 +857,132 @@ async def list_conversations(
     return {"items": items, "page": page, "size": size, "total": total or 0}
 
 
+async def _owned_conversation(session, conversation_id: str, principal) -> Conversation:
+    conv = await session.get(Conversation, conversation_id)
+    if conv is None or conv.user_id != principal.user_id or conv.tenant_id != principal.tenant:
+        raise ApiError("FORBIDDEN", "无权访问该会话")
+    return conv
+
+
 @app.get("/conversations/{conversation_id}/messages")
-async def list_messages(conversation_id: str, principal: PrincipalDep) -> dict[str, Any]:
+async def list_messages(
+    conversation_id: str,
+    principal: PrincipalDep,
+    limit: int = Query(100, ge=1, le=200),
+    cursor: str | None = Query(None),
+) -> dict[str, Any]:
+    """默认返回最新一页；cursor 沿时间向前翻更早的历史，归档消息不参与展示。"""
     async with get_session_factory()() as session:
-        conv = await session.get(Conversation, conversation_id)
-        if conv is None or conv.user_id != principal.user_id or conv.tenant_id != principal.tenant:
-            raise ApiError("FORBIDDEN", "无权访问该会话")
-        rows = await session.execute(
-            select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+        await _owned_conversation(session, conversation_id, principal)
+        stmt = select(Message).where(
+            Message.conversation_id == conversation_id, Message.is_archived.is_(False)
         )
+        if cursor:
+            decoded = decode_cursor(cursor)
+            if decoded is None:
+                raise ApiError("BAD_REQUEST", "cursor 不合法")
+            stamp, message_id = decoded
+            # 与排序保持一致：时间倒序，同一时间戳用 id 倒序兜底，避免翻页重复/漏条。
+            stmt = stmt.where(
+                or_(
+                    Message.created_at < stamp,
+                    and_(Message.created_at == stamp, Message.id < message_id),
+                )
+            )
+        rows = (
+            await session.execute(
+                stmt.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit + 1)
+            )
+        ).scalars().all()
+        has_more = len(rows) > limit
+        page = list(rows[:limit])
+        page.reverse()
+        next_cursor = encode_cursor(page[0].created_at, page[0].id) if has_more and page else None
         items = [
             {
                 "id": msg.id,
                 "role": msg.role,
                 "content": msg.content,
                 "tool_calls": msg.tool_calls_json,
+                "seq": msg.seq,
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             }
-            for msg in rows.scalars().all()
+            for msg in page
         ]
+    return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
+
+
+@app.post("/conversations/{conversation_id}/split")
+async def split_conversation(conversation_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    """手动拆分：旧会话冻结，子会话只带交接摘要与关键事实继续。"""
+    pinned: list[str] = []
+    async with get_session_factory()() as session:
+        conv = await _owned_conversation(session, conversation_id, principal)
+        text, pinned, level = await _summary_text_for(session, conv)
+        child, text = _create_split_child(
+            session, conv, text, pinned, level, source="split"
+        )
+        await session.flush()
+        child_data = _conv_dict(child)
+        child_id = child.id
+        await session.commit()
+    if text and memory is not None:
+        # 立即回灌子会话，避免首次提问时再查一次库。
+        await memory.seed_handoff(principal.user_id, child_id, text, pinned)
+    return {"conversation": child_data, "handoff": text}
+
+
+@app.post("/conversations/{conversation_id}/archive")
+async def archive_conversation(
+    conversation_id: str,
+    principal: PrincipalDep,
+    keep_recent: int = Query(200, ge=0, le=1000),
+) -> dict[str, Any]:
+    """把较早消息压缩归档，仅保留最近 keep_recent 条原文参与历史展示。"""
+    async with get_session_factory()() as session:
+        conv = await _owned_conversation(session, conversation_id, principal)
+        archived = await _archive_old_messages(session, conv, keep_recent)
+        await session.commit()
+    return {"archived": archived, "keep_recent": keep_recent}
+
+
+@app.get("/conversations/{conversation_id}/archives")
+async def list_archives(conversation_id: str, principal: PrincipalDep) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        await _owned_conversation(session, conversation_id, principal)
+        rows = (
+            await session.execute(
+                select(MessageArchive)
+                .where(MessageArchive.conversation_id == conversation_id)
+                .order_by(MessageArchive.created_at.desc())
+            )
+        ).scalars().all()
+        items = [
+            {
+                "id": row.id,
+                "message_count": row.message_count,
+                "encoding": row.encoding,
+                "first_message_at": row.first_message_at.isoformat()
+                if row.first_message_at
+                else None,
+                "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+    return {"items": items}
+
+
+@app.get("/conversations/{conversation_id}/archives/{archive_id}")
+async def get_archive(
+    conversation_id: str, archive_id: str, principal: PrincipalDep
+) -> dict[str, Any]:
+    async with get_session_factory()() as session:
+        await _owned_conversation(session, conversation_id, principal)
+        row = await session.get(MessageArchive, archive_id)
+        if row is None or row.conversation_id != conversation_id:
+            raise ApiError("NOT_FOUND", "归档不存在")
+        items = decompress_records(row.payload)
     return {"items": items}
 
 

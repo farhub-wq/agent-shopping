@@ -3,6 +3,7 @@ name: ops-aftersales
 version: 0.1.0
 description: 售后审核助手，负责汇总工单、评估风险并给出建议，最终决定由人工做出
 trust: reviewed
+roles: [operator, admin]
 max_steps: 5
 allowed_tools:
   - after_sales_queue
