@@ -666,7 +666,20 @@ export async function chatStream(
       provider_id: providerId,
     }),
   });
-  if (!response.ok || !response.body) throw new Error("Agent 连接失败");
+  if (!response.body) throw new Error("Agent 连接失败");
+  // 非 2xx 时尝试解析后端错误体，把真实 message 透出给用户
+  if (!response.ok) {
+    const text = await response.text();
+    let msg = `Agent 请求失败 (${response.status})`;
+    try {
+      const body = JSON.parse(text) as { message?: string; code?: string };
+      if (body.message) msg = body.message;
+    } catch {
+      /* 纯文本响应直接截取 */
+      if (text) msg = text.slice(0, 200);
+    }
+    throw new Error(msg);
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
