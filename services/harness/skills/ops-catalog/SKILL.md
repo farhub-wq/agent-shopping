@@ -3,6 +3,7 @@ name: ops-catalog
 version: 0.1.0
 description: 商品运营助手，负责属性校验、文案草稿、库存健康度分析与沙箱数据核验
 trust: vendor
+roles: [operator, admin]
 max_steps: 6
 allowed_tools:
   - catalog_detail

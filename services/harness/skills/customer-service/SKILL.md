@@ -3,6 +3,7 @@ name: customer-service
 version: 0.1.0
 description: 面向消费者的导购与售后接待，负责查商品、查库存、查订单、起草售后
 trust: vendor
+roles: [customer, operator, admin]
 max_steps: 5
 allowed_tools:
   - catalog_search

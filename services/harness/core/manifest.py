@@ -47,6 +47,7 @@ class SkillManifest:
     max_steps: int
     body: str
     path: str
+    allowed_roles: list[str] = field(default_factory=list)
     content_hash: str = ""
     findings: list[Finding] = field(default_factory=list)
 
@@ -61,6 +62,7 @@ class SkillManifest:
             "description": self.description,
             "trust": self.trust,
             "allowed_tools": self.allowed_tools,
+            "allowed_roles": self.allowed_roles,
             "permissions": self.permissions,
             "max_steps": self.max_steps,
             "path": self.path,
@@ -97,6 +99,8 @@ def load_skill(path: Path) -> SkillManifest:
         max_steps=int(meta.get("max_steps", 6)),
         body=body,
         path=str(path),
+        # roles 未声明时默认对所有角色可见，保证存量技能不因未加声明被突然隐藏。
+        allowed_roles=list(meta.get("roles") or ["customer", "operator", "admin"]),
     )
     manifest.content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     # 准入审计在加载时同步完成：风险技能根本进不了运行时，

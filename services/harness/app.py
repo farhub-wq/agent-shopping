@@ -249,8 +249,12 @@ async def healthz() -> dict[str, Any]:
 
 
 @app.get("/agents")
-async def list_agents() -> dict[str, Any]:
+async def list_agents(principal: PrincipalDep) -> dict[str, Any]:
     assert runtime is not None
+    visible = [
+        manifest for manifest in runtime.skills.values()
+        if principal.role in manifest.allowed_roles
+    ]
     return {
         "items": [
             {
@@ -264,7 +268,7 @@ async def list_agents() -> dict[str, Any]:
                 if any(item.severity == "high" for item in manifest.findings)
                 else "allow",
             }
-            for manifest in runtime.skills.values()
+            for manifest in visible
         ]
     }
 
@@ -308,6 +312,13 @@ async def chat(
     stream: bool = Query(True),
 ):
     assert runtime is not None
+    # 技能按 SKILL.md 声明的 roles 过滤：顾客不能调用 ops-* 运营侧技能，
+    # 即使前端绕过了列表直接调 chat 接口，后端也要拒绝。
+    manifest = runtime.skills.get(skill_name)
+    if manifest is None:
+        raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
+    if principal.role not in manifest.allowed_roles:
+        raise ApiError("FORBIDDEN", f"技能 {skill_name} 不对角色 {principal.role} 开放")
     # 访客只用环境默认/离线模型，会话与用量都不落库，保持既有匿名体验。
     is_guest = principal.user_id == "guest"
 
