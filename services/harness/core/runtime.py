@@ -16,6 +16,7 @@ from shop_common.errors import ApiError
 from shop_common.logging import get_logger
 from shop_common.metrics import AGENT_BUDGET_EXCEEDED, AGENT_INJECTION_BLOCKED
 
+from .context import build_context_usage, estimate_tokens, mask_tool_result, working_token_budget
 from .injection import neutralize, scan
 from .llm import MAX_PLAN_STEPS, Decision, LLMProvider
 from .manifest import SkillManifest
@@ -69,6 +70,8 @@ class AgentRunResult:
     evidence: dict[str, Any]
     trace: list[dict[str, Any]] = field(default_factory=list)
     pending: dict[str, Any] | None = None
+    # 会话上下文占用：前端据此在 80% 时提示换新窗口；早期拦截路径没有该值。
+    context: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +81,7 @@ class AgentRunResult:
             "status": self.status,
             "evidence": self.evidence,
             "pending": self.pending,
+            "context": self.context,
         }
 
 
@@ -143,8 +147,12 @@ class AgentRuntime:
         )
 
     async def _prepare(
-        self, skill_name: str, user_message: str, ctx: ToolContext
-    ) -> tuple[SkillManifest, str, list[dict[str, Any]]]:
+        self,
+        skill_name: str,
+        user_message: str,
+        ctx: ToolContext,
+        specs: list[dict[str, Any]],
+    ) -> tuple[SkillManifest, str, list[dict[str, Any]], dict[str, Any]]:
         manifest = self.skills.get(skill_name)
         if manifest is None:
             raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
@@ -155,9 +163,19 @@ class AgentRuntime:
 
         memories = await self.memory.retrieve(ctx.user_id, user_message, k=5)
         system = self._build_system(manifest, memories)
-        working = await self.memory.working_messages(ctx.user_id, ctx.session_id, limit=6)
+        # 工作记忆按会话上下文预算装填：先扣掉 system 与工具 schema 的占用，
+        # 剩余额度从最新一轮往回装，避免长对话把模型窗口撑爆。
+        budget = working_token_budget() - estimate_tokens(system) - estimate_tokens(
+            json.dumps(specs, ensure_ascii=False)
+        )
+        working, omitted = await self.memory.context_messages(
+            ctx.user_id, ctx.session_id, budget_tokens=budget
+        )
         messages = [*working, {"role": "user", "content": user_message}]
-        return manifest, system, messages
+        return manifest, system, messages, {
+            "working_budget": budget,
+            "omitted_messages": omitted,
+        }
 
     async def _run_events(
         self,
@@ -236,11 +254,13 @@ class AgentRuntime:
                 ),
             )
             return
-        manifest, system, messages = await self._prepare(skill_name, user_message, ctx)
         # 工具白名单取 manifest 声明与注册表的交集：
         # 声明了但没注册的忽略，注册了但没声明的不会暴露给模型。
         allowed = [name for name in manifest.allowed_tools if self.registry.get(name)]
         specs = self.registry.specs(allowed)
+        manifest, system, messages, ctx_meta = await self._prepare(
+            skill_name, user_message, ctx, specs
+        )
         steps_limit = max_steps or manifest.max_steps
         usage = {
             "prompt_chars": len(system),
@@ -263,6 +283,19 @@ class AgentRuntime:
         }
 
         await ledger.append("run.start", skill=skill_name, trust=manifest.trust, user=ctx.user_id, message=user_message)
+
+        # 上下文占用在调用模型前计算：工作记忆已按预算装填，此时的比例就是
+        # 本轮真实 prompt 的占用，用于前端 80% 换窗口提示。
+        base_messages = list(messages)
+        context_usage = build_context_usage(
+            system=system,
+            messages=base_messages,
+            tools=specs,
+            omitted_messages=ctx_meta["omitted_messages"],
+        )
+        state["context"] = context_usage
+        await ledger.append("run.context", **context_usage)
+        yield ("context", context_usage)
 
         async for event in self._run_loop(
             manifest, specs, steps_limit, system, messages, ctx, ledger, usage, state, stream, provider
@@ -301,6 +334,16 @@ class AgentRuntime:
 
         if state["tool_errors"] and status == "completed":
             answer = f"注意：本次执行中有 {state['tool_errors']} 次工具调用失败，以下结论可能不完整。\n{answer}"
+
+        # 下一轮 prompt 只包含工作记忆里的 user/assistant 原文，不包含本轮 tool 结果，
+        # 因此用 base_messages + 最终答案估算，避免把临时的工具输出算进长期占用。
+        context_usage = build_context_usage(
+            system=system,
+            messages=[*base_messages, {"role": "assistant", "content": answer}],
+            tools=specs,
+            omitted_messages=ctx_meta["omitted_messages"],
+        )
+        state["context"] = context_usage
 
         usage["estimated_tokens"] = usage["prompt_chars"] // 3
         # 结算：按「实际 - 预留」补扣/回补，单条 INCRBY 原子完成（负值即回补）。
@@ -347,6 +390,7 @@ class AgentRuntime:
                 evidence=evidence,
                 trace=ledger.events,
                 pending=pending,
+                context=state.get("context"),
             ),
         )
 
@@ -457,12 +501,18 @@ class AgentRuntime:
                 if stream:
                     yield ("trace", call_event)
                 result = await self.registry.execute(step["tool"], step["args"], ctx, trust=manifest.trust)
+                # observation masking：只保留 status/关键字段进 prompt，长结果截断，
+                # 事件账本仍记录原始大小，便于审计「模型看到的到底是什么」。
+                content, mask_meta = mask_tool_result(result.to_dict())
                 result_event = await ledger.append(
                     "tool.result",
                     tool=step["tool"],
                     status=result.status,
                     duration_ms=result.duration_ms,
                     preview=str(result.data)[:200],
+                    masked=mask_meta["masked"],
+                    original_tokens=mask_meta["original_tokens"],
+                    masked_tokens=mask_meta["masked_tokens"],
                 )
                 if stream:
                     yield ("trace", result_event)
@@ -493,7 +543,7 @@ class AgentRuntime:
                     {
                         "role": "tool",
                         "tool_call_id": call_ids[index],
-                        "content": json.dumps(result.to_dict(), ensure_ascii=False),
+                        "content": content,
                     }
                 )
         else:
@@ -532,6 +582,8 @@ class AgentRuntime:
                 yield {"type": "trace", "event": payload}
             elif kind == "delta":
                 yield {"type": "delta", "text": payload}
+            elif kind == "context":
+                yield {"type": "context", "context": payload}
             elif kind == "done":
                 yield {"type": "final", "result": payload.to_dict()}
 
@@ -575,12 +627,16 @@ class AgentRuntime:
         halted_at: int | None = None
         for index, step in enumerate(steps):
             result = await self.registry.execute(step["tool"], step["args"], original_ctx, trust=manifest.trust)
+            content, mask_meta = mask_tool_result(result.to_dict())
             await ledger.append(
                 "tool.result",
                 tool=step["tool"],
                 status=result.status,
                 duration_ms=result.duration_ms,
                 preview=str(result.data)[:200],
+                masked=mask_meta["masked"],
+                original_tokens=mask_meta["original_tokens"],
+                masked_tokens=mask_meta["masked_tokens"],
             )
             if result.status == "needs_approval":
                 halted_at = index
@@ -591,7 +647,7 @@ class AgentRuntime:
                 {
                     "role": "tool",
                     "tool_call_id": call_ids[index],
-                    "content": json.dumps(result.to_dict(), ensure_ascii=False),
+                    "content": content,
                 }
             )
 

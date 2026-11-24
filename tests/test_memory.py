@@ -13,6 +13,7 @@ from harness.core.memory import (
     OpenAIEmbedder,
     _compatible,
     cosine,
+    merge_session_summary,
 )
 from shop_common.errors import ApiError
 
@@ -381,3 +382,81 @@ async def test_slot_conflict_replaces_old_fact(monkeypatch):
     # 同槽位冲突替换：库里只剩新事实，不再新旧并存。
     assert len(semantic) == 1
     assert semantic[0]["text"] == "偏好：清淡饮食"
+
+
+class _ListRedis:
+    """只模拟工作记忆用到的 lrange：items 为「最新在前」的原始列表。"""
+
+    def __init__(self, items):
+        self.items = items
+
+    async def lrange(self, key, start, end):
+        return self.items[start:] if end == -1 else self.items[start : end + 1]
+
+
+@pytest.mark.asyncio
+async def test_context_messages_fills_newest_within_budget():
+    # 每条内容 30 字符 ≈ 10 token；预算 25 只能装下最近两条。
+    items = [
+        json.dumps({"role": "assistant", "content": "新" * 30}, ensure_ascii=False),
+        json.dumps({"role": "user", "content": "中" * 30}, ensure_ascii=False),
+        json.dumps({"role": "assistant", "content": "旧" * 30}, ensure_ascii=False),
+    ]
+    manager = MemoryManager(_ListRedis(items), embedder=HashingEmbedder(16))
+
+    messages, omitted = await manager.context_messages("u1", "s1", budget_tokens=25)
+
+    assert omitted == 1
+    # 返回顺序必须是旧→新，模型才能按时间理解对话。
+    assert [message["content"][0] for message in messages] == ["中", "新"]
+
+
+@pytest.mark.asyncio
+async def test_context_messages_keeps_latest_even_over_budget():
+    items = [json.dumps({"role": "assistant", "content": "长" * 300}, ensure_ascii=False)]
+    manager = MemoryManager(_ListRedis(items), embedder=HashingEmbedder(16))
+
+    messages, omitted = await manager.context_messages("u1", "s1", budget_tokens=1)
+
+    # 最新一轮是硬保留：宁可单条超预算，也不能让模型看不到刚发生的事。
+    assert len(messages) == 1
+    assert omitted == 0
+
+
+def test_merge_session_summary_preserves_intent_and_pinned_facts():
+    older = [
+        {"role": "user", "content": "查订单 SO-123 的物流"},
+        {"role": "assistant", "content": "已发货"},
+    ]
+
+    text, meta = merge_session_summary(None, None, older, max_tokens=200)
+
+    assert "SO-123" in text
+    assert meta["pinned"] == ["SO-123"]
+    assert "查订单" in meta["intent"]
+
+    text2, meta2 = merge_session_summary(
+        text, meta, [{"role": "user", "content": "再看 SKU-2001"}], max_tokens=200
+    )
+
+    assert "SO-123" in text2 and "SKU-2001" in text2
+    assert meta2["pinned"] == ["SO-123", "SKU-2001"]
+    # 合并而不是追加：同一会话始终只有一条摘要文本，避免多份互相矛盾的摘要。
+    assert text2.count("会话摘要：") == 1
+
+
+def test_merge_session_summary_drops_oldest_digest_when_over_budget():
+    meta = {"intent": "查订单", "pinned": ["SO-1"], "digest": ["甲" * 100, "乙" * 100]}
+
+    text, merged = merge_session_summary(
+        "会话摘要：旧", meta, [{"role": "assistant", "content": "丙" * 100}], max_tokens=40
+    )
+
+    joined = "".join(merged["digest"])
+    assert "甲" * 100 not in joined
+    # 新片段按单条 80 字符压缩后进入 digest。
+    assert "丙" * 80 in joined
+    # 关键事实永不随预算丢弃。
+    assert "SO-1" in text
+
+

@@ -99,6 +99,15 @@ export interface Conversation {
   id: string;
   skill: string;
   title: string;
+  // 父子拆分链：root_id 指向链路起点，parent_id 指向被拆分的旧会话
+  root_id: string | null;
+  parent_id: string | null;
+  // 会话累计 token 与上下文状态（ok | warn | split）
+  token_count: number;
+  context_state: string;
+  summary_id: string | null;
+  // 后端建议拆分的原因：context（累计 token 到阈值）| idle（空闲超时）
+  split_suggested: string | null;
   created_at: string;
   last_message_at: string;
 }
@@ -116,7 +125,15 @@ export interface Message {
   role: string;
   content: string;
   tool_calls: string | null;
+  seq: number;
   created_at: string;
+}
+
+export interface MessagePage {
+  items: Message[];
+  // 向前翻更早历史的分页游标；为空表示没有更早的消息
+  next_cursor: string | null;
+  has_more: boolean;
 }
 
 // 用量统计
@@ -297,6 +314,19 @@ export interface TraceStep {
 export interface StreamFinal {
   run_id: string;
   answer: string;
+  // 首轮新建或空闲拆分后返回的会话 id，前端必须续用，否则下一轮会再建一条会话
+  conversation_id?: string | null;
+  context?: ContextUsage | null;
+}
+
+// 会话上下文占用：后端按 token 粗估，前端据此在 80% 时提示开启新会话。
+export interface ContextUsage {
+  used_tokens: number;
+  limit: number;
+  ratio: number;
+  stage: "ok" | "warn" | "split" | "hard";
+  reserve_tokens: number;
+  omitted_messages: number;
 }
 
 export function getSession(): Session | null {
@@ -594,9 +624,27 @@ export const api = {
     ).toString();
     return request<ConversationPage>(`/conversations${query ? `?${query}` : ""}`);
   },
-  // 会话消息列表
-  listMessages: (conversationId: string) =>
-    request<{ items: Message[] }>(`/conversations/${conversationId}/messages`),
+  // 会话消息列表（默认最新一页，cursor 用于加载更早历史）
+  listMessages: (conversationId: string, params: { limit?: number; cursor?: string } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params)
+        .filter(([, value]) => value !== undefined && value !== "")
+        .map(([key, value]) => [key, String(value)]),
+    ).toString();
+    return request<MessagePage>(`/conversations/${conversationId}/messages${query ? `?${query}` : ""}`);
+  },
+  // 拆分会话：旧会话冻结，新会话携带交接摘要继续
+  splitConversation: (conversationId: string) =>
+    request<{ conversation: Conversation; handoff: string }>(`/conversations/${conversationId}/split`, {
+      method: "POST",
+      body: "{}",
+    }),
+  // 归档较早消息，仅保留最近 keep_recent 条原文
+  archiveConversation: (conversationId: string, keepRecent = 200) =>
+    request<{ archived: number; keep_recent: number }>(
+      `/conversations/${conversationId}/archive?keep_recent=${keepRecent}`,
+      { method: "POST", body: "{}" },
+    ),
   // 用量统计
   listUsage: (params: { group_by?: string; from?: string; to?: string; page?: number; size?: number } = {}) => {
     const query = new URLSearchParams(
@@ -632,6 +680,8 @@ export function clearCart() {
 }
 
 export type StreamEvent =
+  | { type: "start"; skill: string; trust: string }
+  | { type: "context"; context: ContextUsage }
   | { type: "trace"; event: TraceStep }
   | { type: "delta"; text: string }
   | { type: "final"; result: StreamFinal }
