@@ -3,19 +3,20 @@
 业务服务只在内网暴露；外部所有流量从这里进入。
 """
 
+import hashlib
 import json
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from shop_common.auth import Principal, PrincipalDep, create_internal_signature, create_token
+from shop_common.auth import Principal, PrincipalDep as _PrincipalDep, create_internal_signature, create_token
 from shop_common.config import get_settings, validate_production_settings
 from shop_common.errors import ApiError, install_error_handlers
 from shop_common.events import create_redis
@@ -44,9 +45,26 @@ SERVICES = {
 
 RATE_LIMIT_PER_MINUTE = 120
 LOGIN_RATE_LIMIT_PER_MINUTE = 10
-# 未登录访客的 AI 对话额度：按客户端 IP 每天 3 次，登录用户不受此限
-GUEST_CHAT_DAILY_LIMIT = 3
+# 匿名访客哨兵：auth.py 无 Bearer + 无签名头时返回 "guest"，
+# gateway 在此基础上按客户端 IP 哈希升级为 anon-{sha256} 身份
 GUEST_USER_ID = "guest"
+
+
+async def _gateway_principal(request: Request, principal: _PrincipalDep) -> Principal:
+    """Gateway 专属主体注入：匿名请求按客户端 IP 哈希生成独立匿名身份。
+
+    目的：所有匿名用户的 Memory/Conversation/配额三层隔离。
+    之前 auth.py 硬编码 Principal("guest", ...) 导致所有访客共享同一 user_id，
+    情节记忆/语义召回跨访客串扰、配额池也被共享。
+    anon_id 只在 gateway 签名头里生效，下游 harness 收到后按 user_id 自然隔离。
+    """
+    if principal.user_id == GUEST_USER_ID:
+        anon_id = f"anon-{hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]}"
+        return Principal(anon_id, principal.role, principal.tenant)
+    return principal
+
+
+PrincipalDep = Annotated[Principal, Depends(_gateway_principal)]
 
 # 服务名与下游真实路由前缀并非一一对应：inventory/orders/aftersales 带服务前缀，
 # fulfillment/harness 的路由没有前缀；agents 是 harness 的别名，还需要兼容
@@ -148,25 +166,6 @@ def _client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
-
-
-async def _consume_guest_chat_quota(request: Request) -> None:
-    """匿名访客按 IP 每天最多 3 次 AI 对话。
-
-    Redis key 按 UTC 自然日分桶，跨天自动重置；TTL 多留一天，
-    避免零点前后旧桶提前过期导致额度被意外刷新。
-    """
-    assert redis is not None
-    day = time.strftime("%Y%m%d", time.gmtime())
-    key = f"shop:guest_chat:{_client_ip(request)}:{day}"
-    count = await redis.incr(key)
-    if count == 1:
-        await redis.expire(key, 2 * 86400)
-    if count > GUEST_CHAT_DAILY_LIMIT:
-        raise ApiError(
-            "RATE_LIMITED",
-            f"访客每天最多 {GUEST_CHAT_DAILY_LIMIT} 次 AI 对话，登录后可继续使用",
-        )
 
 
 @app.middleware("http")
@@ -458,9 +457,6 @@ async def proxy(service: str, rest: str, request: Request, principal: PrincipalD
     base = SERVICES.get(service)
     if base is None:
         raise ApiError("NOT_FOUND", f"未知服务 {service}")
-    # 访客（未登录）每天最多 3 次 AI 对话；登录用户与服务间调用不计数
-    if service in {"agents", "harness"} and rest.endswith("/chat") and principal.user_id == GUEST_USER_ID:
-        await _consume_guest_chat_quota(request)
     url = f"{base}{_upstream_path(service, rest)}"
     # 透传业务头但剔除 hop-by-hop 头（Host/Content-Length 等），否则 httpx 重建请求会冲突
     headers = {
