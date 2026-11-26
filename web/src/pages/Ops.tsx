@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, getSession, money, type InventoryRow, type Order, type Shipment, type Ticket } from "../api";
+import { api, getSession, money, type InventoryRow, type Order, type PendingRun, type Shipment, type Ticket } from "../api";
 
-type Tab = "inventory" | "orders" | "shipments" | "tickets";
+type Tab = "inventory" | "orders" | "shipments" | "tickets" | "runs";
 
 // 不同 tab 复用同一列表状态，渲染时按 tab 收窄到具体行类型。
-type OpsRow = InventoryRow | Order | Shipment | Ticket;
+type OpsRow = InventoryRow | Order | Shipment | Ticket | PendingRun;
 
 export default function Ops() {
   const session = getSession();
@@ -20,6 +20,7 @@ export default function Ops() {
       if (tab === "inventory") setRows((await api.inventory()).items || []);
       else if (tab === "orders") setRows((await api.opsOrders()).items || []);
       else if (tab === "shipments") setRows((await api.shipments()).items || []);
+      else if (tab === "runs") setRows((await api.pendingRuns()).items || []);
       else setRows((await api.tickets("pending")).items || []);
     } catch (exc) {
       setError((exc as Error).message);
@@ -81,6 +82,7 @@ export default function Ops() {
           ["orders", "订单"],
           ["shipments", "履约"],
           ["tickets", "售后待审"],
+          ["runs", "待审批运行"],
         ] as [Tab, string][]).map(([key, label]) => (
           <button
             key={key}
@@ -204,6 +206,32 @@ export default function Ops() {
             </article>
           ))}
           {!rows.length && <p className="muted center">没有待处理的售后单。</p>}
+        </div>
+      )}
+
+      {tab === "runs" && (
+        <div className="list">
+          {(rows as PendingRun[]).map((run) => (
+            <article className="panel order" key={run.run_id}>
+              <header>
+                <strong>{run.tool || run.skill}</strong>
+                <span className="status needs_approval">待审批</span>
+                <span className="price">{run.expires_in_seconds}s</span>
+              </header>
+              <p className="muted">
+                运行 {run.run_id.slice(0, 8)} · 用户 {run.user_id} · {run.delegated ? "子 Agent" : "直接运行"}
+              </p>
+              {run.reason && <p className="hint">{run.reason}</p>}
+              <pre className="evidence">{JSON.stringify(run.args_preview, null, 2)}</pre>
+              <div className="row-actions">
+                {/* 高风险写操作必须由人工点批准后才执行；列表参数已在服务端脱敏。 */}
+                <button className="primary small" onClick={() => act(() => api.approveRun(run.run_id))}>
+                  批准执行
+                </button>
+              </div>
+            </article>
+          ))}
+          {!rows.length && <p className="muted center">没有待审批的 Agent 运行。</p>}
         </div>
       )}
     </div>

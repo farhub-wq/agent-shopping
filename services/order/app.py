@@ -596,6 +596,10 @@ class CreateOrderRequest(BaseModel):
     address: Address
 
 
+class AddressUpdate(BaseModel):
+    address: Address
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "order"}
@@ -821,6 +825,36 @@ async def cancel_order(order_id: str, principal: PrincipalDep, request: Request,
     # 取消落库成功后释放库存；释放接口幂等，重复取消不会二次回补。
     await _release_inventory(order_id, reason)
     return result
+
+
+@app.patch("/orders/{order_id}/address")
+async def update_order_address(
+    order_id: str, payload: AddressUpdate, principal: PrincipalDep, request: Request
+) -> dict[str, Any]:
+    """发货前允许改址；审计只记录字段名，不落收货人与电话等 PII。"""
+    async with get_session_factory()() as session:
+        order = await _load(session, order_id)
+        if not principal.is_staff() and order.user_id != principal.user_id:
+            raise ApiError("FORBIDDEN", "无权修改该订单地址")
+        # 已发货/部分发货/退款中/已结束的订单货已在途，改址必须走人工客服流程。
+        if order.status not in {"CREATED", "RESERVED", "PAYING", "PAID"}:
+            raise ApiError("CONFLICT", "订单已发货或已结束，无法修改收货地址")
+        before = {"address_fields": sorted((order.address or {}).keys())}
+        order.address = payload.address.model_dump()
+        enqueue_audit(
+            session,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            action="order.update_address",
+            target_type="order",
+            target_id=order.id,
+            before=before,
+            after={"address_fields": sorted(order.address.keys())},
+            request=request,
+            tenant=order.tenant,
+        )
+        await session.commit()
+        return order.to_dict()
 
 
 @app.post("/orders/{order_id}/ship")

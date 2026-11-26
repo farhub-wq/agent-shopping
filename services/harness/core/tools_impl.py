@@ -4,6 +4,8 @@
 """
 
 from typing import Any
+from unicodedata import category
+from urllib.parse import quote, urlencode
 
 from shop_common.auth import Principal, signed_identity_headers
 from shop_common.config import get_settings
@@ -19,6 +21,7 @@ settings = get_settings()
 catalog = ServiceClient(settings.catalog_url)
 inventory = ServiceClient(settings.inventory_url)
 orders = ServiceClient(settings.order_url)
+fulfillment = ServiceClient(settings.fulfillment_url)
 aftersales = ServiceClient(settings.aftersales_url)
 sandbox = SandboxManager()
 
@@ -33,31 +36,50 @@ def _principal(ctx: ToolContext) -> Principal:
     return Principal(ctx.user_id, ctx.role, ctx.tenant)
 
 
+def _path_segment(value: Any) -> str:
+    """模型输入只能构成一个路径段；结构字符必须在编码前拒绝。"""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or any(char in "/\\?#" or category(char) == "Cc" for char in value)
+    ):
+        raise ValueError("非法路径参数")
+    return quote(value, safe="")
+
+
+def _with_query(path: str, params: dict[str, Any]) -> str:
+    query = urlencode(params)
+    return f"{path}?{query}" if query else path
+
+
 async def _catalog_search(args: dict[str, Any], ctx: ToolContext) -> Any:
     params = {key: args[key] for key in ("q", "category") if args.get(key)}
     return await _get(catalog, "/products", params)
 
 
 async def _get(client: ServiceClient, path: str, params: dict[str, Any]) -> Any:
-    # 只拼 query 串，路径仍是固定常量（来自各工具函数），避免模型输入改变请求路径。
-    query = "&".join(f"{key}={value}" for key, value in params.items())
-    return await client.request("GET", f"{path}?{query}" if query else path)
+    # 路径仍是固定常量；query 键和值统一编码，模型输入不能新增参数或片段。
+    return await client.request("GET", _with_query(path, params))
 
 
 async def _catalog_detail(args: dict[str, Any], ctx: ToolContext) -> Any:
-    return await catalog.request("GET", f"/products/{args['sku']}")
+    return await catalog.request("GET", f"/products/{_path_segment(args['sku'])}")
 
 
 async def _catalog_validate(args: dict[str, Any], ctx: ToolContext) -> Any:
-    product = await catalog.request("GET", f"/products/{args['sku']}")
+    product = await catalog.request("GET", f"/products/{_path_segment(args['sku'])}")
     check = await catalog.request(
-        "POST", f"/products/{product['id']}/compliance-check", json={}, headers=_headers(ctx)
+        "POST",
+        f"/products/{_path_segment(product['id'])}/compliance-check",
+        json={},
+        headers=_headers(ctx),
     )
     return {"product": product["title"], "sku": product["sku"], **check}
 
 
 async def _inventory_check(args: dict[str, Any], ctx: ToolContext) -> Any:
-    return await inventory.request("GET", f"/inventory/{args['sku']}")
+    return await inventory.request("GET", f"/inventory/{_path_segment(args['sku'])}")
 
 
 async def _inventory_list(_: dict[str, Any], ctx: ToolContext) -> Any:
@@ -68,13 +90,15 @@ async def _order_lookup(args: dict[str, Any], ctx: ToolContext) -> Any:
     order_id = args.get("order_id") or ""
     if not order_id:
         return {"status": "error", "message": "缺少订单号"}
-    return await orders.request("GET", f"/orders/{order_id}", headers=_headers(ctx))
+    return await orders.request(
+        "GET", f"/orders/{_path_segment(order_id)}", headers=_headers(ctx)
+    )
 
 
 async def _order_list(args: dict[str, Any], ctx: ToolContext) -> Any:
     status = args.get("status")
-    path = "/orders" + (f"?status={status}" if status else "")
-    return await orders.request("GET", path, headers=_headers(ctx))
+    params = {"status": status} if status else {}
+    return await orders.request("GET", _with_query("/orders", params), headers=_headers(ctx))
 
 
 async def _after_sales_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -88,6 +112,7 @@ async def _after_sales_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
             "order_id": order_id,
             "reason": args.get("reason", "quality_issue"),
             "description": args.get("description", ""),
+            "review_mode": "manual",
         },
         headers=_headers(ctx),
     )
@@ -95,13 +120,66 @@ async def _after_sales_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
 
 async def _after_sales_queue(args: dict[str, Any], ctx: ToolContext) -> Any:
     status = args.get("status", "pending")
-    return await aftersales.request("GET", f"/aftersales/tickets?status={status}", headers=_headers(ctx))
+    return await aftersales.request(
+        "GET", _with_query("/aftersales/tickets", {"status": status}), headers=_headers(ctx)
+    )
+
+
+async def _after_sales_status(args: dict[str, Any], ctx: ToolContext) -> Any:
+    """顾客侧只读：按工单号查明细，或按状态列出本人工单进度。"""
+    ticket_id = args.get("ticket_id")
+    if ticket_id:
+        return await aftersales.request(
+            "GET", f"/aftersales/tickets/{_path_segment(ticket_id)}", headers=_headers(ctx)
+        )
+    status = args.get("status")
+    params = {"status": status} if status else {}
+    return await aftersales.request(
+        "GET", _with_query("/aftersales/tickets", params), headers=_headers(ctx)
+    )
+
+
+async def _shipment_track(args: dict[str, Any], ctx: ToolContext) -> Any:
+    """顾客侧只读：按订单号查询履约状态与运单号，所有权由 fulfillment 再校验。"""
+    order_id = args.get("order_id") or ""
+    if not order_id:
+        return {"status": "error", "message": "缺少订单号"}
+    return await fulfillment.request(
+        "GET", f"/shipments/by-order/{_path_segment(order_id)}", headers=_headers(ctx)
+    )
+
+
+async def _order_cancel(args: dict[str, Any], ctx: ToolContext) -> Any:
+    """高风险写：取消订单由审批网关放行后才执行，reason 必须编码进 query。"""
+    order_id = args.get("order_id") or ""
+    if not order_id:
+        return {"status": "error", "message": "取消订单需要订单号"}
+    reason = args.get("reason") or "user_cancelled"
+    return await orders.request(
+        "POST",
+        _with_query(f"/orders/{_path_segment(order_id)}/cancel", {"reason": reason}),
+        headers=_headers(ctx),
+    )
+
+
+async def _order_update_address(args: dict[str, Any], ctx: ToolContext) -> Any:
+    """高风险写：修改未发货订单的收货地址。"""
+    order_id = args.get("order_id") or ""
+    address = args.get("address")
+    if not order_id or not isinstance(address, dict) or not address:
+        return {"status": "error", "message": "修改地址需要订单号与完整地址"}
+    return await orders.request(
+        "PATCH",
+        f"/orders/{_path_segment(order_id)}/address",
+        json={"address": address},
+        headers=_headers(ctx),
+    )
 
 
 async def _after_sales_propose(args: dict[str, Any], ctx: ToolContext) -> Any:
     return await aftersales.request(
         "POST",
-        f"/aftersales/tickets/{args['ticket_id']}/proposal",
+        f"/aftersales/tickets/{_path_segment(args['ticket_id'])}/proposal",
         json={
             "recommendation": args["recommendation"],
             "rationale": args.get("rationale", ""),
@@ -115,7 +193,7 @@ async def _after_sales_approve(args: dict[str, Any], ctx: ToolContext) -> Any:
     """不可逆动作：默认不授予任何 Agent，仅保留给人工审批后重放。"""
     return await aftersales.request(
         "POST",
-        f"/aftersales/tickets/{args['ticket_id']}/approve",
+        f"/aftersales/tickets/{_path_segment(args['ticket_id'])}/approve",
         json={"note": args.get("note", "")},
         headers=_headers(ctx),
     )
@@ -142,7 +220,7 @@ async def _sandbox_run(args: dict[str, Any], ctx: ToolContext) -> Any:
 
 
 async def _content_draft(args: dict[str, Any], ctx: ToolContext) -> Any:
-    product = await catalog.request("GET", f"/products/{args['sku']}")
+    product = await catalog.request("GET", f"/products/{_path_segment(args['sku'])}")
     angle = args.get("angle", "卖点")
     title = product["title"]
     points = product.get("tags") or []
@@ -236,8 +314,71 @@ registry.register(
 )
 registry.register(
     Tool(
+        "shipment_track",
+        "按订单号查询发货状态与运单号（只读，仅本人订单）",
+        {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+        _shipment_track,
+        ToolPolicy("shipment_track", permission="read", risk="low", data_class="pii"),
+    )
+)
+registry.register(
+    Tool(
+        "order_cancel",
+        "取消未支付订单（高风险，需人工审批后执行）",
+        {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string"},
+                "reason": {"type": "string", "description": "取消原因"},
+            },
+            "required": ["order_id"],
+        },
+        _order_cancel,
+        ToolPolicy(
+            "order_cancel",
+            permission="write",
+            risk="irreversible",
+            data_class="pii",
+            requires_approval=True,
+        ),
+    )
+)
+registry.register(
+    Tool(
+        "order_update_address",
+        "修改未发货订单的收货地址（高风险，需人工审批后执行）",
+        {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string"},
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "receiver": {"type": "string"},
+                        "phone": {"type": "string"},
+                        "province": {"type": "string"},
+                        "city": {"type": "string"},
+                        "detail": {"type": "string"},
+                    },
+                    "required": ["receiver", "phone", "detail"],
+                },
+            },
+            "required": ["order_id", "address"],
+        },
+        _order_update_address,
+        ToolPolicy(
+            "order_update_address",
+            permission="write",
+            risk="high",
+            data_class="pii",
+            requires_approval=True,
+        ),
+    )
+)
+registry.register(
+    Tool(
         "after_sales_draft",
-        "为指定订单起草售后申请（仅创建待审工单，不直接退款）",
+        "只创建待审核申请，不执行退款",
         {
             "type": "object",
             "properties": {
@@ -258,6 +399,21 @@ registry.register(
         {"type": "object", "properties": {"status": {"type": "string"}}},
         _after_sales_queue,
         ToolPolicy("after_sales_queue", permission="read", risk="low", data_class="internal"),
+    )
+)
+registry.register(
+    Tool(
+        "after_sales_status",
+        "查询本人售后工单的处理进度与结论（只读）",
+        {
+            "type": "object",
+            "properties": {
+                "ticket_id": {"type": "string", "description": "售后工单号，留空则列出本人工单"},
+                "status": {"type": "string", "description": "按状态过滤，如 pending/approved/rejected"},
+            },
+        },
+        _after_sales_status,
+        ToolPolicy("after_sales_status", permission="read", risk="low", data_class="pii"),
     )
 )
 registry.register(
