@@ -155,6 +155,51 @@ async def test_planner_multi_intent_produces_plan():
     assert [step["tool"] for step in decision.steps] == ["inventory_check", "catalog_validate"]
 
 
+@pytest.mark.asyncio
+async def test_planner_asks_for_sku_instead_of_defaulting():
+    planner = DeterministicPlanner()
+    decision = await planner.decide(
+        "system", [{"role": "user", "content": "这个还有货吗"}], [{"name": "inventory_check"}]
+    )
+    assert decision.kind == "final"
+    assert "SKU" in decision.content
+
+
+@pytest.mark.asyncio
+async def test_planner_prefers_shipment_track_for_logistics():
+    planner = DeterministicPlanner()
+    decision = await planner.decide(
+        "system",
+        [{"role": "user", "content": "订单 SO20260101123456 的快递到哪了"}],
+        [{"name": "shipment_track"}, {"name": "order_lookup"}],
+    )
+    assert decision.kind == "tool"
+    assert decision.tool == "shipment_track"
+    assert decision.args["order_id"] == "SO20260101123456"
+
+
+@pytest.mark.asyncio
+async def test_planner_asks_for_order_id_before_tracking():
+    planner = DeterministicPlanner()
+    decision = await planner.decide(
+        "system", [{"role": "user", "content": "我的快递到哪了"}], [{"name": "shipment_track"}]
+    )
+    assert decision.kind == "final"
+    assert "订单号" in decision.content
+
+
+@pytest.mark.asyncio
+async def test_planner_uses_aftersales_status_for_progress_question():
+    planner = DeterministicPlanner()
+    decision = await planner.decide(
+        "system",
+        [{"role": "user", "content": "我的售后审核到哪了"}],
+        [{"name": "after_sales_status"}, {"name": "after_sales_draft"}],
+    )
+    assert decision.kind == "tool"
+    assert decision.tool == "after_sales_status"
+
+
 def test_decision_model_defaults_to_empty():
     assert Decision(kind="final").model == ""
 

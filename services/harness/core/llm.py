@@ -22,6 +22,10 @@ from .circuit import CircuitBreaker
 logger = get_logger(__name__)
 
 SKU_PATTERN = re.compile(r"SKU-\d{4}")
+# 订单号兼容业务单号（SO+数字）与内部 UUID 两种形态。
+_ORDER_PATTERN = re.compile(r"(SO\d{8}\d{6}|\b[0-9a-f]{8}-[0-9a-f-]{27}\b)")
+_ORDER_WORDS = ("订单", "物流", "发货", "到哪", "快递", "运单", "签收")
+_SHIPMENT_WORDS = ("物流", "快递", "运单", "签收", "到哪")
 
 # 单次 plan 的步骤上限：超出截断，避免一次决策无限执行工具（NFR-10 工具调用有上限）。
 MAX_PLAN_STEPS = 6
@@ -107,6 +111,8 @@ class DeterministicPlanner(LLMProvider):
 
         sku = SKU_PATTERN.search(last_user)
         text = last_user
+        order_match = _ORDER_PATTERN.search(text)
+        order_id = order_match.group(0) if order_match else ""
 
         def choose(candidates: list[tuple[str, dict[str, Any]]]) -> Decision:
             # 只从技能实际暴露的工具里挑，候选顺序表达「首选 / 退路」；
@@ -119,14 +125,17 @@ class DeterministicPlanner(LLMProvider):
         # 多意图查询：同时命中 ≥2 个独立查询类意图时产出 plan，而不是被首个关键词截断。
         # 售后/退款属「提议类」动作，保留下面的「首选/退路」语义，不参与 plan 组合。
         plan_steps: list[dict[str, Any]] = []
-        sku_value = sku.group(0) if sku else "SKU-1001"
-        if any(word in text for word in ("库存", "有货", "还剩", "秒杀")):
-            plan_steps.append({"tool": "inventory_check", "args": {"sku": sku_value}})
+        if sku and any(word in text for word in ("库存", "有货", "还剩", "秒杀")):
+            plan_steps.append({"tool": "inventory_check", "args": {"sku": sku.group(0)}})
         if any(word in text for word in ("上架", "合规", "属性", "标题", "文案")):
-            plan_steps.append({"tool": "catalog_validate", "args": {"sku": sku_value}})
-        if any(word in text for word in ("订单", "物流", "发货", "到哪")):
-            match = re.search(r"(SO\d{8}\d{6}|\b[0-9a-f]{8}-[0-9a-f-]{27}\b)", text)
-            plan_steps.append({"tool": "order_lookup", "args": {"order_id": match.group(0) if match else ""}})
+            plan_steps.append(
+                {"tool": "catalog_validate", "args": {"sku": sku.group(0) if sku else "SKU-1001"}}
+            )
+        if any(word in text for word in _ORDER_WORDS):
+            if "shipment_track" in available and any(word in text for word in _SHIPMENT_WORDS) and order_id:
+                plan_steps.append({"tool": "shipment_track", "args": {"order_id": order_id}})
+            else:
+                plan_steps.append({"tool": "order_lookup", "args": {"order_id": order_id}})
         if any(word in text for word in ("推荐", "买", "选", "耳机", "跑鞋", "精华", "衬衫")):
             keyword = next(
                 (word for word in ("耳机", "跑鞋", "精华", "衬衫", "枕头", "收纳") if word in text),
@@ -137,22 +146,34 @@ class DeterministicPlanner(LLMProvider):
         if len(plan_steps) >= 2:
             return Decision(kind="plan", steps=plan_steps)
 
+        # 售后进度优先于建单：用户问「审核到哪了」时不应再起草一张新工单。
+        if (
+            any(word in text for word in ("售后", "退款", "退货", "工单"))
+            and any(word in text for word in ("进度", "审核", "状态", "到哪", "结果", "通过", "拒绝"))
+            and "after_sales_status" in available
+        ):
+            return Decision(kind="tool", tool="after_sales_status", args={})
+
         if any(word in text for word in ("退款", "退货", "售后", "换货")):
             args = {"reason": "quality_issue" if "质量" in text else "size_issue", "description": text}
             if sku:
                 args["sku"] = sku.group(0)
-            if "订单" in text:
-                match = re.search(r"(SO\d{8}\d{6}|\b[0-9a-f]{8}-[0-9a-f-]{27}\b)", text)
-                if match:
-                    args["order_id"] = match.group(0)
+            if "订单" in text and order_id:
+                args["order_id"] = order_id
             return choose([("after_sales_draft", args), ("order_lookup", {})])
 
-        if any(word in text for word in ("订单", "物流", "发货", "到哪")):
-            match = re.search(r"(SO\d{8}\d{6}|\b[0-9a-f]{8}-[0-9a-f-]{27}\b)", text)
-            return choose([("order_lookup", {"order_id": match.group(0) if match else ""})])
+        if any(word in text for word in _ORDER_WORDS):
+            if "shipment_track" in available and any(word in text for word in _SHIPMENT_WORDS):
+                if not order_id:
+                    return Decision(kind="final", content="请提供订单号，我帮你查询物流进度。")
+                return Decision(kind="tool", tool="shipment_track", args={"order_id": order_id})
+            return choose([("order_lookup", {"order_id": order_id})])
 
         if any(word in text for word in ("库存", "有货", "还剩", "秒杀")):
-            return choose([("inventory_check", {"sku": sku.group(0) if sku else "SKU-1001"})])
+            # 缺 SKU 时必须追问，默认某个 SKU 会把「有货吗」答成别的商品库存。
+            if not sku:
+                return Decision(kind="final", content="请提供商品 SKU，我再帮你查询可售库存。")
+            return choose([("inventory_check", {"sku": sku.group(0)})])
 
         if any(word in text for word in ("上架", "合规", "属性", "标题", "文案")):
             return choose([("catalog_validate", {"sku": sku.group(0) if sku else "SKU-1001"})])
