@@ -87,6 +87,18 @@ def _assert_waiting_for_review(response):
 
 
 @pytest.mark.asyncio
+async def test_ticket_detail_accepts_human_readable_ticket_no(sales_env):
+    # 顾客/模型通常拿的是 AS 开头的工单号，详情接口必须能按它定位。
+    response = await _create_ticket(sales_env, review_mode="manual")
+    ticket = _assert_waiting_for_review(response)
+
+    detail = await sales_env.client.get(f"/aftersales/tickets/{ticket['ticket_no']}")
+
+    assert detail.status_code == 200
+    assert detail.json()["id"] == ticket["id"]
+
+
+@pytest.mark.asyncio
 async def test_manual_review_keeps_auto_approve_pending_without_refund(sales_env):
     response = await _create_ticket(sales_env, review_mode="manual")
 

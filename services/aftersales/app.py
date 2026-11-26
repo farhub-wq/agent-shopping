@@ -18,7 +18,7 @@ from shop_common.http import ServiceClient
 from shop_common.logging import configure_logging, get_logger
 from shop_common.metrics import install_metrics
 from shop_common.outbox import OutboxRelay
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from .models import AfterSaleTicket
 from .policy import evaluate
@@ -269,7 +269,12 @@ async def list_tickets(
 @app.get("/aftersales/tickets/{ticket_id}")
 async def get_ticket(ticket_id: str, principal: PrincipalDep) -> dict[str, Any]:
     async with get_session_factory()() as session:
-        ticket = await session.get(AfterSaleTicket, ticket_id)
+        # 顾客和模型更常拿到可读工单号（AS...），内部 id 也可能被直接传入，两者都接受。
+        ticket = await session.scalar(
+            select(AfterSaleTicket).where(
+                or_(AfterSaleTicket.id == ticket_id, AfterSaleTicket.ticket_no == ticket_id)
+            )
+        )
         if ticket is None:
             raise ApiError("NOT_FOUND", "售后单不存在")
         # 单条查询同样校验归属：非员工且非本人一律拒绝，不能靠列表过滤兜底
