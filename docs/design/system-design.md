@@ -1,6 +1,6 @@
 # shop-agent 系统设计（生产基线）
 
-> 状态：**已冻结（修订版 2026-11-06）**。本版取代此前的“可上线 MVP”版本：单机 Compose、整单退款、无总账、Redis 即库存真相、进程内 relay、本地沙箱兜底等设计不再适用。本修订版闭环库存-支付竞态、补总账分录模板与退款分摊、订单状态机补 SHIPPING、消费去重与 DLQ 落库、明确三高容量基准与验收，详见 13.1 修订记录。
+> 状态：**已冻结（修订版 2026-11-06；Agent 协作补充 2026-11-25）**。本版取代此前的“可上线 MVP”版本：单机 Compose、整单退款、无总账、Redis 即库存真相、进程内 relay、本地沙箱兜底等设计不再适用。本修订版闭环库存-支付竞态、补总账分录模板与退款分摊、订单状态机补 SHIPPING、消费去重与 DLQ 落库、明确三高容量基准与验收，详见 13.1 修订记录。
 > 需求来源：[requirements-shop-agent.md](../requirements/requirements-shop-agent.md)；规模与 SLO 见第 1 节。
 
 ---
@@ -293,6 +293,15 @@ sequenceDiagram
 
 **边界**：面向顾客只读 + 提议；退款、改价等不可逆动作只产出提案，由运营审批后由业务系统执行；支持转人工。
 
+- **多 Agent 入口**：顾客默认使用 `auto`，也可手动切换直接技能。自动路由只选择 `chitchat`、`presales`、`inventory`、`aftersales` 四个顾客专家；`customer-service` 是安全兜底和直接入口。`ops-*` 运营技能不参与自动路由，operator/admin 不能调用 `auto`。
+- **串行主控**：单主控最多委派两个专家，按依赖顺序串行执行；单专家可流式透传，多专家在全部完成后进行一次无工具 synthesis，只暴露一个最终答案。真实模型不可用、路由非法或置信度不足时回退 `customer-service`，不使用关键词规划器执行写操作。
+- **预算与证据**：父运行独占日配额、工作/情节/语义记忆、摘要和 usage sink；子运行共享剩余 token 与总计 8 次工具预算，保留独立 `run_id`、trace 和 evidence。根 trace 的 `agent.start/end` 记录子 `run_id`，子 pending 保存 `parent_run_id`。取消、异常和断流显式关闭异步流、补终态并按已观察用量结算。
+- **内置 Agent 信任边界**：内置 Agent 是仓库内受信代码配置，沿用技能 manifest 的工具准入策略，不是可动态加载的第四方 skill；自动路由不能绕过 `ToolRegistry` 的权限、审批和不可信输出约束。
+- **顾客侧只读查询**：售后助手与综合客服可按本人身份查询订单列表、运单轨迹与售后工单进度（`order_list` / `shipment_track` / `after_sales_status`）；下游服务按 principal 再次校验数据所有权，越权返回 403。
+- **高风险写审批**：取消未支付订单（`order_cancel`）与修改未发货订单地址（`order_update_address`）声明 `requires_approval`；运行挂起后，运营在「待审批运行」列表（`GET /runs/pending`，仅脱敏摘要）批准才执行并回填终态。改址在 `order` 服务侧只允许 `CREATED/RESERVED/PAYING/PAID`，已发货改址必须走人工客服。
+- **售后**：Agent 只能查询订单/售后并创建 `review_mode=manual` 申请；申请始终保持 `pending`、不自动通过、不触发退款。顾客售后页默认 `policy` 的自动政策保持不变，执行仍由既有运营审批负责。
+- **审批续跑**：pending 快照保存完整剩余计划、消息配对、累计用量和共享预算；审批按单次工具调用消费。续跑前原子消费 pending，配合运行锁防止并发或失租后重复执行不可逆 handler；消费后异常 fail-closed，不重新放行旧快照。计划续跑仍受 6 步上限，证据查询读取最后一个 `run.end` 作为当前终态。
+
 - **技能准入**：`preprocessing-command`、`undeclared-tool`、`unlisted-script`、`path-escape`、`network-egress`、`dependency-risk` 六类检查。
 - **信任**：`community(T1) < reviewed(T2) < vendor(T3) < certified(T4)`，manifest 不能自我提权；T1/T2 无脚本执行权。
 - **审批**：不可逆工具返回 `needs_approval`，运营审批后重放，审批留痕。
@@ -318,6 +327,9 @@ sequenceDiagram
 | `inventory_negative_total` | counter | >0 立即 P0 |
 | `ledger_imbalance_total` | counter | >0 立即 P0 |
 | `agent_tool_denied_total` | counter | 5 分钟 >10 次 |
+| `agent_route_total{service,source,result}` | counter | 路由失败/回退异常增长时告警 |
+| `agent_delegation_total{service,agent,status}` | counter | 专家失败或 pending 异常增长时告警 |
+| `agent_orchestration_duration_seconds{service}` | histogram | 自动编排 P95 >5s 持续 5 分钟 |
 | `reconciliation_diff_total` | gauge | >0 每日告警 |
 
 **告警分级**
