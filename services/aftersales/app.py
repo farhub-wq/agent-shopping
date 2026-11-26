@@ -3,7 +3,7 @@ import contextlib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, Field
@@ -85,6 +85,8 @@ class TicketCreate(BaseModel):
     # 行级售后：指定订单行与数量；两者都不传表示整单退款
     order_item_id: str | None = None
     quantity: int | None = Field(default=None, gt=0)
+    # Agent 申请只创建待审工单；普通售后页默认沿用自动政策
+    review_mode: Literal["policy", "manual"] = "policy"
 
 
 class Proposal(BaseModel):
@@ -223,8 +225,12 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
             risk_reasons=result["risk_reasons"],
             decision_note=result["note"],
         )
+        # manual 只保留政策评分供人工参考，状态流转与出款权限仍归人工
+        if payload.review_mode == "manual":
+            ticket.decided_by = ""
+            ticket.decision_note = "Agent 申请，待人工审核"
         # 政策引擎三档分流：自动驳回/自动通过/转人工；自动档决策人固定记为 policy-engine 便于审计溯源
-        if result["decision"] == "auto_reject":
+        elif result["decision"] == "auto_reject":
             ticket.status = "rejected"
             ticket.decided_by = "policy-engine"
             ticket.decided_at = datetime.now(UTC)
@@ -236,7 +242,7 @@ async def create_ticket(payload: TicketCreate, principal: PrincipalDep) -> dict[
         await session.commit()
         ticket_dict = ticket.to_dict()
 
-    if ticket.status == "approved":
+    if payload.review_mode == "policy" and ticket.status == "approved":
         # 自动通过后触发退款；退款失败不回滚工单结论，保持 approved 等待重试（payment 按 ticket_id 幂等）
         await _request_refund(ticket, principal)
     return {**ticket_dict, "policy": result}

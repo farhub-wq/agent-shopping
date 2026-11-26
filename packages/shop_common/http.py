@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import httpx
@@ -19,11 +20,14 @@ class ServiceClient:
         self.timeout = timeout
         self.retries = retries
         self._client: httpx.AsyncClient | None = None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        # 惰性初始化连接池：首次调用才建 client，后续请求复用同一连接池。
-        if self._client is None:
+        # 惰性初始化连接池；AsyncClient 绑定创建时的事件循环，跨 loop 必须重建。
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client_loop is not loop:
             self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client_loop = loop
         return self._client
 
     async def request(

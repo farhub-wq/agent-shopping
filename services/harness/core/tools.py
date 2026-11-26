@@ -55,6 +55,7 @@ class ToolContext:
     session_id: str
     run_id: str
     approved: set[str] = field(default_factory=set)
+    consumed_approvals: set[str] = field(default_factory=set)
     # 本次运行是否已收到沙箱执行输出：输出属于低信任数据，
     # 一旦为 True，后续写/不可逆动作一律转人工复核。
     untrusted_output: bool = False
@@ -146,9 +147,9 @@ class ToolRegistry:
             AGENT_TOOL_DENIED.labels("harness").inc()
             return ToolResult("denied", message=exc.message)
 
-        # 第 2 步：审批门槛。未在 ctx.approved 中的高风险工具一律转待审批，
-        # 语义上「已受理但未执行」，而不是失败。
-        if tool.policy.requires_approval and name not in ctx.approved:
+        # 第 2 步：审批门槛。审批按单次调用消费，不能放行续跑中的同名工具。
+        approval_active = name in ctx.approved and name not in ctx.consumed_approvals
+        if tool.policy.requires_approval and not approval_active:
             return ToolResult(
                 "needs_approval",
                 message=f"{name} 属于高风险动作，需要人工审批后重放",
@@ -161,7 +162,7 @@ class ToolRegistry:
         if (
             ctx.untrusted_output
             and tool.policy.permission in {"write", "admin"}
-            and name not in ctx.approved
+            and not approval_active
         ):
             return ToolResult(
                 "needs_approval",

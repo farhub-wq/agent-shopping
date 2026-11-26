@@ -272,6 +272,7 @@ export interface Timeline {
 // Agent 列表项（/agents）
 export interface AgentInfo {
   name: string;
+  display_name?: string;
   description: string;
   trust: string;
   allowed_tools: string[];
@@ -285,6 +286,18 @@ export interface Evidence {
   status: string;
   tool_calls: unknown;
   denied_calls: unknown;
+}
+
+// 待审批运行（/agents/runs/pending）：参数已在服务端脱敏
+export interface PendingRun {
+  run_id: string;
+  skill: string;
+  user_id: string;
+  tool: string;
+  reason: string;
+  args_preview: Record<string, unknown>;
+  delegated: boolean;
+  expires_in_seconds: number;
 }
 
 // 下单请求体（storefront/checkout）
@@ -311,12 +324,50 @@ export interface TraceStep {
   duration_ms?: number;
 }
 
+export interface AgentRouteInfo {
+  agent_ids: string[];
+  confidence: number;
+  reason: string;
+  source: "llm" | "rules" | "fallback";
+}
+
+export interface AgentRunSummary {
+  agent: string;
+  run_id: string;
+  status: string;
+  answer: string;
+  evidence?: Record<string, unknown>;
+}
+
+// 根运行与子 Agent 的终态；degraded 表示已降级但仍有可用结果，不能等同 completed。
+export type AgentRunStatus =
+  | "completed"
+  | "degraded"
+  | "failed"
+  | "pending_approval"
+  | "budget_exceeded"
+  | "quota_exceeded"
+  | "blocked"
+  | "max_steps_exceeded";
+
+export type ActiveAgentRunStatus = AgentRunStatus | "running";
+
+export type AgentEvent =
+  | (AgentRouteInfo & { type: "route" })
+  | { type: "agent.start"; agent: string; run_id: string }
+  | { type: "agent.end"; agent: string; run_id: string; status: string }
+  | { type: "fallback"; reason: string };
+
 export interface StreamFinal {
   run_id: string;
   answer: string;
+  // 根运行终态独立于子 Agent 状态，前端不能从 completed 子运行推导根运行结果。
+  status: AgentRunStatus;
   // 首轮新建或空闲拆分后返回的会话 id，前端必须续用，否则下一轮会再建一条会话
   conversation_id?: string | null;
   context?: ContextUsage | null;
+  route?: AgentRouteInfo;
+  agent_runs?: AgentRunSummary[];
 }
 
 // 会话上下文占用：后端按 token 粗估，前端据此在 80% 时提示开启新会话。
@@ -551,6 +602,10 @@ export const api = {
   agents: () => request<{ items: AgentInfo[] }>("/agents"),
   policies: () => request("/policies"),
   evidence: (runId: string) => request<Evidence>(`/agents/runs/${runId}/evidence`),
+  // 待审批的高风险工具运行：列表只给脱敏摘要，批准后才真正执行。
+  pendingRuns: () => request<{ items: PendingRun[] }>("/agents/runs/pending"),
+  approveRun: (runId: string) =>
+    request(`/agents/runs/${runId}/approve`, { method: "POST", body: "{}" }),
   opsOrders: (status?: string) => request<{ items: Order[] }>(`/orders${status ? `?status=${status}` : ""}`),
   memory: (userId: string) => request(`/agents/memory/${userId}`),
   // 审计日志只对 admin 开放，服务端再校验一次；筛选字段可空，空值不拼进查询串
@@ -683,6 +738,7 @@ export type StreamEvent =
   | { type: "start"; skill: string; trust: string }
   | { type: "context"; context: ContextUsage }
   | { type: "trace"; event: TraceStep }
+  | { type: "agent"; event: AgentEvent }
   | { type: "delta"; text: string }
   | { type: "final"; result: StreamFinal }
   | { type: "error"; message: string };

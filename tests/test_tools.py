@@ -1,6 +1,10 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
+from harness.core import tools_impl
 from harness.core.policy import ToolPolicy
-from harness.core.tools import Tool, ToolContext, ToolRegistry, redact, redact_data
+from harness.core.tools import Tool, ToolContext, ToolRegistry, redact, redact_data, registry
 
 
 def test_redact_masks_phone():
@@ -126,3 +130,140 @@ async def test_execute_neutralizes_injection_in_tool_output():
     assert "很棒的商品！" in result.data["desc"]
     assert "忽略之前的指令" not in result.data["desc"]
     assert result.data["stock"] == 3
+
+
+def _business_tool_context(*, approved: bool = False) -> ToolContext:
+    ctx = ToolContext(user_id="u1", role="operator", tenant="t", session_id="s", run_id="r")
+    if approved:
+        ctx.approved.add("after_sales_approve")
+    return ctx
+
+
+_PATH_CASES = [
+    ("catalog_detail", "catalog", "sku", {}, "GET", "/products/SKU-1001"),
+    ("catalog_validate", "catalog", "sku", {}, "GET", "/products/SKU-1001"),
+    ("inventory_check", "inventory", "sku", {}, "GET", "/inventory/SKU-1001"),
+    ("order_lookup", "orders", "order_id", {}, "GET", "/orders/SO-1001"),
+    ("after_sales_propose", "aftersales", "ticket_id", {"recommendation": "approve"},
+     "POST", "/aftersales/tickets/T1/proposal"),
+    ("after_sales_approve", "aftersales", "ticket_id", {}, "POST",
+     "/aftersales/tickets/T1/approve"),
+    ("content_draft", "catalog", "sku", {}, "GET", "/products/SKU-1001"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "client_name", "arg_name", "extra_args", "method", "expected_path"),
+    _PATH_CASES,
+)
+async def test_path_tools_preserve_normal_business_identifiers(
+    monkeypatch, tool_name, client_name, arg_name, extra_args, method, expected_path
+):
+    service = SimpleNamespace(request=AsyncMock(return_value={
+        "id": "product-1", "title": "商品", "sku": "SKU-1001", "tags": []
+    }))
+    monkeypatch.setattr(tools_impl, client_name, service)
+    identifier = "T1" if arg_name == "ticket_id" else "SO-1001" if arg_name == "order_id" else "SKU-1001"
+
+    result = await registry.execute(
+        tool_name,
+        {arg_name: identifier, **extra_args},
+        _business_tool_context(approved=tool_name == "after_sales_approve"),
+        trust="certified",
+    )
+
+    assert result.ok
+    assert service.request.await_args_list[0].args == (method, expected_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_segment", [
+    "T1/approve?x=", r"T1\approve", "T1?x=1", "T1#fragment", "T1\nnext", ".", "..",
+])
+async def test_after_sales_propose_rejects_path_injection_without_downstream_call(
+    monkeypatch, bad_segment
+):
+    service = SimpleNamespace(request=AsyncMock())
+    monkeypatch.setattr(tools_impl, "aftersales", service)
+
+    result = await registry.execute(
+        "after_sales_propose",
+        {"ticket_id": bad_segment, "recommendation": "approve"},
+        _business_tool_context(),
+        trust="certified",
+    )
+
+    assert result.status == "error"
+    service.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "client_name", "arg_name", "extra_args"),
+    [case[:4] for case in _PATH_CASES if case[0] != "after_sales_propose"],
+)
+@pytest.mark.parametrize("bad_segment", [
+    "ID/approve?x=", r"ID\approve", "ID?x=1", "ID#fragment", "ID\x00next", ".", "..",
+])
+async def test_other_path_tools_reject_structure_changing_segments(
+    monkeypatch, tool_name, client_name, arg_name, extra_args, bad_segment
+):
+    service = SimpleNamespace(request=AsyncMock())
+    monkeypatch.setattr(tools_impl, client_name, service)
+
+    result = await registry.execute(
+        tool_name,
+        {arg_name: bad_segment, **extra_args},
+        _business_tool_context(approved=tool_name == "after_sales_approve"),
+        trust="certified",
+    )
+
+    assert result.status == "error"
+    service.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_path_tools_percent_encode_valid_segment_content(monkeypatch):
+    service = SimpleNamespace(request=AsyncMock(return_value={}))
+    monkeypatch.setattr(tools_impl, "catalog", service)
+
+    result = await registry.execute(
+        "catalog_detail", {"sku": "SKU 1001"}, _business_tool_context(), trust="certified"
+    )
+
+    assert result.ok
+    service.request.assert_awaited_once_with("GET", "/products/SKU%201001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "client_name", "args", "expected_path"),
+    [
+        (
+            "catalog_search", "catalog", {"q": "手机 & 电脑?#", "category": "digital/home"},
+            "/products?q=%E6%89%8B%E6%9C%BA+%26+%E7%94%B5%E8%84%91%3F%23"
+            "&category=digital%2Fhome",
+        ),
+        (
+            "order_list", "orders", {"status": "paid&status=refunded#x"},
+            "/orders?status=paid%26status%3Drefunded%23x",
+        ),
+        (
+            "after_sales_queue", "aftersales", {"status": "pending&status=approved#x"},
+            "/aftersales/tickets?status=pending%26status%3Dapproved%23x",
+        ),
+    ],
+)
+async def test_query_tools_encode_values_without_injecting_parameters(
+    monkeypatch, tool_name, client_name, args, expected_path
+):
+    service = SimpleNamespace(request=AsyncMock(return_value={}))
+    monkeypatch.setattr(tools_impl, client_name, service)
+
+    result = await registry.execute(
+        tool_name, args, _business_tool_context(), trust="certified"
+    )
+
+    assert result.ok
+    assert service.request.await_args.args == ("GET", expected_path)

@@ -1,7 +1,8 @@
+import asyncio
 import json
 import math
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from shop_common.mongo import close_mongo
 from shop_common.sandbox import MAX_CODE_CHARS
 from sqlalchemy import and_, case, func, or_, select, update
 
+from .core.agents import AUTO_AGENT_ID, AgentDefinition, build_builtin_agents
 from .core.context import context_window, estimate_tokens
 from .core.conversation import (
     ARCHIVE_ENCODING,
@@ -42,6 +44,8 @@ from .core.llm import build_provider, build_provider_from_record
 from .core.manifest import load_all, load_skill
 from .core.mcp import MCPHub, MCPServer, build_mcp_hub, discover_and_register
 from .core.memory import MemoryManager, merge_session_summary
+from .core.metrics import OrchestrationMetrics
+from .core.orchestrator import AgentOrchestrator
 from .core.policy import summarize
 from .core.providers import (
     PRESETS,
@@ -56,7 +60,7 @@ from .core.providers import (
 )
 from .core.runtime import AgentRuntime, persist_usage
 from .core.sandbox import SandboxManager, validate_sandbox_production
-from .core.tools import ToolContext, registry
+from .core.tools import ToolContext, redact, redact_data, registry
 from .core.tools_impl import BUSINESS_TOOLS  # noqa: F401  （导入即注册业务工具）
 from .core.trace import load_trace
 from .models import (
@@ -77,6 +81,8 @@ redis: Redis | None = None
 bus: EventBus | None = None
 memory: MemoryManager | None = None
 runtime: AgentRuntime | None = None
+builtin_agents: dict[str, AgentDefinition] = {}
+orchestrator: AgentOrchestrator | None = None
 mcp_server: MCPServer | None = None
 mcp_hub: MCPHub | None = None
 sandbox = SandboxManager()
@@ -84,7 +90,7 @@ sandbox = SandboxManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global redis, bus, memory, runtime, mcp_server, mcp_hub
+    global redis, bus, memory, runtime, builtin_agents, orchestrator, mcp_server, mcp_hub
     configure_logging("harness")
     # 生产密钥仍是公开默认值时拒绝启动：否则 JWT 与内网签名身份头都可被任意伪造。
     # harness 还要签发给 runner 的请求，因此额外要求独立的 RUNNER_SIGNING_SECRET，
@@ -107,10 +113,13 @@ async def lifespan(_: FastAPI):
     # 启动时一次性完成 SKILL.md 准入扫描，findings 随 manifest 缓存；
     # 运行期只读这份快照，保证同一次进程生命周期内准入结论稳定。
     skills = {item.name: item for item in load_all(SKILL_ROOT)}
+    builtin_agents = build_builtin_agents()
+    skills.update({name: definition.manifest for name, definition in builtin_agents.items()})
     # usage_sink 注入真实用量落库；离线/测试环境不写库也不影响运行。
     # 提前构建 provider 并注入 runtime，以便在 shutdown 时关闭其连接池
     provider = build_provider(redis)
     runtime = AgentRuntime(registry, provider, skills, memory, usage_sink=persist_usage)
+    orchestrator = AgentOrchestrator(runtime, builtin_agents)
     # 启动时发现并注册远端 MCP 工具；放在 MCPServer 之前，让 /mcp、/tools 清单与工具网关一致。
     mcp_hub = build_mcp_hub(settings.mcp_http_servers)
     discovered = await discover_and_register(registry, mcp_hub)
@@ -446,26 +455,37 @@ async def healthz() -> dict[str, Any]:
 @app.get("/agents")
 async def list_agents(principal: PrincipalDep) -> dict[str, Any]:
     assert runtime is not None
-    visible = [
-        manifest for manifest in runtime.skills.values()
-        if principal.role in manifest.allowed_roles
-    ]
-    return {
-        "items": [
+    items: list[dict[str, Any]] = []
+    if principal.role == "customer":
+        items.append(
+            {
+                "name": AUTO_AGENT_ID,
+                "description": "自动识别问题并串行分派专家",
+                "trust": "reviewed",
+                "allowed_tools": [],
+                "display_name": "自动分派",
+                "verdict": "allow",
+            }
+        )
+    for manifest in runtime.skills.values():
+        if principal.role not in manifest.allowed_roles:
+            continue
+        definition = builtin_agents.get(manifest.name)
+        items.append(
             {
                 "name": manifest.name,
                 "description": manifest.description,
                 "trust": manifest.trust,
                 "allowed_tools": manifest.allowed_tools,
+                "display_name": definition.display_name if definition else manifest.name,
                 # 只要存在一条 high 级 finding 就整体判 deny：准入是「一票否决」，
                 # 避免部分风险被 medium 项稀释后放行。
                 "verdict": "deny"
                 if any(item.severity == "high" for item in manifest.findings)
                 else "allow",
             }
-            for manifest in visible
-        ]
-    }
+        )
+    return {"items": items}
 
 
 @app.get("/skills")
@@ -476,6 +496,12 @@ async def list_skills() -> dict[str, Any]:
 
 @app.post("/skills/{name}/verify")
 async def verify_skill(name: str) -> dict[str, Any]:
+    if name in builtin_agents:
+        assert runtime is not None
+        manifest = runtime.skills.get(name)
+        if manifest is None:
+            raise ApiError("NOT_FOUND", f"技能 {name} 不存在")
+        return manifest.to_dict()
     path = SKILL_ROOT / name / "SKILL.md"
     if not path.exists():
         raise ApiError("NOT_FOUND", f"技能 {name} 不存在")
@@ -509,11 +535,16 @@ async def chat(
     assert runtime is not None
     # 技能按 SKILL.md 声明的 roles 过滤：顾客不能调用 ops-* 运营侧技能，
     # 即使前端绕过了列表直接调 chat 接口，后端也要拒绝。
-    manifest = runtime.skills.get(skill_name)
-    if manifest is None:
-        raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
-    if principal.role not in manifest.allowed_roles:
-        raise ApiError("FORBIDDEN", f"技能 {skill_name} 不对角色 {principal.role} 开放")
+    is_auto = skill_name == AUTO_AGENT_ID
+    if is_auto:
+        if principal.role != "customer":
+            raise ApiError("FORBIDDEN", "自动分派仅对顾客开放")
+    else:
+        manifest = runtime.skills.get(skill_name)
+        if manifest is None:
+            raise ApiError("NOT_FOUND", f"技能 {skill_name} 不存在")
+        if principal.role not in manifest.allowed_roles:
+            raise ApiError("FORBIDDEN", f"技能 {skill_name} 不对角色 {principal.role} 开放")
     # 访客只用环境默认/离线模型，会话与用量都不落库，保持既有匿名体验。
     is_guest = principal.user_id == "guest"
 
@@ -595,7 +626,24 @@ async def chat(
     )
 
     if not stream:
-        result = await runtime.run(skill_name, payload.message, ctx, provider=provider)
+        metrics = OrchestrationMetrics() if is_auto else None
+        try:
+            if is_auto:
+                assert orchestrator is not None
+                result = await orchestrator.run(payload.message, ctx, provider=provider)
+            else:
+                result = await runtime.run(skill_name, payload.message, ctx, provider=provider)
+        except asyncio.CancelledError:
+            if metrics is not None:
+                metrics.finish("cancelled")
+            raise
+        except Exception:
+            if metrics is not None:
+                metrics.finish("error")
+            raise
+        if metrics is not None:
+            metrics.observe_result(result)
+            metrics.finish(result.status)
         if not is_guest and conversation_id:
             await _persist_assistant(conversation_id, result.answer)
         data = result.to_dict()
@@ -605,13 +653,70 @@ async def chat(
 
     async def generator():
         answer = ""
+        fallback_emitted = False
+        metrics = OrchestrationMetrics() if is_auto else None
         try:
-            async for event in runtime.run_stream(skill_name, payload.message, ctx, provider=provider):
-                if event.get("type") == "final":
-                    answer = event.get("result", {}).get("answer", "")
-                    if conversation_id:
-                        event.setdefault("result", {})["conversation_id"] = conversation_id
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if is_auto:
+                assert orchestrator is not None
+                events = orchestrator.run_stream(payload.message, ctx, provider=provider)
+            else:
+                events = runtime.run_stream(skill_name, payload.message, ctx, provider=provider)
+            async with aclosing(events) as stream_events:
+                async for event in stream_events:
+                    if metrics is not None:
+                        metrics.observe_event(event)
+                    fallback_event = None
+                    agent_event = event.get("event")
+                    if (
+                        is_auto
+                        and event.get("type") == "agent"
+                        and isinstance(agent_event, dict)
+                        and agent_event.get("type") == "fallback"
+                    ):
+                        # 兼容 orchestrator 将来直接输出 fallback；已补发过则不重复转发。
+                        if fallback_emitted:
+                            continue
+                        fallback_emitted = True
+                    if (
+                        is_auto
+                        and not fallback_emitted
+                        and event.get("type") == "agent"
+                        and isinstance(agent_event, dict)
+                        and agent_event.get("type") == "route"
+                        and agent_event.get("source") == "fallback"
+                    ):
+                        # orchestrator 的 fallback 路由只发 route；SSE 契约额外要求
+                        # 独立 fallback 事件，供前端展示降级原因，final 保持原样。
+                        fallback_emitted = True
+                        fallback_event = {
+                            "type": "agent",
+                            "event": {
+                                "type": "fallback",
+                                "reason": agent_event.get("reason", ""),
+                            },
+                        }
+                    if event.get("type") == "final":
+                        result = event.get("result", {})
+                        answer = result.get("answer", "")
+                        if metrics is not None:
+                            metrics.observe_result(result)
+                            metrics.finish(result.get("status", "unknown"))
+                        if conversation_id:
+                            result["conversation_id"] = conversation_id
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if fallback_event is not None:
+                        yield f"data: {json.dumps(fallback_event, ensure_ascii=False)}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            if metrics is not None:
+                metrics.finish("cancelled")
+            raise
+        except Exception:
+            if metrics is not None:
+                metrics.finish("error")
+            raise
+        else:
+            if metrics is not None:
+                metrics.finish("error")
         finally:
             # 流结束（含异常收尾）后补落助手消息，不让持久化失败中断 SSE。
             if not is_guest and conversation_id and answer:
@@ -634,7 +739,10 @@ async def approve_run(run_id: str, principal: PrincipalDep, request: Request) ->
         session_id=f"approve-{run_id}",
         run_id=run_id,
     )
-    result = (await runtime.approve_and_replay(run_id, ctx)).to_dict()
+    if orchestrator is not None:
+        result = (await orchestrator.approve_and_replay(run_id, ctx)).to_dict()
+    else:
+        result = (await runtime.approve_and_replay(run_id, ctx)).to_dict()
     # harness 无关系库，审计直接投递 Redis Stream；失败不阻断审批结果返回
     if bus is not None:
         try:
@@ -666,7 +774,7 @@ async def get_evidence(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
     owner = start.get("user")
     if not principal.is_staff() and owner != principal.user_id:
         raise ApiError("FORBIDDEN", "无权查看该运行证据")
-    end = next((item for item in trace if item["type"] == "run.end"), {})
+    end = next((item for item in reversed(trace) if item["type"] == "run.end"), {})
     tool_calls = [item for item in trace if item["type"] == "tool.result"]
     return {
         "run_id": run_id,
@@ -677,6 +785,46 @@ async def get_evidence(run_id: str, principal: PrincipalDep) -> dict[str, Any]:
         "denied_calls": len([item for item in tool_calls if item.get("status") in {"denied", "needs_approval"}]),
         "trace": trace,
     }
+
+
+@app.get("/runs/pending")
+async def list_pending_runs(principal: PrincipalDep) -> dict[str, Any]:
+    """运营审批工作台：列出未过期的待审批运行，只返回脱敏摘要。"""
+    assert redis is not None
+    principal.require_staff()
+    items: list[dict[str, Any]] = []
+    async for raw_key in redis.scan_iter(match="shop:harness:pending:*", count=100):
+        key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+        run_id = key[len("shop:harness:pending:") :]
+        if not run_id:
+            continue
+        raw = await redis.get(key)
+        if not raw:
+            continue
+        try:
+            snapshot = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(snapshot, dict):
+            continue
+        ctx = snapshot.get("ctx") if isinstance(snapshot.get("ctx"), dict) else {}
+        ttl = await redis.ttl(key)
+        items.append(
+            {
+                "run_id": run_id,
+                "skill": str(snapshot.get("skill") or ""),
+                "user_id": str(ctx.get("user_id") or ""),
+                "tool": str(snapshot.get("tool") or ""),
+                "reason": redact(str(snapshot.get("reason") or ""))[:200],
+                "args_preview": redact_data(snapshot.get("args") or {}),
+                "delegated": isinstance(snapshot.get("limits"), dict),
+                "expires_in_seconds": ttl if isinstance(ttl, int) and ttl > 0 else 0,
+            }
+        )
+        if len(items) >= 50:
+            break
+    items.sort(key=lambda item: item["run_id"])
+    return {"items": items}
 
 
 @app.get("/memory/{user_id}")

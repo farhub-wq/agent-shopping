@@ -341,6 +341,27 @@ async def test_extract_semantic_regex_only_without_provider(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我穿42码",
+        "我的电话是13800138000",
+        "我穿42码？",
+        "他昨天说，我穿43码",
+        "如果我穿42码，会好看吗？",
+    ],
+)
+async def test_extract_semantic_without_provider_does_not_persist_size_or_contact(
+    text, monkeypatch
+):
+    collection = _FakeCollection()
+    manager = _manager_with_collection(collection, monkeypatch)
+
+    assert await manager.extract_semantic("u1", text) == []
+    assert collection.rows == []
+
+
+@pytest.mark.asyncio
 async def test_llm_extraction_merges_and_stores_slot_facts(monkeypatch):
     collection = _FakeCollection()
     manager = _manager_with_collection(collection, monkeypatch)
