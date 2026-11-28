@@ -5,7 +5,6 @@ import {
   getSession,
   type TraceStep,
   type AgentInfo,
-  type AgentRouteInfo,
   type AgentRunSummary,
   type AgentRunStatus,
   type ActiveAgentRunStatus,
@@ -18,6 +17,9 @@ import {
 interface Message {
   role: "user" | "assistant";
   text: string;
+  // 本轮答案实际调用的智能体及其终态；只有识别结果、未实际执行时仅标注专家名。
+  agents?: { agent: string; status?: ActiveAgentRunStatus }[];
+  fallbackReason?: string;
 }
 
 interface ActiveAgentRun {
@@ -64,18 +66,13 @@ export default function Agent() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   // 只有服务端确认当前技能可见后，才允许发起对话。
   const [agentsReady, setAgentsReady] = useState(false);
-  const [skill, setSkill] = useState("auto");
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [trace, setTrace] = useState<TraceStep[]>([]);
   const [runId, setRunId] = useState("");
   const [evidence, setEvidence] = useState<Evidence | null>(null);
-  const [routeLabel, setRouteLabel] = useState("");
-  const [route, setRoute] = useState<AgentRouteInfo | null>(null);
   const [activeAgents, setActiveAgents] = useState<ActiveAgentRun[]>([]);
   const [agentRuns, setAgentRuns] = useState<AgentRunSummary[]>([]);
-  const [rootStatus, setRootStatus] = useState<AgentRunStatus | "">("");
-  const [fallbackReason, setFallbackReason] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [splitPending, setSplitPending] = useState(false);
@@ -93,8 +90,6 @@ export default function Agent() {
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
   // 会话 id 在页面生命周期内固定，让多轮对话共享 Agent 的上下文与记忆。
   const sessionId = useRef(`web-${crypto.randomUUID().slice(0, 8)}`);
-  // 流式过程中切换专家时，final 仍应刷新当前专家对应的会话列表。
-  const skillRef = useRef(skill);
   const agentsReadyRef = useRef(false);
   const busyRef = useRef(false);
   const splitPendingRef = useRef(false);
@@ -110,23 +105,13 @@ export default function Agent() {
     setEvidence(null);
     setStreaming("");
     setRunId("");
-    setRouteLabel("");
-    setRoute(null);
     setActiveAgents([]);
     setAgentRuns([]);
-    setRootStatus("");
-    setFallbackReason("");
   }
 
   function agentName(agentId: string): string {
     const agent = agents.find((item) => item.name === agentId);
     return agent?.display_name || BUILTIN_AGENT_NAMES[agentId] || agent?.name || "专家";
-  }
-
-  function formatRouteLabel(routeInfo: AgentRouteInfo): string {
-    const names = routeInfo.agent_ids.map(agentName).join("＋");
-    if (routeInfo.source === "fallback") return names ? `已回退至${names}` : "";
-    return names ? `已识别：${names}` : "";
   }
 
   function terminalAgentStatus(status: string): ActiveAgentRunStatus {
@@ -144,14 +129,9 @@ export default function Agent() {
       const visibleAgents = data.items || [];
       if (visibleAgents.length === 0) throw new Error("没有可用的智能体");
       setAgents(visibleAgents);
-      // auto 仅对服务端可见列表包含它的身份开放；不可用时改选首个可见技能。
-      if (!visibleAgents.some((agent) => agent.name === skillRef.current)) {
-        skillRef.current = visibleAgents[0].name;
-        setSkill(skillRef.current);
-      }
       agentsReadyRef.current = true;
       setAgentsReady(true);
-      if (session) void loadConversations(skillRef.current);
+      if (session) void loadConversations();
     }).catch((exc) => {
       agentsReadyRef.current = false;
       setAgentsReady(false);
@@ -163,29 +143,19 @@ export default function Agent() {
     }
   }, []);
 
-  async function loadConversations(selectedSkill = skill) {
+  async function loadConversations() {
     const requestId = ++listRequestRef.current;
     try {
-      const data = await api.listConversations({ skill: selectedSkill, page: 1, size: 20 });
+      const data = await api.listConversations({ skill: "auto", page: 1, size: 20 });
       // 快速切换或重复加载时只接受最新请求，避免旧列表覆盖当前选择。
-      if (requestId === listRequestRef.current && selectedSkill === skillRef.current) {
+      if (requestId === listRequestRef.current) {
         setConversations(data.items || []);
       }
     } catch (exc) {
-      if (requestId === listRequestRef.current && selectedSkill === skillRef.current) {
+      if (requestId === listRequestRef.current) {
         setError((exc as Error).message);
       }
     }
-  }
-
-  function changeSkill(nextSkill: string) {
-    if (nextSkill === skill || splitPendingRef.current) return;
-    skillRef.current = nextSkill;
-    setSkill(nextSkill);
-    setConversations([]);
-    historyRequestRef.current += 1;
-    // 只切换请求入口和会话列表，当前对话及运行证据继续保留。
-    void loadConversations(nextSkill);
   }
 
   async function loadConversationMessages(convId: string) {
@@ -289,7 +259,7 @@ export default function Agent() {
     setInput("");
     clearRunDisplay();
     try {
-      await chatStream(skill, text, sessionId.current, (event) => {
+      await chatStream("auto", text, sessionId.current, (event) => {
         // trace 事件逐条累积，形成工具调用证据；delta 逐片累积成流式答案；
         // final 才把完整答案落进消息列表并记录 run_id。
         if (event.type === "trace") setTrace((prev) => [...prev, event.event]);
@@ -297,14 +267,6 @@ export default function Agent() {
         if (event.type === "delta") setStreaming((prev) => prev + event.text);
         if (event.type === "agent") {
           const agentEvent = event.event;
-          if (agentEvent.type === "route") {
-            setRoute(agentEvent);
-            setRouteLabel(formatRouteLabel(agentEvent));
-            // fallback 原因独立保存，避免后续 route 事件覆盖已展示的降级信息。
-            if (agentEvent.source === "fallback") {
-              setFallbackReason((prev) => prev || agentEvent.reason);
-            }
-          }
           if (agentEvent.type === "agent.start") {
             setActiveAgents((prev) => [
               ...prev.filter((item) => item.run_id !== agentEvent.run_id),
@@ -317,7 +279,6 @@ export default function Agent() {
               item.run_id === agentEvent.run_id ? { ...item, status } : item,
             ));
           }
-          if (agentEvent.type === "fallback") setFallbackReason(agentEvent.reason);
         }
         if (event.type === "final") {
           const result = event.result;
@@ -325,17 +286,19 @@ export default function Agent() {
           evidenceRequestRef.current += 1;
           setEvidence(null);
           setRunId(result.run_id);
-          setRootStatus(result.status);
-          setMessages((prev) => [...prev, { role: "assistant", text: result.answer }]);
+          // 实际执行过子 Agent 时展示其状态；只有识别结果、未实际执行时仅标注专家名。
+          const runAgents = result.agent_runs && result.agent_runs.length > 0
+            ? result.agent_runs.map((item) => ({ agent: item.agent, status: terminalAgentStatus(item.status) }))
+            : (result.route?.agent_ids || []).map((agent) => ({ agent }));
+          const fallbackReason = result.route?.source === "fallback" ? result.route.reason : "";
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: result.answer,
+            agents: runAgents,
+            fallbackReason,
+          }]);
           setStreaming("");
           if (result.context) setContextUsage(result.context);
-          if (result.route) {
-            setRoute(result.route);
-            setRouteLabel(formatRouteLabel(result.route));
-            if (result.route.source === "fallback") {
-              setFallbackReason((prev) => prev || result.route?.reason || "");
-            }
-          }
           setAgentRuns(result.agent_runs || []);
           if (result.agent_runs) {
             setActiveAgents(result.agent_runs.map((item) => ({
@@ -349,8 +312,7 @@ export default function Agent() {
             if (result.conversation_id !== conversationId) setMessageCursor(null);
             setConversationId(result.conversation_id);
           }
-          // 流式过程中允许切换专家，因此刷新列表时以最新选择为准。
-          if (session) void loadConversations(skillRef.current);
+          if (session) void loadConversations();
         }
         if (event.type === "error") setError(event.message);
       }, conversationId, providerId);
@@ -375,31 +337,8 @@ export default function Agent() {
     }
   };
 
-  const currentAgent = agents.find((item) => item.name === skill);
-  const currentAgentName = skill === "auto"
-    ? "自动分派"
-    : currentAgent?.display_name || currentAgent?.name || "智能助手";
-  const currentRouteLabel = routeLabel || (route ? formatRouteLabel(route) : "");
-
   return (
     <div className="agent-layout">
-      <aside className="panel agent-side">
-        <h2>智能体</h2>
-        {agents.map((agent) => (
-          <button
-            key={agent.name}
-            className={agent.name === skill ? "agent-item active" : "agent-item"}
-            disabled={splitPending}
-            onClick={() => changeSkill(agent.name)}
-          >
-            <strong>{agent.name === "auto" ? "自动分派" : agent.display_name || agent.name}</strong>
-            <span>{agent.description}</span>
-            <small>信任等级 {agent.trust} · 工具 {agent.allowed_tools.length}</small>
-          </button>
-        ))}
-        {!session && <p className="hint">当前为访客身份，部分工具会被权限上限拦截。</p>}
-      </aside>
-
       <section className="agent-main">
         {/* provider 选择器 */}
         {session && providers.length > 0 && (
@@ -488,10 +427,10 @@ export default function Agent() {
           )}
           {messages.length === 0 && (
             <div className="chat-empty">
-              <h2>{currentAgentName}</h2>
-              <p className="muted">{currentAgent?.description || (skill === "auto" ? "自动识别问题并串行分派专家" : "选择左侧智能体开始对话")}</p>
+              <h2>自动分派</h2>
+              <p className="muted">自动识别问题并串行分派专家，答案下方会标注本次调用的智能体</p>
               <div className="chips">
-                {(QUICK_PROMPTS[skill] || []).map((prompt) => (
+                {QUICK_PROMPTS.auto.map((prompt) => (
                   <button key={prompt} className="chip" disabled={!agentsReady || controlsBusy} onClick={() => send(prompt)}>{prompt}</button>
                 ))}
               </div>
@@ -499,35 +438,40 @@ export default function Agent() {
           )}
           {messages.map((message, index) => (
             <div key={index} className={`bubble ${message.role}`}>
+              {message.role === "assistant" && message.agents && message.agents.length > 0 && (
+                <div className="agent-meta">
+                  {message.agents.map((item, itemIndex) => (
+                    <span className="agent-chip" key={itemIndex}>
+                      <strong>{agentName(item.agent)}</strong>
+                      {item.status && <small>{ACTIVE_AGENT_STATUS_LABELS[item.status]}</small>}
+                    </span>
+                  ))}
+                </div>
+              )}
               <p>{message.text}</p>
+              {message.role === "assistant" && message.fallbackReason && (
+                <p className="hint" style={{ marginTop: "6px" }}>降级原因：{message.fallbackReason}</p>
+              )}
             </div>
           ))}
           {busy && (
             <div className="bubble assistant">
+              {activeAgents.length > 0 && (
+                <div className="agent-meta">
+                  {activeAgents.map((item) => (
+                    <span className="agent-chip" key={item.run_id}>
+                      <strong>{agentName(item.agent)}</strong>
+                      <small>{ACTIVE_AGENT_STATUS_LABELS[item.status]}</small>
+                    </span>
+                  ))}
+                </div>
+              )}
               {/* 流式已到文本时用正常样式，空时显示占位思考提示。 */}
               <p className={streaming ? "" : "muted"}>{streaming || "思考中…"}</p>
             </div>
           )}
           <div ref={bottomRef} />
         </div>
-
-        {(currentRouteLabel || rootStatus || fallbackReason || activeAgents.length > 0) && (
-          <div className="panel" role="status" aria-live="polite" style={{ padding: "0.75rem 1rem" }}>
-            {currentRouteLabel && <p>{currentRouteLabel}</p>}
-            {rootStatus && <p><strong>根运行：</strong>{AGENT_RUN_STATUS_LABELS[rootStatus]}</p>}
-            {fallbackReason && <p className="hint">降级原因：{fallbackReason}</p>}
-            {activeAgents.length > 0 && (
-              <div className="chips">
-                {activeAgents.map((item) => (
-                  <span className="chip" key={item.run_id}>
-                    <strong>{agentName(item.agent)}</strong>
-                    <small style={{ marginLeft: "0.5rem" }}>{ACTIVE_AGENT_STATUS_LABELS[item.status]}</small>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
 
         {error && <p className="error">{error}</p>}
 

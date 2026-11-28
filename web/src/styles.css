@@ -217,17 +217,7 @@ button { cursor: pointer; border: none; background: none; }
 
 .advice { background: #f3f7ff; border-left: 3px solid #5872d6; padding: 10px 12px; border-radius: 8px; font-size: 13px; }
 
-.agent-layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; align-items: start; }
-.agent-side { margin-top: 0; display: grid; gap: 10px; }
-.agent-side h2 { margin-bottom: 4px; }
-.agent-item {
-  text-align: left; display: grid; gap: 4px; padding: 12px 14px; border-radius: 12px;
-  border: 1px solid var(--line); background: var(--bg);
-}
-.agent-item.active { border-color: var(--ink); background: var(--surface); box-shadow: 0 8px 20px rgba(0,0,0,.06); }
-.agent-item strong { font-size: 14px; }
-.agent-item span { font-size: 12px; color: var(--muted); line-height: 1.5; }
-.agent-item small { font-size: 11px; color: var(--accent); }
+.agent-layout { display: grid; grid-template-columns: 1fr; gap: 20px; align-items: start; }
 
 .agent-main { display: grid; gap: 14px; }
 .chat-window {
@@ -240,6 +230,16 @@ button { cursor: pointer; border: none; background: none; }
 .bubble p { margin: 0; white-space: pre-wrap; }
 .bubble.user { align-self: flex-end; background: var(--ink); color: #fff; border-bottom-right-radius: 4px; }
 .bubble.assistant { align-self: flex-start; background: var(--bg); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+
+/* 答案气泡内的智能体标注：名称 + 终态，替代原先左侧常驻列表 */
+.agent-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.agent-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+  font-size: 12px;
+}
+.agent-chip strong { font-weight: 600; }
+.agent-chip small { color: var(--muted); }
 
 .composer { display: flex; gap: 10px; align-items: flex-end; }
 .composer textarea { flex: 1; min-height: 60px; max-height: 160px; resize: vertical; background: var(--surface); }
