@@ -17,8 +17,8 @@ export default function Product() {
   if (error) return <p className="error">{error}</p>;
   if (!data) return <p className="muted">加载中…</p>;
   const { product, stock } = data;
-  // 库存字段可能缺失，用 nullish 兜底判断是否售罄，按钮状态统一由此派生。
-  const soldOut = (stock.available ?? 0) <= 0;
+  // 库存只暴露能否购买的布尔，缺失时按缺货兜底，按钮状态统一由此派生。
+  const soldOut = !stock.in_stock;
 
   // 只保留下单需要的字段，避免把整份详情响应塞进购物车/本地存储。
   const cartPayload = () => ({
@@ -48,7 +48,7 @@ export default function Product() {
         <div className="buy-row">
           <span className="price big">{money(product.price_cents)}</span>
           <span className={soldOut ? "stock out" : "stock"}>
-            {soldOut ? "暂时缺货" : `可售 ${stock.available} 件`}
+            {soldOut ? "暂时缺货" : "有货"}
           </span>
         </div>
         <div className="qty-row">

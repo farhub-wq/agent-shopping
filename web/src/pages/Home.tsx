@@ -93,9 +93,9 @@ export default function Home({ session }: { session: Session | null }) {
               <p className="muted">{item.subtitle}</p>
               <div className="price-row">
                 <span className="price">{money(item.price_cents)}</span>
-                {/* 可售数量是列表接口聚合出的派生值，>0 才展示可售，否则统一显示缺货。 */}
-                <span className={item.available > 0 ? "stock" : "stock out"}>
-                  {item.available > 0 ? `可售 ${item.available}` : "缺货"}
+                {/* 顾客侧只暴露「能否购买」的布尔，有货/缺货二选一。 */}
+                <span className={item.in_stock ? "stock" : "stock out"}>
+                  {item.in_stock ? "有货" : "缺货"}
                 </span>
               </div>
             </div>

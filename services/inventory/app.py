@@ -393,12 +393,9 @@ async def get_stock(sku: str) -> dict[str, Any]:
     if stock is None and available is None:
         # 两处都没有记录才算 SKU 不存在，任一侧有数据都可正常返回。
         raise ApiError("NOT_FOUND", "SKU 不存在")
-    return {
-        "sku": sku,
-        "available": int(available) if available is not None else max((stock.total - stock.reserved), 0),
-        "total": stock.total if stock else None,
-        "reserved": stock.reserved if stock else None,
-    }
+    # 顾客侧只暴露「能否购买」的布尔，不暴露 total/reserved/可售数量，避免泄露内部库存水位。
+    sellable = int(available) if available is not None else (stock.total - stock.reserved if stock else 0)
+    return {"sku": sku, "in_stock": sellable > 0}
 
 
 @app.post("/inventory/reserve")

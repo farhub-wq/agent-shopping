@@ -296,8 +296,8 @@ async def product_detail(product_id: str, principal: PrincipalDep) -> dict[str, 
             raise ApiError("NOT_FOUND", "商品不存在")
         product = product_resp.json()
         stock_resp = await client.get(f"{settings.inventory_url}/inventory/{product['sku']}")
-        # 库存服务异常时降级为 0，页面仍可展示商品，只是显示无可售库存
-        stock = stock_resp.json() if stock_resp.status_code == 200 else {"available": 0}
+        # 库存服务异常时降级为缺货，页面仍可展示商品，只是无法购买
+        stock = stock_resp.json() if stock_resp.status_code == 200 else {"in_stock": False}
     return {"product": product, "stock": stock}
 
 
@@ -310,7 +310,7 @@ async def storefront_feed(principal: PrincipalDep, q: str | None = None, categor
         # 首页只展示前 12 条并逐条补库存；这是展示级聚合，不承担分页查询职责
         for product in products["items"][:12]:
             stock = (await client.get(f"{settings.inventory_url}/inventory/{product['sku']}")).json()
-            items.append({**product, "available": stock.get("available", 0)})
+            items.append({**product, "in_stock": stock.get("in_stock", False)})
     return {**products, "items": items}
 
 

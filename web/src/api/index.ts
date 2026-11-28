@@ -165,7 +165,7 @@ export interface FeedItem {
   category: string;
   subtitle: string;
   price_cents: number;
-  available: number;
+  in_stock: boolean;
 }
 
 // 商品详情 + 库存快照（storefront/products/:id）
@@ -182,7 +182,7 @@ export interface ProductDetail {
 }
 
 export interface StockSnapshot {
-  available: number;
+  in_stock: boolean;
 }
 
 export interface ProductPage {

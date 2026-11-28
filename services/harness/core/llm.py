@@ -236,8 +236,8 @@ class DeterministicPlanner(LLMProvider):
                     else:
                         lines.append(str(item))
                 return "；".join(lines)
-            if "available" in data:
-                return f"商品 {data.get('sku')} 当前可售 {data['available']} 件"
+            if "in_stock" in data:
+                return f"商品 {data.get('sku')} 当前{'有货' if data['in_stock'] else '缺货'}"
             if "status" in data and "order_no" in data:
                 return f"订单 {data['order_no']} 当前状态：{data['status']}"
             if "result" in data:
